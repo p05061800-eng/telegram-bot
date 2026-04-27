@@ -44,19 +44,21 @@ logging.basicConfig(
 
 load_dotenv()
 token = os.getenv("TELEGRAM_BOT_TOKEN")
-# Куда бот пишет о новых заказах (ваш user id, id группы с ботом или @username через getChat).
-# Можно узнать у @userinfobot, у группы: добавить бота и /chatid (или похожие). Должен быть int.
-def _read_notify_chat() -> Optional[int]:
+# Куда бот пишет о новых заказах: по умолчанию @Daniel_official; переопределение — TELEGRAM_ORDER_NOTIFY_ID (int или @username).
+def _read_order_notify_target():
+    """Куда слать заказы: по умолчанию @Daniel_official; из .env — int id или @username."""
     s = (os.getenv("TELEGRAM_ORDER_NOTIFY_ID") or os.getenv("ORDER_NOTIFY_CHAT_ID") or "").strip()
     if not s:
-        return None
+        return "@Daniel_official"
+    if s.startswith("@"):
+        return s
     try:
         return int(s)
     except ValueError:
-        return None
+        return s
 
 
-ORDER_NOTIFY_CHAT_ID: Optional[int] = _read_notify_chat()
+ORDER_NOTIFY_TARGET = _read_order_notify_target()
 ORDER_MENTION = (os.getenv("ORDER_MENTION", "@Daniel_official") or "@Daniel_official").strip()
 
 # Сообщения о заказе из t.me/bot?start=... (числовой Telegram id админа)
@@ -111,25 +113,22 @@ SYNC_EVERY_SEC = int(os.getenv("ILLUCARDS_SYNC_EVERY_SEC", "900"))
 # Tinder-режим каталога: одна карта на экран, смена через editMessageMedia
 TINDER_NO_IMAGE = "https://picsum.photos/seed/illu-noimg/400/550"
 
-# Редкости из API часто на английском — в интерфейсе показываем по-русски
+# Редкости как на illucards.by (фильтры каталога — индексы callback j:cat:0..4)
+CATALOG_RARITY_FILTERS: Tuple[str, ...] = (
+    "common",
+    "limited",
+    "novelty",
+    "replica",
+    "adult",
+)
+# Подписи для кнопок и карточек (epic / legendary / rare и пр. не переводим — покажем как в API)
 RARITY_RU: dict = {
     "—": "б/р",
     "common": "Обычная",
-    "uncommon": "Необычная",
-    "rare": "Редкая",
-    "epic": "Эпическая",
-    "legendary": "Легендарная",
-    "mythic": "Мифическая",
-    "foil": "Фойл",
-    "foiled": "Фойл",
-    "promo": "Промо",
-    "promotion": "Промо",
-    "special": "Особая",
-    "secret": "Секретная",
-    "default": "Стандартная",
-    "basic": "Базовая",
-    "holo": "Голо",
-    "holographic": "Голографическая",
+    "limited": "Лимитированная",
+    "novelty": "Новинка",
+    "replica": "Реплика",
+    "adult": "18+",
 }
 
 
@@ -194,6 +193,8 @@ async def load_products() -> List[dict]:
         else:
             image = front
         rar = item.get("rarity", "")
+        sale_raw = item.get("isSale", False)
+        is_sale = sale_raw is True or str(sale_raw).lower() in ("1", "true", "yes")
         cards.append(
             {
                 "id": item.get("id"),
@@ -202,6 +203,7 @@ async def load_products() -> List[dict]:
                 "category": item.get("category", "Без категории"),
                 "rarity": (str(rar).strip() or "—"),
                 "image": image,
+                "isSale": is_sale,
             }
         )
     print(f"Загружено карточек: {len(cards)}")
@@ -309,8 +311,7 @@ def _format_cart_message(lines: List[dict]) -> str:
             name = name.rstrip() + "…"
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
-        sub = p * q
-        out.append(f"• {name} — {sub} BYN")
+        out.append(f"• {name} — {p} BYN × {q}")
     out += ["", f"💰 Итого: {total} BYN"]
     s = "\n".join(out)
     if len(s) > 3900:
@@ -343,11 +344,9 @@ def _format_checkout_preview_for_user(lines: List[dict]) -> str:
         name = (x.get("name") or "—")[:200]
         if len((x.get("name") or "")) > 200:
             name = name.rstrip() + "…"
+        p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
-        if q > 1:
-            out.append(f"• {name} (×{q})")
-        else:
-            out.append(f"• {name}")
+        out.append(f"• {name} — {p} BYN × {q}")
     out += ["", f"💰 Итого: {total} BYN"]
     return "\n".join(out)
 
@@ -355,26 +354,20 @@ def _format_checkout_preview_for_user(lines: List[dict]) -> str:
 async def _send_new_order_to_admin(
     context: ContextTypes.DEFAULT_TYPE, user, lines: List[dict]
 ) -> bool:
-    """Сообщение в TELEGRAM_ORDER_NOTIFY_ID: «Новый заказ», список, username."""
-    chat_id = ORDER_NOTIFY_CHAT_ID
-    if not chat_id:
-        return False
+    """Заказ в Telegram (по умолчанию @Daniel_official)."""
+    chat_id = ORDER_NOTIFY_TARGET
     total, _ = _cart_totals(lines)
-    body: List[str] = ["📦 Новый заказ", ""]
+    body: List[str] = ["🔥 НОВЫЙ ЗАКАЗ", ""]
     for x in lines:
         n = (x.get("name") or "—")[:200]
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
         sub = p * q
-        if q > 1:
-            body.append(f"• {n} (×{q}) — {sub} BYN")
-        else:
-            body.append(f"• {n} — {sub} BYN")
+        body.append(f"• {n} — {sub} BYN")
     body += ["", f"💰 Итого: {total} BYN", ""]
     u = user
     uline = f"@{u.username}" if u and u.username else "— (нет @username)"
-    body.append(f"Username: {uline}")
-    body.append(f"Telegram id: {u.id if u else '—'}")
+    body.append(f"👤 {uline} · id {u.id if u else '—'}")
     text = "\n".join(body)
     if len(text) > 4090:
         text = text[:4086] + "…"
@@ -392,31 +385,6 @@ async def _send_new_order_to_admin(
 def _category_names(products: List[dict]) -> List[str]:
     s = {str(p.get("category", "Без категории") or "Без категории") for p in products}
     return sorted(s, key=str.lower)
-
-
-def _rarities_in_category(products: List[dict], category: str) -> List[str]:
-    u: set = set()
-    for p in products:
-        if str(p.get("category", "Без категории")) != category:
-            continue
-        u.add(str(p.get("rarity", "—") or "—"))
-    return sorted(u, key=str.lower)
-
-
-def _filter_cards(products: List[dict], category: str, rarity: str) -> List[dict]:
-    out: List[dict] = []
-    for p in products:
-        if str(p.get("category", "Без категории")) != category:
-            continue
-        pr = str(p.get("rarity", "—") or "—")
-        if pr == rarity:
-            out.append(p)
-    return out
-
-
-def _rarities_globally(products: List[dict]) -> List[str]:
-    u: set = {str(p.get("rarity", "—") or "—") for p in products}
-    return sorted(u, key=str.lower)
 
 
 def _btn_label(s: str, max_len: int = 22) -> str:
@@ -439,27 +407,29 @@ def _kb_categories(categories: List[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _kb_rarities(cat_tok: str, rarities: List[str]) -> InlineKeyboardMarkup:
+def _kb_rarities(cat_tok: str) -> InlineKeyboardMarkup:
     """
-    j:{cat_tok}:all  — все редкости в рамках выбранных категорий
-    j:{cat_tok}:0,1,…  — индекс в rarities
+    j:{cat_tok}:all — все
+    j:{cat_tok}:sale — isSale
+    j:{cat_tok}:0..4 — common, limited, novelty, replica, adult
     """
-    rows: List[List[InlineKeyboardButton]] = [
-        [InlineKeyboardButton("⭐ Все редкости", callback_data=f"j:{cat_tok}:all")],
-    ]
-    row: List[InlineKeyboardButton] = []
-    for i, r in enumerate(rarities):
-        label = _rarity_label_ru(r)[:20]
-        row.append(InlineKeyboardButton(_btn_label(label, 20), callback_data=f"j:{cat_tok}:{i}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append(
-        [InlineKeyboardButton("⬅ К категориям", callback_data="m:0")],
+    c = str(cat_tok)[:12]
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⭐ Все редкости", callback_data=f"j:{c}:all")],
+            [InlineKeyboardButton("🔥 Горячая цена", callback_data=f"j:{c}:sale")],
+            [
+                InlineKeyboardButton("Обычная", callback_data=f"j:{c}:0"),
+                InlineKeyboardButton("Лимитированная", callback_data=f"j:{c}:1"),
+            ],
+            [
+                InlineKeyboardButton("Новинка", callback_data=f"j:{c}:2"),
+                InlineKeyboardButton("Реплика", callback_data=f"j:{c}:3"),
+            ],
+            [InlineKeyboardButton("18+", callback_data=f"j:{c}:4")],
+            [InlineKeyboardButton("⬅ К категориям", callback_data="m:0")],
+        ]
     )
-    return InlineKeyboardMarkup(rows)
 
 
 def _global_product_index(all_products: List[dict], p: dict) -> int:
@@ -478,11 +448,10 @@ def _global_product_index(all_products: List[dict], p: dict) -> int:
 def _filter_wizard(
     products: List[dict], cats: List[str], cat_tok: str, rar_tok: str
 ) -> tuple[List[dict], str, str]:
-    """cat_tok: "all" или индекс категории. rar_tok: "all" или индекс в списке редкостей."""
+    """cat_tok: all | индекс категории. rar_tok: all | sale | 0..4 по CATALOG_RARITY_FILTERS."""
     if cat_tok == "all":
         base = list(products)
         cat_label = "Все категории"
-        rlist = _rarities_globally(products) or ["—"]
     else:
         cix = int(cat_tok)
         if cix < 0 or cix >= len(cats):
@@ -490,15 +459,24 @@ def _filter_wizard(
         cn = cats[cix]
         cat_label = cn
         base = [p for p in products if str(p.get("category", "Без категории")) == cn]
-        rlist = _rarities_in_category(products, cn) or ["—"]
     if rar_tok == "all":
         return base, cat_label, "все редкости"
-    rix = int(rar_tok)
-    if rix < 0 or rix >= len(rlist):
+    if rar_tok == "sale":
+        out = [p for p in base if p.get("isSale") is True]
+        return out, cat_label, "🔥 Горячая цена"
+    try:
+        rix = int(rar_tok)
+    except ValueError:
         return [], cat_label, ""
-    rname = rlist[rix]
-    out = [p for p in base if str(p.get("rarity", "—") or "—") == rname]
-    rlab = _rarity_label_ru(rname)
+    if rix < 0 or rix >= len(CATALOG_RARITY_FILTERS):
+        return [], cat_label, ""
+    rkey = CATALOG_RARITY_FILTERS[rix]
+    out = [
+        p
+        for p in base
+        if str(p.get("rarity", "") or "").strip().lower() == rkey
+    ]
+    rlab = RARITY_RU.get(rkey, rkey)
     return out, cat_label, rlab
 
 
@@ -992,27 +970,25 @@ async def on_pick_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     products = await _get_products(context)
     cats = _category_names(products)
     if key == "all":
-        rlist = _rarities_globally(products) or ["—"]
-        t = "🔥 Все разделы\n\n⭐ Редкость"
+        t = "🔥 Все разделы\n\n⭐ Выбери редкость:"
         await q.answer()
-        await q.edit_message_text(t, reply_markup=_kb_rarities("all", rlist))
+        await q.edit_message_text(t, reply_markup=_kb_rarities("all"))
         return
     ci = int(key)
     if ci < 0 or ci >= len(cats):
         await q.answer("Категория не найдена", show_alert=True)
         return
     cat = cats[ci]
-    rlist = _rarities_in_category(products, cat) or ["—"]
-    t = f"🔥 {cat}\n\n⭐ Редкость"
+    t = f"🔥 {cat}\n\n⭐ Выбери редкость:"
     await q.answer()
-    await q.edit_message_text(t, reply_markup=_kb_rarities(str(ci), rlist))
+    await q.edit_message_text(t, reply_markup=_kb_rarities(str(ci)))
 
 
 async def on_pick_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not q or not q.data:
         return
-    m = re.match(r"^j:([^:]+):(all|\d+)$", (q.data or "").strip())
+    m = re.match(r"^j:([^:]+):(all|sale|\d+)$", (q.data or "").strip())
     if not m:
         return
     cat_tok, rar_tok = m.group(1), m.group(2)
@@ -1023,7 +999,10 @@ async def on_pick_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await q.answer("Нет раздела", show_alert=True)
         return
     if rar_tok != "all" and not in_scope:
-        await q.answer("По такой редкости пусто.", show_alert=True)
+        if rar_tok == "sale":
+            await q.answer("По горячей цене пока пусто.", show_alert=True)
+        else:
+            await q.answer("По этой редкости пусто.", show_alert=True)
         return
     if not in_scope:
         await q.answer("В выборе пока нет карточек.", show_alert=True)
@@ -1052,9 +1031,8 @@ async def on_back_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     products = await _get_products(context)
     cats = _category_names(products)
     if cat_tok == "all":
-        rlist = _rarities_globally(products) or ["—"]
-        t = "🔥 Все разделы\n\n⭐ Редкость"
-        kb = _kb_rarities("all", rlist)
+        t = "🔥 Все разделы\n\n⭐ Выбери редкость:"
+        kb = _kb_rarities("all")
     else:
         try:
             cix = int(cat_tok)
@@ -1065,9 +1043,8 @@ async def on_back_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await _edit_to_categories(q, context)
             return
         cat = cats[cix]
-        rlist = _rarities_in_category(products, cat) or ["—"]
-        t = f"🔥 {cat}\n\n⭐ Редкость"
-        kb = _kb_rarities(str(cix), rlist)
+        t = f"🔥 {cat}\n\n⭐ Выбери редкость:"
+        kb = _kb_rarities(str(cix))
     qm = q.message
     if qm and qm.photo:
         try:
@@ -1257,10 +1234,7 @@ async def on_send_order_to_admin(
     u = q.from_user
     ok = await _send_new_order_to_admin(context, u, list(lines))
     if not ok:
-        if not ORDER_NOTIFY_CHAT_ID:
-            await q.answer("Админ-чат не настроен (TELEGRAM_ORDER_NOTIFY_ID)", show_alert=True)
-        else:
-            await q.answer("Не получилось отправить", show_alert=True)
+        await q.answer("Не получилось отправить заказ. Проверь, что бот может писать получателю.", show_alert=True)
         return
     _cart_clear(ud)
     ud.pop("order_checkout", None)
@@ -1313,12 +1287,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(application: Application) -> None:
     log = logging.getLogger(__name__)
-    if ORDER_NOTIFY_CHAT_ID is not None:
-        log.info("Уведомления о заказах: chat_id=%s, mention=%s", ORDER_NOTIFY_CHAT_ID, ORDER_MENTION)
-    else:
-        log.warning(
-            "TELEGRAM_ORDER_NOTIFY_ID не задан — бот не сможет присылать заказы в чат (см. .env)"
-        )
+    log.info(
+        "Уведомления о заказах: target=%s, mention=%s",
+        ORDER_NOTIFY_TARGET,
+        ORDER_MENTION,
+    )
     if not ADMIN_ID:
         log.warning("ADMIN_ID=0 — заказы с /start ...?start= не дойдут до админа")
     try:
@@ -1363,7 +1336,11 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_add_to_cart, pattern=re.compile(r"^a:(.+)$")))
     app.add_handler(CallbackQueryHandler(on_back_rarity, pattern=re.compile(r"^h:([^:]{1,12})$")))
     app.add_handler(CallbackQueryHandler(on_menu_main, pattern=re.compile(r"^m:0$")))
-    app.add_handler(CallbackQueryHandler(on_pick_rarity, pattern=re.compile(r"^j:([^:]{1,12}):(all|\d+)$")))
+    app.add_handler(
+        CallbackQueryHandler(
+            on_pick_rarity, pattern=re.compile(r"^j:([^:]{1,12}):(all|sale|\d+)$")
+        )
+    )
     app.add_handler(CallbackQueryHandler(on_pick_category, pattern=re.compile(r"^c:(\d+|all)$")))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
