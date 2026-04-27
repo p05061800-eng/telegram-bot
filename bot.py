@@ -20,9 +20,11 @@ from dotenv import load_dotenv
 import aiohttp
 from telegram import (
     CallbackQuery,
+    InputMediaPhoto,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    Message,
     ReplyKeyboardMarkup,
     Update,
 )
@@ -106,8 +108,8 @@ CARDS_JSON_URL = os.getenv("CARDS_JSON_URL", "https://www.illucards.by/cards.jso
 PROMO_PHOTO = "https://picsum.photos/seed/promo/400/300"
 ILLUCARDS_BASE = "https://www.illucards.by"
 SYNC_EVERY_SEC = int(os.getenv("ILLUCARDS_SYNC_EVERY_SEC", "900"))
-# Шаг 3: столько пунктов (№ + название) в одном сообщении (пагинация при большом списке)
-LIST_ITEMS_PER_PAGE = 32
+# Tinder-режим каталога: одна карта на экран, смена через editMessageMedia
+TINDER_NO_IMAGE = "https://picsum.photos/seed/illu-noimg/400/550"
 
 # Редкости из API часто на английском — в интерфейсе показываем по-русски
 RARITY_RU: dict = {
@@ -145,6 +147,7 @@ def _rarity_label_ru(s: str) -> str:
 REPLY_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton("📦 Каталог"), KeyboardButton("🛒 Корзина")],
+        [KeyboardButton("🔥 Смотреть карточки")],
         [KeyboardButton("🔥 Акции"), KeyboardButton("💬 Связь")],
     ],
     resize_keyboard=True,
@@ -159,9 +162,9 @@ def _format_caption(p: dict) -> str:
     price_str = str(price) if price is not None and price != "" else "—"
     lines = [
         f"{name}",
-        f"Категория: {category}",
-        f"Редкость: {_rarity_label_ru(r_raw)}",
-        f"Цена: {price_str}",
+        f"🔥 Категория: {category}",
+        f"⭐ Редкость: {_rarity_label_ru(r_raw)}",
+        f"💰 Цена: {price_str}",
     ]
     return "\n".join(lines)
 
@@ -263,6 +266,20 @@ def _cart_remove_line(user_data: dict, index: int) -> bool:
     return False
 
 
+def _cart_dec_line(user_data: dict, index: int) -> bool:
+    lines = _cart_get_lines(user_data)
+    if not (0 <= index < len(lines)):
+        return False
+    line = lines[index]
+    q = int(line.get("qty") or 1)
+    if q > 1:
+        line["qty"] = q - 1
+    else:
+        lines.pop(index)
+    user_data["cart"] = lines
+    return True
+
+
 def _cart_clear(user_data: dict) -> None:
     user_data["cart"] = []
 
@@ -280,34 +297,22 @@ def _cart_totals(lines: List[dict]) -> Tuple[int, int]:
 
 def _format_cart_message(lines: List[dict]) -> str:
     if not lines:
-        return "Корзина пуста. Добавь карточки из коллекции (кнопка «➕ В корзину» под снимками) или нажми 📦 Каталог."
-    total, npos = _cart_totals(lines)
-    parts: List[str] = [
-        "🛒 Корзина",
-    ]
-    if len(lines) > 20:
-        parts.append(
-            "Кнопки «➖» — только для первых 20 поз.; если больше, нажмите «Очистить» и соберите снова."
-        )
-    parts += [
-        f"Позиций: {len(lines)} | штук: {npos} | сумма: {total} ₽",
+        return "🛒 Твоя корзина:\n\nПока пусто.\n\nНажми 📦 Каталог — выбери карточки и «🛒 В корзину»."
+    total, _ = _cart_totals(lines)
+    out: List[str] = [
+        "🛒 Твоя корзина:",
         "",
     ]
-    for i, x in enumerate(lines, 1):
-        name = (x.get("name") or "—")[:120]
-        if len((x.get("name") or "")) > 120:
-            name += "…"
-        q = int(x.get("qty") or 1)
+    for x in lines:
+        name = (x.get("name") or "—")[:200]
+        if len((x.get("name") or "")) > 200:
+            name = name.rstrip() + "…"
         p = int(x.get("price") or 0)
+        q = int(x.get("qty") or 1)
         sub = p * q
-        parts.append(f"{i}) {name}")
-        parts.append(f"   {p} ₽ × {q} = {sub} ₽")
-    parts.append("")
-    parts.append(
-        f"Снизу — убрать позицию, «Очистить» или «Оформить заказ». "
-        f"После оформления бот попросит твой @username: заказ и сумма уйдут {ORDER_MENTION} и администратору; с тобой свяжутся в ближайшее время."
-    )
-    s = "\n".join(parts)
+        out.append(f"• {name} — {sub} BYN")
+    out += ["", f"💰 Итого: {total} BYN"]
+    s = "\n".join(out)
     if len(s) > 3900:
         s = s[:3890] + "…"
     return s
@@ -317,69 +322,60 @@ def _kb_cart(lines: List[dict]) -> Optional[InlineKeyboardMarkup]:
     if not lines:
         return None
     rows: List[List[InlineKeyboardButton]] = []
-    n_show = min(20, len(lines))
-    for i in range(n_show):
-        x = lines[i]
-        nm = (x.get("name") or "—")[:28]
-        if len((x.get("name") or "")) > 28:
-            nm = nm.rstrip() + "…"
-        q = int(x.get("qty") or 1)
+    for i in range(len(lines)):
         rows.append(
             [
-                InlineKeyboardButton(
-                    f"➖ {i + 1}. {nm} (×{q})",
-                    callback_data=f"rm:{i}",
-                )
+                InlineKeyboardButton("➖", callback_data=f"dc:{i}"),
+                InlineKeyboardButton("➕", callback_data=f"ic:{i}"),
+                InlineKeyboardButton("❌", callback_data=f"rm:{i}"),
             ],
         )
     rows.append(
-        [
-            InlineKeyboardButton("🧹 Очистить", callback_data="cz:0"),
-            InlineKeyboardButton("✅ Оформить заказ", callback_data="co:0"),
-        ],
+        [InlineKeyboardButton("✅ Оформить заказ", callback_data="co:0")],
     )
     return InlineKeyboardMarkup(rows)
 
 
-def _order_snapshot_for_notify(lines: List[dict]) -> Tuple[str, int]:
+def _format_checkout_preview_for_user(lines: List[dict]) -> str:
     total, _ = _cart_totals(lines)
-    b = f"Сумма: {total} ₽\n\n"
-    for i, x in enumerate(lines, 1):
-        n = (x.get("name") or "—")[:200]
-        p = int(x.get("price") or 0)
+    out: List[str] = ["📦 Твой заказ:", ""]
+    for x in lines:
+        name = (x.get("name") or "—")[:200]
+        if len((x.get("name") or "")) > 200:
+            name = name.rstrip() + "…"
         q = int(x.get("qty") or 1)
-        b += f"{i}) {n} — {p} ₽ × {q} = {p * q} ₽\n"
-    return b, total
+        if q > 1:
+            out.append(f"• {name} (×{q})")
+        else:
+            out.append(f"• {name}")
+    out += ["", f"💰 Итого: {total} BYN"]
+    return "\n".join(out)
 
 
-async def _notify_admins(
-    context: ContextTypes.DEFAULT_TYPE,
-    user,
-    client_username: str,
-    order_body: str,
+async def _send_new_order_to_admin(
+    context: ContextTypes.DEFAULT_TYPE, user, lines: List[dict]
 ) -> bool:
-    """Пишет в TELEGRAM_ORDER_NOTIFY_ID: заказ, сумма, @Daniel_official (пинг), данные покупателя."""
+    """Сообщение в TELEGRAM_ORDER_NOTIFY_ID: «Новый заказ», список, username."""
     chat_id = ORDER_NOTIFY_CHAT_ID
     if not chat_id:
         return False
-    u = user or None
-    uid = u.id if u else "—"
-    t_un = f"@{u.username}" if u and u.username else "нет @username"
-    uname = (
-        f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
-        if u
-        else "—"
-    )
-    if not uname:
-        uname = "—"
-    text = (
-        f"🛒 Новый заказ\n{ORDER_MENTION}\n\n"
-        f"Логин для заказа: {client_username}\n"
-        f"В боте: {t_un} | id: {uid} | {uname}\n\n"
-        f"{order_body}\n"
-        f"---\n"
-        f"Свяжитесь в ближайшее время. {ORDER_MENTION}"
-    )
+    total, _ = _cart_totals(lines)
+    body: List[str] = ["📦 Новый заказ", ""]
+    for x in lines:
+        n = (x.get("name") or "—")[:200]
+        p = int(x.get("price") or 0)
+        q = int(x.get("qty") or 1)
+        sub = p * q
+        if q > 1:
+            body.append(f"• {n} (×{q}) — {sub} BYN")
+        else:
+            body.append(f"• {n} — {sub} BYN")
+    body += ["", f"💰 Итого: {total} BYN", ""]
+    u = user
+    uline = f"@{u.username}" if u and u.username else "— (нет @username)"
+    body.append(f"Username: {uline}")
+    body.append(f"Telegram id: {u.id if u else '—'}")
+    text = "\n".join(body)
     if len(text) > 4090:
         text = text[:4086] + "…"
     log = logging.getLogger(__name__)
@@ -388,7 +384,7 @@ async def _notify_admins(
             chat_id=chat_id, text=text, disable_web_page_preview=True
         )
     except Exception as e:
-        log.exception("Ошибка отправки уведомления о заказе: %s", e)
+        log.exception("Ошибка отправки заказа админу: %s", e)
         return False
     return True
 
@@ -430,7 +426,7 @@ def _btn_label(s: str, max_len: int = 22) -> str:
 
 def _kb_categories(categories: List[str]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = [
-        [InlineKeyboardButton("🌐 Все категории", callback_data="c:all")],
+        [InlineKeyboardButton("🔥 Все категории", callback_data="c:all")],
     ]
     row: List[InlineKeyboardButton] = []
     for i, name in enumerate(categories):
@@ -449,7 +445,7 @@ def _kb_rarities(cat_tok: str, rarities: List[str]) -> InlineKeyboardMarkup:
     j:{cat_tok}:0,1,…  — индекс в rarities
     """
     rows: List[List[InlineKeyboardButton]] = [
-        [InlineKeyboardButton("🎲 Все редкости", callback_data=f"j:{cat_tok}:all")],
+        [InlineKeyboardButton("⭐ Все редкости", callback_data=f"j:{cat_tok}:all")],
     ]
     row: List[InlineKeyboardButton] = []
     for i, r in enumerate(rarities):
@@ -506,85 +502,314 @@ def _filter_wizard(
     return out, cat_label, rlab
 
 
-def _numbered_list_view(
-    in_scope: List[dict],
-    cat_tok: str,
-    rar_tok: str,
-    page: int,
-    cat_label: str,
-    rar_label: str,
-) -> tuple[str, InlineKeyboardMarkup]:
-    """
-    Шаг 3: сверху — выбранный фильтр, затем полный перечень «№. название» (по страницам);
-    картинки — только на шаге 4, по кнопке «Показать карточки».
-    """
-    if not in_scope:
-        t = (
-            f"Выбранные фильтры\n"
-            f"• Категория: {cat_label}\n"
-            f"• Редкость: {rar_label}\n\n"
-            f"По этим настройкам карт нет. Выбери другой фильтр (шаг 1 или 2)."
-        )
-        kb = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("⬅ К выбору редкости", callback_data=f"h:{cat_tok}")],
-            ]
-        )
-        return t, kb
-    total = max(1, (len(in_scope) + LIST_ITEMS_PER_PAGE - 1) // LIST_ITEMS_PER_PAGE)
-    page = max(0, min(page, total - 1))
-    start = page * LIST_ITEMS_PER_PAGE
-    chunk = in_scope[start : start + LIST_ITEMS_PER_PAGE]
+def _tinder_photo_url(p: dict) -> str:
+    u = str(p.get("image") or "").strip()
+    if u and u.startswith("http"):
+        return u
+    if u and u.startswith("/"):
+        return ILLUCARDS_BASE + u
+    return TINDER_NO_IMAGE
 
-    parts: List[str] = [
-        "Коллекция (шаг 3 из 4) — полный перечень по выбранному фильтру",
-        "",
-        "Выбранные фильтры",
-        f"• Категория: {cat_label}",
-        f"• Редкость: {rar_label}",
-        "",
-        "Список карт (номер — как в общей нумерации в пределах фильтра):",
-        f"позиции {start + 1}–{start + len(chunk)} из {len(in_scope)}; страница {page + 1} из {total}.",
-        "",
-    ]
-    for k, p in enumerate(chunk, start=1 + start):
-        name = p.get("name") or "—"
-        if len(name) > 200:
-            name = name[:197] + "…"
-        parts.append(f"{k}. {name}")
-    text = "\n".join(parts)
-    if len(text) > 3900:
-        text = text[:3890] + "\n…"
-    follow = (
-        f"\n\nШаг 4: «Показать карточки» — {len(in_scope)} снимков, «➕ в корзину», затем «🛒 Корзина» для суммы и заказа."
-    )
-    if len(text) + len(follow) <= 4090:
-        text = text + follow
 
-    rows: List[List[InlineKeyboardButton]] = []
-    cb_g = f"g:{cat_tok}:{rar_tok}"
-    if len(cb_g.encode("utf-8")) <= 64:
-        rows.append(
+def _tinder_caption(p: dict, cur_1: int, n_total: int) -> str:
+    name = (p.get("name") or "—")
+    r_raw = str(p.get("rarity", "") or "").strip() or "—"
+    r = _rarity_label_ru(r_raw)
+    v = p.get("price", 0)
+    try:
+        pstr = f"{int(float(v))} BYN"
+    except (TypeError, ValueError):
+        pstr = "—"
+    if len(name) > 200:
+        name = name[:197] + "…"
+    c = f"{name}\n\n💰 {pstr}\n⭐ {r}\n\n{cur_1} / {n_total}"
+    if len(c) > 1024:
+        c = c[:1020] + "…"
+    return c
+
+
+def _tinder_keyboard(cat_tok: str, user_data: dict) -> InlineKeyboardMarkup:
+    c = str(cat_tok)[:12]
+    if user_data.get("tinder_autoplay_paused", False):
+        auto_btn = InlineKeyboardButton("▶️ Продолжить", callback_data="t:f")
+    else:
+        auto_btn = InlineKeyboardButton("⏸ Пауза", callback_data="t:f")
+    return InlineKeyboardMarkup(
+        [
             [
-                InlineKeyboardButton(
-                    f"🖼 Показать карточки ({len(in_scope)} шт.)",
-                    callback_data=cb_g,
-                )
+                InlineKeyboardButton("⬅️ Назад", callback_data="t:p"),
+                InlineKeyboardButton("❤️ В корзину", callback_data="t:c"),
+                InlineKeyboardButton("➡️ Далее", callback_data="t:n"),
             ],
-        )
-    nav: List[InlineKeyboardButton] = []
-    p_prev = f"p:{cat_tok}:{rar_tok}:{page - 1}"
-    p_next = f"p:{cat_tok}:{rar_tok}:{page + 1}"
-    if page > 0 and len(p_prev) <= 64:
-        nav.append(InlineKeyboardButton("◀️", callback_data=p_prev))
-    if page < total - 1 and len(p_next) <= 64:
-        nav.append(InlineKeyboardButton("▶️", callback_data=p_next))
-    if nav:
-        rows.append(nav)
-    rows.append(
-        [InlineKeyboardButton("⬅ К выбору редкости", callback_data=f"h:{cat_tok}")],
+            [auto_btn, InlineKeyboardButton("⬅️ К редкости", callback_data=f"h:{c}")],
+        ]
     )
-    return text, InlineKeyboardMarkup(rows)
+
+
+def _tinder_cancel_autoplay(user_data: dict) -> None:
+    t = user_data.get("tinder_autoplay_task")
+    if isinstance(t, asyncio.Task) and not t.done():
+        t.cancel()
+    user_data.pop("tinder_autoplay_task", None)
+
+
+async def _tinder_message_edit(
+    context: ContextTypes.DEFAULT_TYPE,
+    message: Optional[Message],
+    chat_id: int,
+    message_id: int,
+    ud: dict,
+) -> bool:
+    log = logging.getLogger(__name__)
+    gixs: List[int] = list(ud.get("tinder_gidxs") or [])
+    products: List[dict] = list(context.application.bot_data.get("products") or [])
+    if not gixs or not products:
+        return False
+    n = len(gixs)
+    if n == 0:
+        return False
+    i = int(ud.get("tinder_i", 0)) % n
+    gidx = gixs[i]
+    if gidx < 0 or gidx >= len(products):
+        return False
+    p = products[gidx]
+    cap = _tinder_caption(p, i + 1, n)
+    media = InputMediaPhoto(
+        media=_tinder_photo_url(p),
+        caption=cap,
+    )
+    ctk = str(ud.get("tinder_cat_tok", "all"))[:12]
+    kb = _tinder_keyboard(ctk, ud)
+    try:
+        if message and message.message_id == message_id and message.chat_id == chat_id:
+            try:
+                await message.edit_media(media=media, reply_markup=kb)
+            except Exception as e1:
+                log.info("Tinder: edit_media fallback: %s", e1)
+                try:
+                    await message.edit_caption(caption=cap, reply_markup=kb)
+                except Exception as e2:
+                    log.exception("Tinder: %s", e2)
+                    return False
+        else:
+            try:
+                await context.bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=kb,
+                )
+            except Exception as e1:
+                log.info("Tinder: edit_message_media fallback: %s", e1)
+                try:
+                    await context.bot.edit_message_caption(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        caption=cap,
+                        reply_markup=kb,
+                    )
+                except Exception as e2:
+                    log.exception("Tinder: %s", e2)
+                    return False
+    except Exception as e0:
+        log.exception("Tinder: %s", e0)
+        return False
+    return True
+
+
+def _tinder_start_autoplay(context: ContextTypes.DEFAULT_TYPE, user_data: dict) -> None:
+    _tinder_cancel_autoplay(user_data)
+    if user_data.get("tinder_autoplay_paused", False):
+        return
+    if not user_data.get("tinder_gidxs") or not user_data.get("tinder_message_id"):
+        return
+    t = asyncio.create_task(
+        _tinder_autoplay_loop(context, user_data),
+        name="tinder_autoplay",
+    )
+    user_data["tinder_autoplay_task"] = t
+
+
+async def _tinder_autoplay_loop(
+    context: ContextTypes.DEFAULT_TYPE, user_data: dict) -> None:
+    log = logging.getLogger(__name__)
+    try:
+        while True:
+            if not user_data.get("tinder_gidxs"):
+                return
+            if user_data.get("tinder_autoplay_paused", False):
+                return
+            try:
+                await asyncio.sleep(3)
+            except asyncio.CancelledError:
+                return
+            if not user_data.get("tinder_gidxs"):
+                return
+            if user_data.get("tinder_autoplay_paused", False):
+                return
+            gixs: List[int] = list(user_data.get("tinder_gidxs") or [])
+            n = len(gixs)
+            if n == 0:
+                return
+            new_i = (int(user_data.get("tinder_i", 0)) + 1) % n
+            user_data["tinder_i"] = new_i
+            cid = int(user_data.get("tinder_chat_id", 0))
+            mid = int(user_data.get("tinder_message_id", 0))
+            if not cid or not mid:
+                return
+            if not await _tinder_message_edit(
+                context, None, cid, mid, user_data
+            ):
+                return
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        log.exception("Tinder: autoplay %s", e)
+
+
+async def _tinder_start_deck(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    in_scope: List[dict],
+    products: List[dict],
+    cat_tok: str,
+) -> bool:
+    gixs: List[int] = []
+    for p in in_scope:
+        gixs.append(_global_product_index(products, p))
+    if not gixs:
+        return False
+    ud = context.user_data
+    ud["tinder_gidxs"] = gixs
+    ud["tinder_i"] = 0
+    ud["tinder_cat_tok"] = str(cat_tok)[:12]
+    n = len(gixs)
+    g0 = gixs[0]
+    if g0 < 0 or g0 >= len(products):
+        return False
+    p0 = products[g0]
+    cap = _tinder_caption(p0, 1, n)
+    photo = _tinder_photo_url(p0)
+    kw = str(cat_tok)[:12]
+    ud["tinder_autoplay_paused"] = False
+    kb = _tinder_keyboard(kw, ud)
+    _tinder_cancel_autoplay(ud)
+    sent: Optional[Message] = None
+    try:
+        sent = await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=photo,
+            caption=cap,
+            reply_markup=kb,
+        )
+    except Exception:
+        try:
+            sent = await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=TINDER_NO_IMAGE,
+                caption=cap,
+                reply_markup=kb,
+            )
+        except Exception:
+            return False
+    if not sent:
+        return False
+    ud["tinder_chat_id"] = int(sent.chat_id)
+    ud["tinder_message_id"] = int(sent.message_id)
+    _tinder_start_autoplay(context, ud)
+    return True
+
+
+async def _tinder_start(
+    q: CallbackQuery,
+    context: ContextTypes.DEFAULT_TYPE,
+    in_scope: List[dict],
+    products: List[dict],
+    cat_tok: str,
+) -> None:
+    m = q.message
+    if not m:
+        return
+    try:
+        await m.delete()
+    except Exception:
+        pass
+    await _tinder_start_deck(context, m.chat_id, in_scope, products, cat_tok)
+
+
+async def on_tinder_swipe(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """t:p t:n t:c t:f — листалка Tinder; t:f = пауза/продолжить авто-показ."""
+    q = update.callback_query
+    if not q or not q.data or not q.message:
+        return
+    s = (q.data or "").strip()
+    m = re.match(r"^t:([pncf])$", s)
+    if not m:
+        return
+    op = m.group(1)
+    if not q.message.photo and op != "f":
+        await q.answer("Открой снова: 📦 Каталог", show_alert=True)
+        return
+    ud = context.user_data
+    _tinder_cancel_autoplay(ud)
+    gixs: List[int] = list(ud.get("tinder_gidxs") or [])
+    products: List[dict] = list(context.application.bot_data.get("products") or [])
+    if not gixs or not products:
+        await q.answer("Сессия сброшена — открой «📦 Каталог»", show_alert=True)
+        return
+    n = len(gixs)
+    if n == 0:
+        return
+    if op == "f":
+        if not q.message.photo:
+            await q.answer("Нет клавиатуры", show_alert=True)
+            return
+        new_paused = not bool(ud.get("tinder_autoplay_paused", False))
+        ud["tinder_autoplay_paused"] = new_paused
+        ctk = str(ud.get("tinder_cat_tok", "all"))[:12]
+        try:
+            await q.message.edit_reply_markup(
+                reply_markup=_tinder_keyboard(ctk, ud)
+            )
+        except Exception:
+            pass
+        await q.answer("⏸ Пауза" if new_paused else "▶ Автопоказ, следующая — через 3 с")
+        if not new_paused:
+            _tinder_start_autoplay(context, ud)
+        return
+    i = int(ud.get("tinder_i", 0)) % n
+    if op == "n":
+        i = (i + 1) % n
+    elif op == "p":
+        i = (i - 1) % n
+    else:
+        gix_cur = gixs[i]
+        p_cur = products[gix_cur] if 0 <= gix_cur < len(products) else None
+        if p_cur is None:
+            await q.answer("Нет в каталоге", show_alert=True)
+            return
+        ref = _product_ref_for_callback(p_cur, gix_cur)
+        _cart_add_line(
+            ud, ref, p_cur, p_cur.get("name") or "—", _product_price(p_cur)
+        )
+        i = (i + 1) % n
+    ud["tinder_i"] = i
+    cid = int(q.message.chat_id)
+    mid = int(q.message.message_id)
+    ok = await _tinder_message_edit(context, q.message, cid, mid, ud)
+    if not ok:
+        await q.answer("Не получилось обновить, открой «📦 Каталог»", show_alert=True)
+        return
+    if op == "c":
+        lines = _cart_get_lines(ud)
+        tot, _ = _cart_totals(lines)
+        short = f"{len(lines)} п. · {tot} BYN"
+        await q.answer(f"В корзине: {short}", show_alert=False)
+    else:
+        await q.answer()
+    if not ud.get("tinder_autoplay_paused", False):
+        _tinder_start_autoplay(context, ud)
 
 
 async def illucards_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -614,7 +839,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not t:
             await msg.reply_text("Привет!", reply_markup=REPLY_KB)
         else:
-            out = f"🛒 Ваш заказ:\n{t}"
+            out = f"📦 Ваш заказ:\n{t}"
             if len(out) > 4096:
                 out = out[:4090] + "…"
             await msg.reply_text(
@@ -658,8 +883,7 @@ async def catalog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def send_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Мастер: категория → редкость (подписи на рус.) → полный перечень названий (шаг 3) →
-    по кнопке «Показать карточки» — фото с ценой.
+    Категория → редкость → Tinder-просмотр (1 карта, листалка), корзина.
     """
     msg = update.effective_message
     if not msg:
@@ -677,15 +901,31 @@ async def send_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not categories:
         await msg.reply_text("Категории не найдены")
         return
-    log.info("Каталог: шаг 1, категорий=%d (фото — только после кнопки в шаге 4)", len(categories))
+    log.info("Каталог: %d разделов", len(categories))
     await msg.reply_text(
-        "Коллекция (illucards)\n"
-        "1) Категория (или «Все категории»)\n"
-        "2) Редкость на русском в кнопках, или «Все редкости»\n"
-        "3) Полный список: сверху фильтр, ниже — номер и название (при длине списка — листайте ◀▶)\n"
-        "4) «Показать карточки» — снимки, «➕ в корзину»; «🛒 Корзина» — сумма, оформление, @username",
+        "🔥 Коллекция",
         reply_markup=_kb_categories(categories),
     )
+
+
+async def send_tinder_mode(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «🔥 Смотреть карточки» — Tinder по всему каталогу (cat_tok all)."""
+    msg = update.effective_message
+    if not msg:
+        return
+    products = await _get_products(context)
+    if not products:
+        await msg.reply_text(
+            "Пока нет карточек. Сначала открой «📦 Каталог» или подожди загрузки."
+        )
+        return
+    in_scope = list(products)
+    ok = await _tinder_start_deck(
+        context, int(msg.chat_id), in_scope, products, "all"
+    )
+    if not ok:
+        await msg.reply_text("Не получилось открыть просмотр. Попробуй ещё раз.")
 
 
 async def send_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -728,7 +968,7 @@ async def _edit_to_categories(
         await q.edit_message_text("Категорий нет")
         return
     await q.edit_message_text(
-        "Коллекция (illucards). Шаг 1 — категория (или «Все категории»).",
+        "🔥 Коллекция",
         reply_markup=_kb_categories(cats),
     )
 
@@ -753,7 +993,7 @@ async def on_pick_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     cats = _category_names(products)
     if key == "all":
         rlist = _rarities_globally(products) or ["—"]
-        t = "Коллекция: все категории\n\nШаг 2 — выберите редкость (подписи на русском) или «Все редкости»"
+        t = "🔥 Все разделы\n\n⭐ Редкость"
         await q.answer()
         await q.edit_message_text(t, reply_markup=_kb_rarities("all", rlist))
         return
@@ -763,7 +1003,7 @@ async def on_pick_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     cat = cats[ci]
     rlist = _rarities_in_category(products, cat) or ["—"]
-    t = f"Коллекция: {cat}\n\nШаг 2 — редкость (подписи на русском) или «Все редкости»"
+    t = f"🔥 {cat}\n\n⭐ Редкость"
     await q.answer()
     await q.edit_message_text(t, reply_markup=_kb_rarities(str(ci), rlist))
 
@@ -778,42 +1018,18 @@ async def on_pick_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     cat_tok, rar_tok = m.group(1), m.group(2)
     products = await _get_products(context)
     cats = _category_names(products)
-    in_scope, c_lab, r_lab = _filter_wizard(products, cats, cat_tok, rar_tok)
+    in_scope, c_lab, _r_lab = _filter_wizard(products, cats, cat_tok, rar_tok)
     if not c_lab:
-        await q.answer("Сначала выбери шаг 1 (категория).", show_alert=True)
+        await q.answer("Нет раздела", show_alert=True)
         return
     if rar_tok != "all" and not in_scope:
         await q.answer("По такой редкости пусто.", show_alert=True)
         return
-    body, kb = _numbered_list_view(
-        in_scope, cat_tok, rar_tok, 0, c_lab, r_lab
-    )
+    if not in_scope:
+        await q.answer("В выборе пока нет карточек.", show_alert=True)
+        return
     await q.answer()
-    await q.edit_message_text(body, reply_markup=kb)
-
-
-async def on_card_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    if not q or not q.data:
-        return
-    m = re.match(r"^p:([^:]+):([^:]+):(\d+)$", (q.data or "").strip())
-    if not m:
-        return
-    cat_tok, rar_tok, pg = m.group(1), m.group(2), int(m.group(3))
-    if pg < 0 or pg > 2000:
-        await q.answer("Список устарел", show_alert=True)
-        return
-    products = await _get_products(context)
-    cats = _category_names(products)
-    in_scope, c_lab, r_lab = _filter_wizard(products, cats, cat_tok, rar_tok)
-    if not c_lab:
-        await q.answer("Список устарел", show_alert=True)
-        return
-    body, kb = _numbered_list_view(
-        in_scope, cat_tok, rar_tok, pg, c_lab, r_lab
-    )
-    await q.answer()
-    await q.edit_message_text(body, reply_markup=kb)
+    await _tinder_start(q, context, in_scope, products, cat_tok)
 
 
 async def on_back_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -825,85 +1041,51 @@ async def on_back_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     await q.answer()
     cat_tok = m.group(1)
+    udi = context.user_data
+    _tinder_cancel_autoplay(udi)
+    udi.pop("tinder_gidxs", None)
+    udi.pop("tinder_i", None)
+    udi.pop("tinder_cat_tok", None)
+    udi.pop("tinder_message_id", None)
+    udi.pop("tinder_chat_id", None)
+    udi.pop("tinder_autoplay_paused", None)
     products = await _get_products(context)
     cats = _category_names(products)
     if cat_tok == "all":
         rlist = _rarities_globally(products) or ["—"]
-        t = "Коллекция: все категории (шаг 2 — редкость, подписи на русском)"
-        await q.edit_message_text(t, reply_markup=_kb_rarities("all", rlist))
-        return
-    cix = int(cat_tok)
-    if cix < 0 or cix >= len(cats):
-        await _edit_to_categories(q, context)
-        return
-    cat = cats[cix]
-    rlist = _rarities_in_category(products, cat) or ["—"]
-    await q.edit_message_text(
-        f"Коллекция: {cat}\n(шаг 2 — редкость, подписи на русском)",
-        reply_markup=_kb_rarities(str(cix), rlist),
-    )
-
-
-async def on_send_all_cards(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """g:{cat_tok}:{rar_tok} — после выбора фильтра: все карточки из подборки (фото, цена, купить)."""
-    q = update.callback_query
-    if not q or not q.message or not q.data:
-        return
-    m = re.match(r"^g:([^:]+):([^:]+)$", (q.data or "").strip())
-    if not m:
-        return
-    cat_tok, rar_tok = m.group(1), m.group(2)
-    products = await _get_products(context)
-    if not products:
-        await q.answer("Каталог пуст. Откройте «📦 Каталог» снова.", show_alert=True)
-        return
-    cats = _category_names(products)
-    in_scope, c_lab, r_lab = _filter_wizard(products, cats, cat_tok, rar_tok)
-    if not c_lab:
-        await q.answer("Список устарел, начните с каталога.", show_alert=True)
-        return
-    if not in_scope:
-        await q.answer("По этому фильтру нет карт.", show_alert=True)
-        return
-    n = len(in_scope)
-    await q.answer("Отправляю карточки…", show_alert=False)
-    if n > 20:
-        await q.message.reply_text(
-            f"Сейчас пошлём {n} карточек: фото, «➕ в корзину» и дальше — «🛒 Корзина» для суммы и заказа."
-        )
-    site_line = ILLUCARDS_BASE.removeprefix("https://").removeprefix("http://")
-    for i, p in enumerate(in_scope, 1):
-        gidx = _global_product_index(products, p)
-        cap = f"Карта {i} из {n}\nФильтр: {c_lab} • {r_lab}\n\n" + _format_caption(
-            p
-        ) + f"\n🌐 {site_line}"
-        if len(cap) > 1020:
-            cap = cap[:1016] + "…"
-        ref = _product_ref_for_callback(p, gidx)
-        a_cb = f"a:{ref}"
-        if len(a_cb.encode("utf-8")) > 64:
-            a_cb = f"a:{gidx}"
-        vc_cb = "vc:0"
-        kb = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("➕ В корзину", callback_data=a_cb)],
-                [InlineKeyboardButton("🛒 Открыть корзину", callback_data=vc_cb)],
-            ],
-        )
-        photo = str(p.get("image") or "")
+        t = "🔥 Все разделы\n\n⭐ Редкость"
+        kb = _kb_rarities("all", rlist)
+    else:
         try:
-            if photo:
-                await q.message.reply_photo(photo=photo, caption=cap, reply_markup=kb)
-            else:
-                await q.message.reply_text(cap, reply_markup=kb)
+            cix = int(cat_tok)
+        except ValueError:
+            await _edit_to_categories(q, context)
+            return
+        if cix < 0 or cix >= len(cats):
+            await _edit_to_categories(q, context)
+            return
+        cat = cats[cix]
+        rlist = _rarities_in_category(products, cat) or ["—"]
+        t = f"🔥 {cat}\n\n⭐ Редкость"
+        kb = _kb_rarities(str(cix), rlist)
+    qm = q.message
+    if qm and qm.photo:
+        try:
+            await qm.delete()
         except Exception:
-            await q.message.reply_text(cap, reply_markup=kb)
-        if i < n and (i % 3 == 0 or n > 30):
-            await asyncio.sleep(0.12)
-    if n:
-        await q.message.reply_text(
-            "Соберите заказ: «➕» в корзину, внизу — «🛒 Корзина» — там сумма, оформление и @username."
+            pass
+        await context.bot.send_message(
+            qm.chat_id, text=t, reply_markup=kb
         )
+        return
+    try:
+        if qm:
+            await q.edit_message_text(t, reply_markup=kb)
+    except Exception:
+        if qm:
+            await context.bot.send_message(
+                qm.chat_id, text=t, reply_markup=kb
+            )
 
 
 async def _edit_cart_message(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -948,8 +1130,8 @@ async def on_add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lines = _cart_get_lines(context.user_data)
     tot, npos = _cart_totals(lines)
     nlines = len(lines)
-    short = f"Сумма {tot} ₽, шт. {npos}"
-    await q.answer(f"➕ В корзине {nlines} п. · {short}", show_alert=False)
+    short = f"{tot} BYN, шт. {npos}"
+    await q.answer(f"В корзине: {nlines} п. · {short}", show_alert=False)
 
 
 async def on_cart_remove_line(
@@ -969,6 +1151,59 @@ async def on_cart_remove_line(
     await _edit_cart_message(q, context)
 
 
+async def on_cart_increment(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    q = update.callback_query
+    if not q or not q.data or not q.message:
+        return
+    m = re.match(r"^ic:(\d+)$", (q.data or "").strip())
+    if not m:
+        return
+    ix = int(m.group(1))
+    lines = _cart_get_lines(context.user_data)
+    if not (0 <= ix < len(lines)):
+        await q.answer("Позиция устарела", show_alert=True)
+        return
+    ref = str(lines[ix].get("ref"))
+    app = context.application
+    products: List[dict] = list(app.bot_data.get("products") or [])
+    product = _product_from_callback(ref, products)
+    if product is None:
+        extra = await load_products()
+        if extra:
+            app.bot_data["products"] = extra
+        products = list(app.bot_data.get("products") or [])
+        product = _product_from_callback(ref, products)
+    if product is None:
+        await q.answer("Карта не в каталоге", show_alert=True)
+        return
+    gix = _global_product_index(products, product)
+    r = _product_ref_for_callback(product, gix)
+    _cart_add_line(
+        context.user_data, r, product, product.get("name") or "—", _product_price(product)
+    )
+    await q.answer()
+    await _edit_cart_message(q, context)
+
+
+async def on_cart_decrement(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    q = update.callback_query
+    if not q or not q.data or not q.message:
+        return
+    m = re.match(r"^dc:(\d+)$", (q.data or "").strip())
+    if not m:
+        return
+    ix = int(m.group(1))
+    if not _cart_dec_line(context.user_data, ix):
+        await q.answer("Позиция устарела", show_alert=True)
+        return
+    await q.answer()
+    await _edit_cart_message(q, context)
+
+
 async def on_cart_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not q or not q.data or not q.message:
@@ -983,6 +1218,7 @@ async def on_cart_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def on_checkout_ask_username(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    """co:0 — предпросмотр заказа + кнопка «Отправить админу»."""
     q = update.callback_query
     if not q or not q.data or not q.message:
         return
@@ -992,15 +1228,44 @@ async def on_checkout_ask_username(
     if not lines:
         await q.answer("Корзина пуста", show_alert=True)
         return
-    tot, npos = _cart_totals(lines)
     context.user_data["order_checkout"] = deepcopy(lines)
-    context.user_data["awaiting_order_username"] = True
+    preview = _format_checkout_preview_for_user(lines)
     await q.answer()
     await q.message.reply_text(
-        f"Сумма заказа: {tot} ₽ (всего {npos} шт., поз. {len(lines)}).\n"
-        f"Напиши ниже свой @username (как в Telegram) — по нему с тобой свяжутся.\n"
-        f"Состав и сумма уйдут админу, с упоминанием {ORDER_MENTION}."
+        preview,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📩 Отправить админу", callback_data="ta:0")],
+            ],
+        ),
     )
+
+
+async def on_send_order_to_admin(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ta:0 — в чат админа: новый заказ, список, username."""
+    q = update.callback_query
+    if not q or not q.data or not q.message:
+        return
+    if (q.data or "").strip() != "ta:0":
+        return
+    ud = context.user_data
+    lines: Optional[List[dict]] = ud.get("order_checkout")
+    if not lines:
+        await q.answer("Сначала нажми «✅ Оформить заказ»", show_alert=True)
+        return
+    u = q.from_user
+    ok = await _send_new_order_to_admin(context, u, list(lines))
+    if not ok:
+        if not ORDER_NOTIFY_CHAT_ID:
+            await q.answer("Админ-чат не настроен (TELEGRAM_ORDER_NOTIFY_ID)", show_alert=True)
+        else:
+            await q.answer("Не получилось отправить", show_alert=True)
+        return
+    _cart_clear(ud)
+    ud.pop("order_checkout", None)
+    await q.answer("Готово")
+    await q.message.reply_text("Заказ отправлен. Скоро с вами свяжутся.")
 
 
 async def on_view_cart_callback(
@@ -1019,16 +1284,6 @@ async def on_view_cart_callback(
     await q.message.reply_text(t, reply_markup=kb)
 
 
-def _is_username_suggestion(s: str) -> bool:
-    t = s.strip()
-    if not t.startswith("@"):
-        return False
-    u = t[1:]
-    if not (5 <= len(u) <= 32) or not u[0].isalpha():
-        return False
-    return all(c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for c in u)
-
-
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg or not msg.text:
@@ -1036,45 +1291,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = msg.text.strip()
     user_data = context.user_data
 
-    if text in ("📦 Каталог", "🔥 Акции", "💬 Связь"):
-        user_data.pop("awaiting_order_username", None)
+    if text in ("📦 Каталог", "🔥 Смотреть карточки", "🔥 Акции", "💬 Связь"):
         user_data.pop("order_checkout", None)
-
-    if user_data.get("awaiting_order_username"):
-        if text in ("🛒 Корзина",):
-            await msg.reply_text(
-                "Сначала напиши свой @username (одна строка), чтобы завершить заказ — или сброс: «📦 Каталог»."
-            )
-            return
-        if not _is_username_suggestion(text):
-            await msg.reply_text("Напиши Telegram-логин с @, например @myname (одной строкой).")
-            return
-        lines: Optional[List[dict]] = user_data.get("order_checkout")
-        user = msg.from_user
-        user_data.pop("awaiting_order_username", None)
-        user_data.pop("order_checkout", None)
-        if not lines:
-            await msg.reply_text("Сессия оформления сброшена. Соберите «🛒 Корзина» снова.")
-            return
-        ob, tot = _order_snapshot_for_notify(lines)
-        _cart_clear(user_data)
-        ok = await _notify_admins(context, user, text, ob)
-        log = logging.getLogger(__name__)
-        if ok:
-            note = (
-                f"Принято! Заказ на {tot} ₽. Скоро с вами свяжутся. "
-                f"Админу и {ORDER_MENTION} ушло уведомление с составом заказа."
-            )
-        else:
-            if not ORDER_NOTIFY_CHAT_ID:
-                log.warning("TELEGRAM_ORDER_NOTIFY_ID не настроен — уведомление в чат не отправлено")
-            note = (
-                f"Принято! Заказ на {tot} ₽, логин для связи: {text}.\n"
-                f"Сообщение боту не доставилось (проверьте TELEGRAM_ORDER_NOTIFY_ID в .env) — "
-                f"напишите {ORDER_MENTION} вручную, если вас не наберут."
-            )
-        await msg.reply_text(note)
-        return
 
     if text == "🛒 Корзина":
         cl = _cart_get_lines(user_data)
@@ -1085,6 +1303,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if text == "📦 Каталог":
         await send_catalog(update, context)
+    elif text == "🔥 Смотреть карточки":
+        await send_tinder_mode(update, context)
     elif text == "🔥 Акции":
         await send_promo(update, context)
     elif text == "💬 Связь":
@@ -1133,12 +1353,14 @@ def main() -> None:
     app.add_handler(CommandHandler("catalog", catalog_cmd))
     app.add_handler(CallbackQueryHandler(confirm, pattern="confirm"))
     app.add_handler(CallbackQueryHandler(on_checkout_ask_username, pattern=re.compile(r"^co:0$")))
+    app.add_handler(CallbackQueryHandler(on_send_order_to_admin, pattern=re.compile(r"^ta:0$")))
     app.add_handler(CallbackQueryHandler(on_view_cart_callback, pattern=re.compile(r"^vc:0$")))
+    app.add_handler(CallbackQueryHandler(on_cart_increment, pattern=re.compile(r"^ic:(\d+)$")))
+    app.add_handler(CallbackQueryHandler(on_cart_decrement, pattern=re.compile(r"^dc:(\d+)$")))
     app.add_handler(CallbackQueryHandler(on_cart_remove_line, pattern=re.compile(r"^rm:(\d+)$")))
     app.add_handler(CallbackQueryHandler(on_cart_clear, pattern=re.compile(r"^cz:0$")))
+    app.add_handler(CallbackQueryHandler(on_tinder_swipe, pattern=re.compile(r"^t:([pncf])$")))
     app.add_handler(CallbackQueryHandler(on_add_to_cart, pattern=re.compile(r"^a:(.+)$")))
-    app.add_handler(CallbackQueryHandler(on_send_all_cards, pattern=re.compile(r"^g:([^:]{1,12}):([^:]{1,6})$")))
-    app.add_handler(CallbackQueryHandler(on_card_page, pattern=re.compile(r"^p:([^:]{1,12}):([^:]{1,6}):(\d+)$")))
     app.add_handler(CallbackQueryHandler(on_back_rarity, pattern=re.compile(r"^h:([^:]{1,12})$")))
     app.add_handler(CallbackQueryHandler(on_menu_main, pattern=re.compile(r"^m:0$")))
     app.add_handler(CallbackQueryHandler(on_pick_rarity, pattern=re.compile(r"^j:([^:]{1,12}):(all|\d+)$")))
