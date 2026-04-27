@@ -5,12 +5,14 @@
 #   pip list | grep dotenv
 #   python bot.py
 # Если pip не найден: python3 -m pip install python-dotenv
+import asyncio
 import logging
 import os
 import re
 import sys
 import time
-from typing import List, Optional
+from copy import deepcopy
+from typing import List, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -39,19 +41,75 @@ logging.basicConfig(
 
 load_dotenv()
 token = os.getenv("TELEGRAM_BOT_TOKEN")
+# Куда бот пишет о новых заказах (ваш user id, id группы с ботом или @username через getChat).
+# Можно узнать у @userinfobot, у группы: добавить бота и /chatid (или похожие). Должен быть int.
+def _read_notify_chat() -> Optional[int]:
+    s = (os.getenv("TELEGRAM_ORDER_NOTIFY_ID") or os.getenv("ORDER_NOTIFY_CHAT_ID") or "").strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+ORDER_NOTIFY_CHAT_ID: Optional[int] = _read_notify_chat()
+ORDER_MENTION = (os.getenv("ORDER_MENTION", "@Daniel_official") or "@Daniel_official").strip()
+
+# Уведомления о заказе из deep link t.me/bot?start=... (числовой user id в Telegram)
+try:
+    ADMIN_ID: int = int((os.getenv("ADMIN_ID") or "0").strip() or "0")
+except ValueError:
+    ADMIN_ID = 0
+
+# callback для «Оформить» после /start <текст заказа> (лимит 64 байт)
+DEEPLINK_ORDER_CB = "dl:ok"
 
 CARDS_JSON_URL = os.getenv("CARDS_JSON_URL", "https://www.illucards.by/cards.json")
 
 PROMO_PHOTO = "https://picsum.photos/seed/promo/400/300"
 ILLUCARDS_BASE = "https://www.illucards.by"
 SYNC_EVERY_SEC = int(os.getenv("ILLUCARDS_SYNC_EVERY_SEC", "900"))
-CARDS_PER_PAGE = 5
+# Шаг 3: столько пунктов (№ + название) в одном сообщении (пагинация при большом списке)
+LIST_ITEMS_PER_PAGE = 32
+
+# Редкости из API часто на английском — в интерфейсе показываем по-русски
+RARITY_RU: dict = {
+    "—": "б/р",
+    "common": "Обычная",
+    "uncommon": "Необычная",
+    "rare": "Редкая",
+    "epic": "Эпическая",
+    "legendary": "Легендарная",
+    "mythic": "Мифическая",
+    "foil": "Фойл",
+    "foiled": "Фойл",
+    "promo": "Промо",
+    "promotion": "Промо",
+    "special": "Особая",
+    "secret": "Секретная",
+    "default": "Стандартная",
+    "basic": "Базовая",
+    "holo": "Голо",
+    "holographic": "Голографическая",
+}
+
+
+def _rarity_label_ru(s: str) -> str:
+    t = (s or "").strip()
+    if t == "—" or t == "":
+        return "б/р"
+    if any("\u0400" <= c <= "\u04ff" for c in t):
+        return t
+    k = t.lower()
+    if k in RARITY_RU:
+        return RARITY_RU[k]
+    return t
 
 REPLY_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton("📦 Каталог")],
-        [KeyboardButton("🔥 Акции")],
-        [KeyboardButton("💬 Связь")],
+        [KeyboardButton("📦 Каталог"), KeyboardButton("🛒 Корзина")],
+        [KeyboardButton("🔥 Акции"), KeyboardButton("💬 Связь")],
     ],
     resize_keyboard=True,
 )
@@ -60,13 +118,15 @@ REPLY_KB = ReplyKeyboardMarkup(
 def _format_caption(p: dict) -> str:
     name = p.get("name") or "Без названия"
     category = p.get("category") or ""
-    rarity = str(p.get("rarity", "") or "").strip()
+    r_raw = str(p.get("rarity", "") or "").strip() or "—"
     price = p.get("price")
     price_str = str(price) if price is not None and price != "" else "—"
-    lines = [f"{name}", f"Категория: {category}"]
-    if rarity and rarity != "—":
-        lines.append(f"Редкость: {rarity}")
-    lines.append(f"Цена: {price_str}")
+    lines = [
+        f"{name}",
+        f"Категория: {category}",
+        f"Редкость: {_rarity_label_ru(r_raw)}",
+        f"Цена: {price_str}",
+    ]
     return "\n".join(lines)
 
 
@@ -109,14 +169,6 @@ async def load_products() -> List[dict]:
     return cards
 
 
-def _format_buy_callback(p: dict, index: int) -> str:
-    """До 64 байт. Сначала id с сайта, иначе индекс (совместимость)."""
-    pid = p.get("id")
-    if pid is not None and str(pid).strip() != "":
-        return f"buy:{pid}"
-    return f"buy:{index}"
-
-
 def _product_from_callback(ref: str, products: List[dict]) -> Optional[dict]:
     if not ref or not products:
         return None
@@ -129,6 +181,180 @@ def _product_from_callback(ref: str, products: List[dict]) -> Optional[dict]:
         if 0 <= i < len(products):
             return products[i]
     return None
+
+
+def _product_ref_for_callback(p: dict, index: int) -> str:
+    pid = p.get("id")
+    if pid is not None and str(pid).strip() != "":
+        return str(pid).strip()
+    return str(index)
+
+
+def _product_price(p: dict) -> int:
+    v = p.get("price", 0)
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cart_get_lines(user_data: dict) -> List[dict]:
+    c = user_data.get("cart")
+    if not isinstance(c, list):
+        return []
+    return c
+
+
+def _cart_add_line(
+    user_data: dict, ref: str, product: dict, name: str, price: int
+) -> None:
+    lines = _cart_get_lines(user_data)
+    for line in lines:
+        if str(line.get("ref")) == ref:
+            line["qty"] = int(line.get("qty") or 1) + 1
+            user_data["cart"] = lines
+            return
+    lines.append({"ref": ref, "name": name, "price": price, "qty": 1})
+    user_data["cart"] = lines
+
+
+def _cart_remove_line(user_data: dict, index: int) -> bool:
+    lines = _cart_get_lines(user_data)
+    if 0 <= index < len(lines):
+        lines.pop(index)
+        user_data["cart"] = lines
+        return True
+    return False
+
+
+def _cart_clear(user_data: dict) -> None:
+    user_data["cart"] = []
+
+
+def _cart_totals(lines: List[dict]) -> Tuple[int, int]:
+    t = 0
+    n = 0
+    for x in lines:
+        q = int(x.get("qty") or 1)
+        p = int(x.get("price") or 0)
+        t += p * q
+        n += q
+    return t, n
+
+
+def _format_cart_message(lines: List[dict]) -> str:
+    if not lines:
+        return "Корзина пуста. Добавь карточки из коллекции (кнопка «➕ В корзину» под снимками) или нажми 📦 Каталог."
+    total, npos = _cart_totals(lines)
+    parts: List[str] = [
+        "🛒 Корзина",
+    ]
+    if len(lines) > 20:
+        parts.append(
+            "Кнопки «➖» — только для первых 20 поз.; если больше, нажмите «Очистить» и соберите снова."
+        )
+    parts += [
+        f"Позиций: {len(lines)} | штук: {npos} | сумма: {total} ₽",
+        "",
+    ]
+    for i, x in enumerate(lines, 1):
+        name = (x.get("name") or "—")[:120]
+        if len((x.get("name") or "")) > 120:
+            name += "…"
+        q = int(x.get("qty") or 1)
+        p = int(x.get("price") or 0)
+        sub = p * q
+        parts.append(f"{i}) {name}")
+        parts.append(f"   {p} ₽ × {q} = {sub} ₽")
+    parts.append("")
+    parts.append(
+        f"Снизу — убрать позицию, «Очистить» или «Оформить заказ». "
+        f"После оформления бот попросит твой @username: заказ и сумма уйдут {ORDER_MENTION} и администратору; с тобой свяжутся в ближайшее время."
+    )
+    s = "\n".join(parts)
+    if len(s) > 3900:
+        s = s[:3890] + "…"
+    return s
+
+
+def _kb_cart(lines: List[dict]) -> Optional[InlineKeyboardMarkup]:
+    if not lines:
+        return None
+    rows: List[List[InlineKeyboardButton]] = []
+    n_show = min(20, len(lines))
+    for i in range(n_show):
+        x = lines[i]
+        nm = (x.get("name") or "—")[:28]
+        if len((x.get("name") or "")) > 28:
+            nm = nm.rstrip() + "…"
+        q = int(x.get("qty") or 1)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"➖ {i + 1}. {nm} (×{q})",
+                    callback_data=f"rm:{i}",
+                )
+            ],
+        )
+    rows.append(
+        [
+            InlineKeyboardButton("🧹 Очистить", callback_data="cz:0"),
+            InlineKeyboardButton("✅ Оформить заказ", callback_data="co:0"),
+        ],
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _order_snapshot_for_notify(lines: List[dict]) -> Tuple[str, int]:
+    total, _ = _cart_totals(lines)
+    b = f"Сумма: {total} ₽\n\n"
+    for i, x in enumerate(lines, 1):
+        n = (x.get("name") or "—")[:200]
+        p = int(x.get("price") or 0)
+        q = int(x.get("qty") or 1)
+        b += f"{i}) {n} — {p} ₽ × {q} = {p * q} ₽\n"
+    return b, total
+
+
+async def _notify_admins(
+    context: ContextTypes.DEFAULT_TYPE,
+    user,
+    client_username: str,
+    order_body: str,
+) -> bool:
+    """Пишет в TELEGRAM_ORDER_NOTIFY_ID: заказ, сумма, @Daniel_official (пинг), данные покупателя."""
+    chat_id = ORDER_NOTIFY_CHAT_ID
+    if not chat_id:
+        return False
+    u = user or None
+    uid = u.id if u else "—"
+    t_un = f"@{u.username}" if u and u.username else "нет @username"
+    uname = (
+        f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+        if u
+        else "—"
+    )
+    if not uname:
+        uname = "—"
+    text = (
+        f"🛒 Новый заказ\n{ORDER_MENTION}\n\n"
+        f"Логин для заказа: {client_username}\n"
+        f"В боте: {t_un} | id: {uid} | {uname}\n\n"
+        f"{order_body}\n"
+        f"---\n"
+        f"Свяжитесь в ближайшее время. {ORDER_MENTION}"
+    )
+    if len(text) > 4090:
+        text = text[:4086] + "…"
+    log = logging.getLogger(__name__)
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id, text=text, disable_web_page_preview=True
+        )
+    except Exception as e:
+        log.exception("Ошибка отправки уведомления о заказе: %s", e)
+        return False
+    return True
 
 
 def _category_names(products: List[dict]) -> List[str]:
@@ -191,8 +417,8 @@ def _kb_rarities(cat_tok: str, rarities: List[str]) -> InlineKeyboardMarkup:
     ]
     row: List[InlineKeyboardButton] = []
     for i, r in enumerate(rarities):
-        label = (r if r != "—" else "б/р")[:16]
-        row.append(InlineKeyboardButton(_btn_label(label, 16), callback_data=f"j:{cat_tok}:{i}"))
+        label = _rarity_label_ru(r)[:20]
+        row.append(InlineKeyboardButton(_btn_label(label, 20), callback_data=f"j:{cat_tok}:{i}"))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -240,39 +466,49 @@ def _filter_wizard(
         return [], cat_label, ""
     rname = rlist[rix]
     out = [p for p in base if str(p.get("rarity", "—") or "—") == rname]
-    rlab = rname if rname != "—" else "б/р"
+    rlab = _rarity_label_ru(rname)
     return out, cat_label, rlab
 
 
 def _numbered_list_view(
     in_scope: List[dict],
-    all_products: List[dict],
     cat_tok: str,
     rar_tok: str,
     page: int,
     cat_label: str,
     rar_label: str,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Шаг 3: только нумерованные названия; кнопки-цифры — потом v: (фото и цена)."""
+    """
+    Шаг 3: сверху — выбранный фильтр, затем полный перечень «№. название» (по страницам);
+    картинки — только на шаге 4, по кнопке «Показать карточки».
+    """
     if not in_scope:
-        t = f"Коллекция: {cat_label}\nРедкость: {rar_label}\n\nПо выбранным фильтрам пусто."
+        t = (
+            f"Выбранные фильтры\n"
+            f"• Категория: {cat_label}\n"
+            f"• Редкость: {rar_label}\n\n"
+            f"По этим настройкам карт нет. Выбери другой фильтр (шаг 1 или 2)."
+        )
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("⬅ К редкости", callback_data=f"h:{cat_tok}")],
+                [InlineKeyboardButton("⬅ К выбору редкости", callback_data=f"h:{cat_tok}")],
             ]
         )
         return t, kb
-    total = max(1, (len(in_scope) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE)
+    total = max(1, (len(in_scope) + LIST_ITEMS_PER_PAGE - 1) // LIST_ITEMS_PER_PAGE)
     page = max(0, min(page, total - 1))
-    start = page * CARDS_PER_PAGE
-    chunk = in_scope[start : start + CARDS_PER_PAGE]
+    start = page * LIST_ITEMS_PER_PAGE
+    chunk = in_scope[start : start + LIST_ITEMS_PER_PAGE]
 
     parts: List[str] = [
-        f"Коллекция: {cat_label}",
-        f"Редкость: {rar_label}",
+        "Коллекция (шаг 3 из 4) — полный перечень по выбранному фильтру",
         "",
-        f"Шаг 3. Список № и название (без фото). Позиции {start + 1}–{start + len(chunk)} из {len(in_scope)}. Стр. {page + 1}/{total}.",
-        "Ниже — цифры. Нажми номер, чтобы в следующем шаге пришла карта, цена и картинка.",
+        "Выбранные фильтры",
+        f"• Категория: {cat_label}",
+        f"• Редкость: {rar_label}",
+        "",
+        "Список карт (номер — как в общей нумерации в пределах фильтра):",
+        f"позиции {start + 1}–{start + len(chunk)} из {len(in_scope)}; страница {page + 1} из {total}.",
         "",
     ]
     for k, p in enumerate(chunk, start=1 + start):
@@ -283,22 +519,23 @@ def _numbered_list_view(
     text = "\n".join(parts)
     if len(text) > 3900:
         text = text[:3890] + "\n…"
+    follow = (
+        f"\n\nШаг 4: «Показать карточки» — {len(in_scope)} снимков, «➕ в корзину», затем «🛒 Корзина» для суммы и заказа."
+    )
+    if len(text) + len(follow) <= 4090:
+        text = text + follow
 
     rows: List[List[InlineKeyboardButton]] = []
-    num_row: List[InlineKeyboardButton] = []
-    for k, p in enumerate(chunk):
-        n = 1 + start + k
-        gidx = _global_product_index(all_products, p)
-        cb = f"v:{gidx}"
-        if len(cb.encode("utf-8")) > 64:
-            continue
-        num_row.append(InlineKeyboardButton(str(n), callback_data=cb))
-        if len(num_row) == 5:
-            rows.append(num_row)
-            num_row = []
-    if num_row:
-        rows.append(num_row)
-
+    cb_g = f"g:{cat_tok}:{rar_tok}"
+    if len(cb_g.encode("utf-8")) <= 64:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🖼 Показать карточки ({len(in_scope)} шт.)",
+                    callback_data=cb_g,
+                )
+            ],
+        )
     nav: List[InlineKeyboardButton] = []
     p_prev = f"p:{cat_tok}:{rar_tok}:{page - 1}"
     p_next = f"p:{cat_tok}:{rar_tok}:{page + 1}"
@@ -309,7 +546,7 @@ def _numbered_list_view(
     if nav:
         rows.append(nav)
     rows.append(
-        [InlineKeyboardButton("⬅ К редкости", callback_data=f"h:{cat_tok}")],
+        [InlineKeyboardButton("⬅ К выбору редкости", callback_data=f"h:{cat_tok}")],
     )
     return text, InlineKeyboardMarkup(rows)
 
@@ -330,8 +567,79 @@ async def illucards_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text("Привет!", reply_markup=REPLY_KB)
+    msg = update.message
+    if not msg:
+        return
+    args = context.args or []
+    if args:
+        order_text = " ".join(args).strip()
+        if not order_text:
+            await msg.reply_text("Привет!", reply_markup=REPLY_KB)
+            return
+        context.user_data["deeplink_order"] = order_text
+        out = f"🛒 Ваш заказ:\n{order_text}"
+        if len(out) > 4096:
+            out = out[:4090] + "…"
+        await msg.reply_text(
+            out,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Оформить заказ",
+                            callback_data=DEEPLINK_ORDER_CB,
+                        ),
+                    ],
+                ],
+            ),
+        )
+        return
+    await msg.reply_text("Привет!", reply_markup=REPLY_KB)
+
+
+async def on_deeplink_order_confirm(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Кнопка после /start <payload> — уведомление админу (ADMIN_ID)."""
+    q = update.callback_query
+    if not q or not q.data or not q.message:
+        return
+    if (q.data or "").strip() != DEEPLINK_ORDER_CB:
+        return
+    order = (context.user_data or {}).get("deeplink_order")
+    if not order or not str(order).strip():
+        await q.answer("Сначала откройте ссылку с заказом ещё раз.", show_alert=True)
+        return
+    if not ADMIN_ID:
+        await q.answer("ADMIN_ID не настроен в боте", show_alert=True)
+        return
+    u = q.from_user
+    un = f"@{u.username}" if u and u.username else "—"
+    name = f"{(u.first_name or '')} {(u.last_name or '')}".strip() or "—"
+    uid = u.id if u else "—"
+    text = f"🔥 Новый заказ:\n{order}\n\nОт: {un} | {name} | id={uid}"
+    if len(text) > 4090:
+        text = text[:4086] + "…"
+    log = logging.getLogger(__name__)
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=text,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.exception("Deep link order → админ: %s", e)
+        await q.answer("Не получилось отправить админу", show_alert=True)
+        return
+    context.user_data.pop("deeplink_order", None)
+    await q.answer("Заказ отправлен", show_alert=False)
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await q.message.reply_text(
+        "Готово. Админ получит уведомление о заказе. Скоро с вами свяжутся."
+    )
 
 
 async def catalog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -340,8 +648,8 @@ async def catalog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def send_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Только мастер: категория → редкость → список с пагинацией → фото по клику.
-    Не отправляет пачку фото (это никогда не делаем здесь).
+    Мастер: категория → редкость (подписи на рус.) → полный перечень названий (шаг 3) →
+    по кнопке «Показать карточки» — фото с ценой.
     """
     msg = update.effective_message
     if not msg:
@@ -359,13 +667,13 @@ async def send_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not categories:
         await msg.reply_text("Категории не найдены")
         return
-    log.info("Каталог: шаг 1, категорий=%d (без массовой рассылки фото)", len(categories))
+    log.info("Каталог: шаг 1, категорий=%d (фото — только после кнопки в шаге 4)", len(categories))
     await msg.reply_text(
         "Коллекция (illucards)\n"
-        "Шаг 1 — какая категория? (или «Все категории»)\n"
-        "Шаг 2 — редкость, или «Все редкости»\n"
-        "Шаг 3 — список только номеров и названий\n"
-        "Шаг 4 — нажмёшь номер, пришлём картинку, цену, кнопку «Купить»",
+        "1) Категория (или «Все категории»)\n"
+        "2) Редкость на русском в кнопках, или «Все редкости»\n"
+        "3) Полный список: сверху фильтр, ниже — номер и название (при длине списка — листайте ◀▶)\n"
+        "4) «Показать карточки» — снимки, «➕ в корзину»; «🛒 Корзина» — сумма, оформление, @username",
         reply_markup=_kb_categories(categories),
     )
 
@@ -398,12 +706,6 @@ async def _get_products(context: ContextTypes.DEFAULT_TYPE) -> List[dict]:
     return products
 
 
-def _rarity_caption_name(r: str) -> str:
-    if r == "—" or not str(r).strip():
-        return "все / б/р"
-    return str(r)
-
-
 async def _edit_to_categories(
     q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -416,7 +718,7 @@ async def _edit_to_categories(
         await q.edit_message_text("Категорий нет")
         return
     await q.edit_message_text(
-        "Коллекция (illucards). Шаг 1 — какая категория? (либо «Все категории»)",
+        "Коллекция (illucards). Шаг 1 — категория (или «Все категории»).",
         reply_markup=_kb_categories(cats),
     )
 
@@ -441,8 +743,7 @@ async def on_pick_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     cats = _category_names(products)
     if key == "all":
         rlist = _rarities_globally(products) or ["—"]
-        t = "Коллекция: **все категории**\n\nШаг 2 — редкость? (либо «Все редкости»)"
-        t = t.replace("**", "")
+        t = "Коллекция: все категории\n\nШаг 2 — выберите редкость (подписи на русском) или «Все редкости»"
         await q.answer()
         await q.edit_message_text(t, reply_markup=_kb_rarities("all", rlist))
         return
@@ -452,7 +753,7 @@ async def on_pick_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     cat = cats[ci]
     rlist = _rarities_in_category(products, cat) or ["—"]
-    t = f"Коллекция: {cat}\n\nШаг 2 — редкость? (либо «Все редкости»)"
+    t = f"Коллекция: {cat}\n\nШаг 2 — редкость (подписи на русском) или «Все редкости»"
     await q.answer()
     await q.edit_message_text(t, reply_markup=_kb_rarities(str(ci), rlist))
 
@@ -475,7 +776,7 @@ async def on_pick_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await q.answer("По такой редкости пусто.", show_alert=True)
         return
     body, kb = _numbered_list_view(
-        in_scope, products, cat_tok, rar_tok, 0, c_lab, r_lab
+        in_scope, cat_tok, rar_tok, 0, c_lab, r_lab
     )
     await q.answer()
     await q.edit_message_text(body, reply_markup=kb)
@@ -499,7 +800,7 @@ async def on_card_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await q.answer("Список устарел", show_alert=True)
         return
     body, kb = _numbered_list_view(
-        in_scope, products, cat_tok, rar_tok, pg, c_lab, r_lab
+        in_scope, cat_tok, rar_tok, pg, c_lab, r_lab
     )
     await q.answer()
     await q.edit_message_text(body, reply_markup=kb)
@@ -518,7 +819,7 @@ async def on_back_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     cats = _category_names(products)
     if cat_tok == "all":
         rlist = _rarities_globally(products) or ["—"]
-        t = "Коллекция: **все категории** (шаг 2 — редкость)".replace("**", "")
+        t = "Коллекция: все категории (шаг 2 — редкость, подписи на русском)"
         await q.edit_message_text(t, reply_markup=_kb_rarities("all", rlist))
         return
     cix = int(cat_tok)
@@ -528,64 +829,95 @@ async def on_back_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     cat = cats[cix]
     rlist = _rarities_in_category(products, cat) or ["—"]
     await q.edit_message_text(
-        f"Коллекция: {cat}\n(шаг 2 — редкость)",
+        f"Коллекция: {cat}\n(шаг 2 — редкость, подписи на русском)",
         reply_markup=_kb_rarities(str(cix), rlist),
     )
 
 
-async def on_view_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_send_all_cards(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """g:{cat_tok}:{rar_tok} — после выбора фильтра: все карточки из подборки (фото, цена, купить)."""
     q = update.callback_query
     if not q or not q.message or not q.data:
         return
-    m = re.match(r"^v:(\d+)$", (q.data or "").strip())
+    m = re.match(r"^g:([^:]+):([^:]+)$", (q.data or "").strip())
     if not m:
         return
-    idx = int(m.group(1))
-    app = context.application
-    products = list(app.bot_data.get("products") or [])
-    if not (0 <= idx < len(products)) or not products:
-        extra = await load_products()
-        if extra:
-            app.bot_data["products"] = extra
-        products = list(app.bot_data.get("products") or [])
-    if not (0 <= idx < len(products)):
-        await q.answer("Список устарел. Открой Каталог снова", show_alert=True)
+    cat_tok, rar_tok = m.group(1), m.group(2)
+    products = await _get_products(context)
+    if not products:
+        await q.answer("Каталог пуст. Откройте «📦 Каталог» снова.", show_alert=True)
         return
-    await q.answer()
-    p = products[idx]
+    cats = _category_names(products)
+    in_scope, c_lab, r_lab = _filter_wizard(products, cats, cat_tok, rar_tok)
+    if not c_lab:
+        await q.answer("Список устарел, начните с каталога.", show_alert=True)
+        return
+    if not in_scope:
+        await q.answer("По этому фильтру нет карт.", show_alert=True)
+        return
+    n = len(in_scope)
+    await q.answer("Отправляю карточки…", show_alert=False)
+    if n > 20:
+        await q.message.reply_text(
+            f"Сейчас пошлём {n} карточек: фото, «➕ в корзину» и дальше — «🛒 Корзина» для суммы и заказа."
+        )
     site_line = ILLUCARDS_BASE.removeprefix("https://").removeprefix("http://")
-    cap = "Шаг 4. Карта, цена, картинка\n\n" + _format_caption(p) + f"\n🌐 {site_line}"
-    if len(cap) > 1020:
-        cap = cap[:1016] + "…"
-    bcb = _format_buy_callback(p, idx)
-    if len(bcb.encode("utf-8")) > 64:
-        bcb = f"buy:{idx}"
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Купить", callback_data=bcb)],
-        ]
-    )
-    photo = p.get("image") or ""
-    if photo:
+    for i, p in enumerate(in_scope, 1):
+        gidx = _global_product_index(products, p)
+        cap = f"Карта {i} из {n}\nФильтр: {c_lab} • {r_lab}\n\n" + _format_caption(
+            p
+        ) + f"\n🌐 {site_line}"
+        if len(cap) > 1020:
+            cap = cap[:1016] + "…"
+        ref = _product_ref_for_callback(p, gidx)
+        a_cb = f"a:{ref}"
+        if len(a_cb.encode("utf-8")) > 64:
+            a_cb = f"a:{gidx}"
+        vc_cb = "vc:0"
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("➕ В корзину", callback_data=a_cb)],
+                [InlineKeyboardButton("🛒 Открыть корзину", callback_data=vc_cb)],
+            ],
+        )
+        photo = str(p.get("image") or "")
         try:
-            await q.message.reply_photo(photo=photo, caption=cap, reply_markup=kb)
+            if photo:
+                await q.message.reply_photo(photo=photo, caption=cap, reply_markup=kb)
+            else:
+                await q.message.reply_text(cap, reply_markup=kb)
         except Exception:
             await q.message.reply_text(cap, reply_markup=kb)
-    else:
-        await q.message.reply_text(cap, reply_markup=kb)
+        if i < n and (i % 3 == 0 or n > 30):
+            await asyncio.sleep(0.12)
+    if n:
+        await q.message.reply_text(
+            "Соберите заказ: «➕» в корзину, внизу — «🛒 Корзина» — там сумма, оформление и @username."
+        )
 
 
-async def on_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.data or not query.message:
+async def _edit_cart_message(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lines = _cart_get_lines(context.user_data)
+    t = _format_cart_message(lines)
+    kb = _kb_cart(lines) if lines else None
+    if not q.message:
         return
+    try:
+        await q.edit_message_text(t, reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(t, reply_markup=kb)
 
-    m = re.match(r"^buy:(.+)$", (query.data or "").strip())
+
+async def on_add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q or not q.data or not q.message:
+        return
+    m = re.match(r"^a:(.+)$", (q.data or "").strip())
     if not m:
         return
-    ref = m.group(1)
+    ref = m.group(1).strip()
     app = context.application
-    products: List[dict] = list(app.bot_data.get("products") or [])
+    products = list(app.bot_data.get("products") or [])
 
     product = _product_from_callback(ref, products)
     if product is None:
@@ -596,13 +928,85 @@ async def on_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         products = list(app.bot_data.get("products") or [])
         product = _product_from_callback(ref, products)
     if product is None:
-        await query.answer("Карточка не найдена. Обнови каталог.", show_alert=True)
+        await q.answer("Карта не в каталоге, обнови раздел «Каталог»", show_alert=True)
         return
-    context.user_data["awaiting_order_username"] = True
-    context.user_data["pending_order_product_name"] = product.get("name") or ""
+    gix = _global_product_index(products, product)
+    r = _product_ref_for_callback(product, gix)
+    _cart_add_line(
+        context.user_data, r, product, product.get("name") or "—", _product_price(product)
+    )
+    lines = _cart_get_lines(context.user_data)
+    tot, npos = _cart_totals(lines)
+    nlines = len(lines)
+    short = f"Сумма {tot} ₽, шт. {npos}"
+    await q.answer(f"➕ В корзине {nlines} п. · {short}", show_alert=False)
 
-    await query.answer()
-    await query.message.reply_text("Напиши свой @username для заказа")
+
+async def on_cart_remove_line(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    q = update.callback_query
+    if not q or not q.data or not q.message:
+        return
+    m2 = re.match(r"^rm:(\d+)$", (q.data or "").strip())
+    if not m2:
+        return
+    ix = int(m2.group(1))
+    if not _cart_remove_line(context.user_data, ix):
+        await q.answer("Позиция не найдена, открой корзину снова", show_alert=True)
+        return
+    await q.answer()
+    await _edit_cart_message(q, context)
+
+
+async def on_cart_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q or not q.data or not q.message:
+        return
+    if re.match(r"^cz:0$", (q.data or "").strip()) is None:
+        return
+    _cart_clear(context.user_data)
+    await q.answer("Корзина пуста", show_alert=False)
+    await _edit_cart_message(q, context)
+
+
+async def on_checkout_ask_username(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    q = update.callback_query
+    if not q or not q.data or not q.message:
+        return
+    if re.match(r"^co:0$", (q.data or "").strip()) is None:
+        return
+    lines = _cart_get_lines(context.user_data)
+    if not lines:
+        await q.answer("Корзина пуста", show_alert=True)
+        return
+    tot, npos = _cart_totals(lines)
+    context.user_data["order_checkout"] = deepcopy(lines)
+    context.user_data["awaiting_order_username"] = True
+    await q.answer()
+    await q.message.reply_text(
+        f"Сумма заказа: {tot} ₽ (всего {npos} шт., поз. {len(lines)}).\n"
+        f"Напиши ниже свой @username (как в Telegram) — по нему с тобой свяжутся.\n"
+        f"Состав и сумма уйдут админу, с упоминанием {ORDER_MENTION}."
+    )
+
+
+async def on_view_cart_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    q = update.callback_query
+    if not q or not q.message or not q.data:
+        return
+    m = re.match(r"^vc:0$", (q.data or "").strip())
+    if not m:
+        return
+    await q.answer()
+    lines = _cart_get_lines(context.user_data)
+    t = _format_cart_message(lines)
+    kb = _kb_cart(lines) if lines else None
+    await q.message.reply_text(t, reply_markup=kb)
 
 
 def _is_username_suggestion(s: str) -> bool:
@@ -620,22 +1024,53 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not msg or not msg.text:
         return
     text = msg.text.strip()
+    user_data = context.user_data
 
     if text in ("📦 Каталог", "🔥 Акции", "💬 Связь"):
-        context.user_data.pop("awaiting_order_username", None)
-        context.user_data.pop("pending_order_product_name", None)
+        user_data.pop("awaiting_order_username", None)
+        user_data.pop("order_checkout", None)
 
-    if context.user_data.get("awaiting_order_username"):
-        if not _is_username_suggestion(text):
-            await msg.reply_text("Напиши Telegram-логин с @, например @yourname")
+    if user_data.get("awaiting_order_username"):
+        if text in ("🛒 Корзина",):
+            await msg.reply_text(
+                "Сначала напиши свой @username (одна строка), чтобы завершить заказ — или сброс: «📦 Каталог»."
+            )
             return
-        name = str(context.user_data.get("pending_order_product_name", "")).strip()
-        context.user_data.pop("awaiting_order_username", None)
-        context.user_data.pop("pending_order_product_name", None)
-        extra = f" по товару: {name}" if name else ""
-        await msg.reply_text(
-            f"Принято! Заказ оформлен{extra}, username: {text}."
-        )
+        if not _is_username_suggestion(text):
+            await msg.reply_text("Напиши Telegram-логин с @, например @myname (одной строкой).")
+            return
+        lines: Optional[List[dict]] = user_data.get("order_checkout")
+        user = msg.from_user
+        user_data.pop("awaiting_order_username", None)
+        user_data.pop("order_checkout", None)
+        if not lines:
+            await msg.reply_text("Сессия оформления сброшена. Соберите «🛒 Корзина» снова.")
+            return
+        ob, tot = _order_snapshot_for_notify(lines)
+        _cart_clear(user_data)
+        ok = await _notify_admins(context, user, text, ob)
+        log = logging.getLogger(__name__)
+        if ok:
+            note = (
+                f"Принято! Заказ на {tot} ₽. Скоро с вами свяжутся. "
+                f"Админу и {ORDER_MENTION} ушло уведомление с составом заказа."
+            )
+        else:
+            if not ORDER_NOTIFY_CHAT_ID:
+                log.warning("TELEGRAM_ORDER_NOTIFY_ID не настроен — уведомление в чат не отправлено")
+            note = (
+                f"Принято! Заказ на {tot} ₽, логин для связи: {text}.\n"
+                f"Сообщение боту не доставилось (проверьте TELEGRAM_ORDER_NOTIFY_ID в .env) — "
+                f"напишите {ORDER_MENTION} вручную, если вас не наберут."
+            )
+        await msg.reply_text(note)
+        return
+
+    if text == "🛒 Корзина":
+        cl = _cart_get_lines(user_data)
+        t = _format_cart_message(cl)
+        kb = _kb_cart(cl) if cl else None
+        await msg.reply_text(t, reply_markup=kb)
         return
 
     if text == "📦 Каталог":
@@ -648,6 +1083,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(application: Application) -> None:
     log = logging.getLogger(__name__)
+    if ORDER_NOTIFY_CHAT_ID is not None:
+        log.info("Уведомления о заказах: chat_id=%s, mention=%s", ORDER_NOTIFY_CHAT_ID, ORDER_MENTION)
+    else:
+        log.warning(
+            "TELEGRAM_ORDER_NOTIFY_ID не задан — бот не сможет присылать заказы в чат (см. .env)"
+        )
+    if ADMIN_ID:
+        log.info("Deep link /start-заказы: ADMIN_ID=%s", ADMIN_ID)
+    else:
+        log.warning("ADMIN_ID=0 — кнопка «Оформить» с ссылки t.me/...?start= не сможет уведомить админа")
     try:
         initial = await load_products()
         application.bot_data["products"] = initial
@@ -678,13 +1123,22 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("catalog", catalog_cmd))
-    app.add_handler(CallbackQueryHandler(on_view_card, pattern=re.compile(r"^v:\d+$")))
+    app.add_handler(
+        CallbackQueryHandler(
+            on_deeplink_order_confirm, pattern=re.compile(r"^dl:ok$")
+        )
+    )
+    app.add_handler(CallbackQueryHandler(on_checkout_ask_username, pattern=re.compile(r"^co:0$")))
+    app.add_handler(CallbackQueryHandler(on_view_cart_callback, pattern=re.compile(r"^vc:0$")))
+    app.add_handler(CallbackQueryHandler(on_cart_remove_line, pattern=re.compile(r"^rm:(\d+)$")))
+    app.add_handler(CallbackQueryHandler(on_cart_clear, pattern=re.compile(r"^cz:0$")))
+    app.add_handler(CallbackQueryHandler(on_add_to_cart, pattern=re.compile(r"^a:(.+)$")))
+    app.add_handler(CallbackQueryHandler(on_send_all_cards, pattern=re.compile(r"^g:([^:]{1,12}):([^:]{1,6})$")))
     app.add_handler(CallbackQueryHandler(on_card_page, pattern=re.compile(r"^p:([^:]{1,12}):([^:]{1,6}):(\d+)$")))
     app.add_handler(CallbackQueryHandler(on_back_rarity, pattern=re.compile(r"^h:([^:]{1,12})$")))
     app.add_handler(CallbackQueryHandler(on_menu_main, pattern=re.compile(r"^m:0$")))
     app.add_handler(CallbackQueryHandler(on_pick_rarity, pattern=re.compile(r"^j:([^:]{1,12}):(all|\d+)$")))
     app.add_handler(CallbackQueryHandler(on_pick_category, pattern=re.compile(r"^c:(\d+|all)$")))
-    app.add_handler(CallbackQueryHandler(on_buy, pattern=re.compile(r"^buy:")))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
