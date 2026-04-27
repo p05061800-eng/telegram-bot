@@ -8,13 +8,15 @@
 import asyncio
 import logging
 import os
+import random
 import re
 import secrets
 import sys
 import time
 import urllib.parse
 from copy import deepcopy
-from typing import List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -62,15 +64,38 @@ def _read_order_notify_target():
 ORDER_NOTIFY_TARGET = _read_order_notify_target()
 ORDER_MENTION = (os.getenv("ORDER_MENTION", "@Daniel_official") or "@Daniel_official").strip()
 
-# Сообщения о заказе из t.me/bot?start=... (числовой Telegram id админа)
-try:
-    ADMIN_ID: int = int((os.getenv("ADMIN_ID") or "0").strip() or "0")
-except ValueError:
-    ADMIN_ID = 0
+# Админ-панель (/admin) и /say — только этот Telegram user id
+ADMIN_ID = 711309799
+ADMIN_ACCESS_DENIED = "⛔ Нет доступа"
 
 
-def is_admin(user_id: int) -> bool:
-    return int(user_id) == int(ADMIN_ID)
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+
+# Заказы и админка:
+# 1) Клиенты не получают сообщений с admin inline-кнопками (accept_/sent_/cancel_/adm:/oam: и т.д.).
+# 2) Все новые заказы уходят в ORDER_NOTIFY_TARGET (_notify_admin_new_order).
+# 3) Клиенту — только текстовые уведомления о статусе и ответах.
+# 4) Админ → клиент: только bot.send_message(..., reply_markup=None).
+
+
+async def _send_customer_plain(bot, user_id: int, text: str) -> bool:
+    """Уведомление клиенту: send_message, только текст, без inline-клавиатуры."""
+    if not user_id:
+        return False
+    log = logging.getLogger(__name__)
+    try:
+        await bot.send_message(
+            chat_id=int(user_id),
+            text=text,
+            disable_web_page_preview=True,
+            reply_markup=None,
+        )
+        return True
+    except Exception:
+        log.exception("send_message → клиент user_id=%s", user_id)
+        return False
 
 
 # Одноразовые коды для входа на сайт: код (строка) -> {user_id, expires (unix time)}
@@ -80,10 +105,103 @@ LOGIN_CODE_TTL_SEC = 5 * 60
 # Корзина и оформленные заказы в памяти процесса (ключ — Telegram user_id)
 USER_CART: dict = {}
 USER_ORDERS: dict = {}
+# Глобальный реестр заказов по порядковому id (память процесса)
+# ORDERS[id] = { user_id, username, items, total, delivery, status, created_at, admin_* }
+ORDERS: dict = {}
+ORDER_COUNTER = 1
 # /start order_<id> — черновики заказов по ссылке (до оформления). Пополняется API/сайтом или register_shared_deep_link_order.
 SHARED_DEEP_LINK_ORDERS: dict = {}
+# Режим «написать админу»: user_id -> True, пока ждём следующее текстовое сообщение
+user_support_state: dict = {}
+# Состояния оплаты по user_id (вне user_data — не теряются при смене контекста чата)
+# user_states[user_id] = { "awaiting_proof": order_id, "crypto_check": order_id }
+user_states: Dict[int, Dict[str, int]] = {}
 
-FALLBACK_USER_TEXT = "Что-то пошло не так, открой каталог"
+
+def _user_state_bucket(uid: int) -> Dict[str, int]:
+    if uid not in user_states:
+        user_states[uid] = {}
+    return user_states[uid]
+
+
+def _user_state_get(uid: int, key: str) -> Optional[int]:
+    if not uid:
+        return None
+    v = user_states.get(uid, {}).get(key)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _user_state_set(uid: int, key: str, order_id: int) -> None:
+    if not uid:
+        return
+    b = _user_state_bucket(uid)
+    b[key] = int(order_id)
+
+
+def _user_state_pop(uid: int, key: str) -> Optional[int]:
+    if not uid:
+        return None
+    b = user_states.get(uid)
+    if not b:
+        return None
+    v = b.pop(key, None)
+    if not b:
+        user_states.pop(uid, None)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _user_state_clear_payment_states(uid: int) -> None:
+    """После оплаты / полного сброса: убрать awaiting_proof и crypto_check."""
+    if not uid:
+        return
+    b = user_states.get(uid)
+    if not b:
+        return
+    b.pop("awaiting_proof", None)
+    b.pop("crypto_check", None)
+    if not b:
+        user_states.pop(uid, None)
+
+
+FALLBACK_USER_TEXT = "❌"
+
+# Reply-клавиатура: короткие подписи + эмодзи
+BTN_ORDERS = "📦 заказы"
+BTN_CART = "🛒 корзина"
+BTN_CHAT = "💬 чат"
+BTN_DELIVERY = "🚚 доставка"
+BTN_MONEY = "💰 деньги"
+BTN_POPULAR = "🔥 Популярное"
+BTN_RANDOM_CARD = "🎁 Случайная карточка"
+
+# Уведомление клиенту при входе админа в режим ответа
+ADMIN_TYPING_NOTICE = "⏳ Администратор печатает..."
+# Автоответ после успешной отправки заказа админу
+ORDER_AUTO_ACK = "📦 Заказ принят"
+
+# Шаги воронки оплаты (короткая подсказка)
+PAY_FLOW_STEPS = "Оплата → Скрин → Проверка → Готово"
+
+# Оплата (реквизиты + callback)
+PAY_CARD_BODY = "💳\n9112 3810 0954 6243\nDANIL PARFIONAU"
+PAY_TRANSFER_BODY = "📱\n+375298124337\nDANIL PARFIONAU"
+PAY_CRYPTO_BODY = "₿ USDT TRC20\nTBRKDLTC6QXED4pEVVm1RpZNKeB4ScJChf"
+PAY_PROOF_REQUEST = "📸 Скрин"
+PAY_PROOF_WAIT = "⏳ Проверяем оплату..."
+PAY_ADMIN_CONFIRMED_CLIENT = "✅"
+PAY_ADMIN_REJECTED_CLIENT = "📸 Ещё раз"
+CRYPTO_AUTO_OK_CLIENT = "✅ Крипто-платеж получен!"
+CRYPTO_AUTO_OK_ADMIN = "💰 КРИПТА ОПЛАЧЕНА"
 
 _RE_START_ORDER_ARG = re.compile(r"^order_(.+)$", re.IGNORECASE)
 
@@ -103,7 +221,9 @@ async def _notify_callback_issue(
         except Exception:
             try:
                 await context.bot.send_message(
-                    q.message.chat_id, FALLBACK_USER_TEXT
+                    q.message.chat_id,
+                    FALLBACK_USER_TEXT,
+                    reply_markup=None,
                 )
             except Exception:
                 pass
@@ -190,12 +310,25 @@ def _rarity_label_ru(s: str) -> str:
 
 REPLY_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton("📦 Каталог"), KeyboardButton("🛒 Корзина")],
-        [KeyboardButton("📦 Ваши заказы")],
-        [KeyboardButton("🔥 Смотреть карточки")],
-        [KeyboardButton("🔥 Акции"), KeyboardButton("💬 Связь")],
+        [KeyboardButton(BTN_ORDERS), KeyboardButton(BTN_CART)],
+        [KeyboardButton(BTN_CHAT), KeyboardButton(BTN_DELIVERY)],
+        [KeyboardButton(BTN_MONEY)],
+        [KeyboardButton(BTN_POPULAR), KeyboardButton(BTN_RANDOM_CARD)],
     ],
     resize_keyboard=True,
+)
+
+# Тексты reply-клавиатуры (сброс режима «чат с админом» при переходе в меню)
+REPLY_MENU_TEXTS = frozenset(
+    {
+        BTN_ORDERS,
+        BTN_CART,
+        BTN_CHAT,
+        BTN_DELIVERY,
+        BTN_MONEY,
+        BTN_POPULAR,
+        BTN_RANDOM_CARD,
+    },
 )
 
 
@@ -365,6 +498,323 @@ def _cart_clear_uid(user_id: int) -> None:
     USER_CART[user_id] = {"items": [], "total": 0}
 
 
+ORDER_STATUS_RU: dict = {
+    "new": "Новый",
+    "accepted": "Принят",
+    "shipped": "Отправлен",
+    "done": "Завершён",
+    "canceled": "Отменён",
+    "cancelled": "Отменён",
+}
+
+# Уведомление клиенту о смене статуса (коротко)
+CUSTOMER_STATUS_BODY: dict = {
+    "accepted": "🚚 Подготавливаем к отправке",
+    "shipped": "🚚 Отправлен",
+    "done": "✅",
+    "canceled": "❌",
+    "cancelled": "❌",
+}
+
+
+def _order_status_label_ru(status: str) -> str:
+    s = str(status or "new").strip()
+    return ORDER_STATUS_RU.get(s, s)
+
+
+def _format_customer_order_status_notice(order_id: int, status_key: str) -> str:
+    sk = str(status_key or "new").strip()
+    if sk == "cancelled":
+        sk = "canceled"
+    body = CUSTOMER_STATUS_BODY.get(sk, "")
+    if body:
+        return f"{body} (#{order_id})"
+    return f"📦 #{order_id}"
+
+
+def _payment_intro_text(total: int) -> str:
+    """После оформления: заказ принят, шаги, сумма и выбор способа оплаты (кнопки)."""
+    return f"📦 Заказ принят\n\n{PAY_FLOW_STEPS}\n\n💰 {int(total)} BYN"
+
+
+def _format_delivery_block(d: Optional[dict]) -> str:
+    if not d or not isinstance(d, dict):
+        return ""
+    lab = str(d.get("label") or "").strip()
+    if not lab:
+        return ""
+    try:
+        amt = int(d.get("amount") if d.get("amount") is not None else 0)
+    except (TypeError, ValueError):
+        amt = 0
+    cur = str(d.get("currency") or "").strip() or "—"
+    return f"🚚 {lab} — {amt} {cur}"
+
+
+def _format_order_items_for_admin(lines: List[dict]) -> str:
+    rows: List[str] = []
+    for x in lines:
+        name = (x.get("name") or "—")[:200]
+        if len((x.get("name") or "")) > 200:
+            name = name.rstrip() + "…"
+        p = int(x.get("price") or 0)
+        q = int(x.get("qty") or 1)
+        sub = p * q
+        rows.append(f"• {name} — {sub} BYN")
+    return "\n".join(rows) if rows else "—"
+
+
+def _format_admin_order_detail_text(order_id: int, o: dict) -> str:
+    """Карточка заказа для админа (уведомление, open_order, правка сообщения)."""
+    uid = int(o.get("user_id") or 0)
+    un = o.get("username")
+    un_s = str(un).strip().lstrip("@") if un else ""
+    items_block = _format_order_items_for_admin(list(o.get("items") or []))
+    tot = int(o.get("total") or 0)
+    st = str(o.get("status") or "new")
+    st_ru = _order_status_label_ru(st)
+    dline = _format_delivery_block(o.get("delivery") if isinstance(o.get("delivery"), dict) else None)
+    try:
+        ts = float(o.get("created_at") or 0)
+    except (TypeError, ValueError):
+        ts = 0.0
+    tss = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts > 0 else "—"
+    user_line = f"👤 {uid}"
+    if un_s:
+        user_line += f" · @{un_s}"
+    parts: List[str] = [
+        f"📦 Заказ #{order_id}",
+        "",
+        user_line,
+        "🛒",
+        items_block,
+        "",
+    ]
+    if dline:
+        parts.append(dline)
+        parts.append("")
+    parts.append(f"💰 {tot} BYN")
+    parts.append(f"📊 Статус: {st_ru}")
+    parts.append(f"🕐 Создан: {tss}")
+    body = "\n".join(parts)
+    if len(body) > 4090:
+        body = body[:4086] + "…"
+    return body
+
+
+def _kb_order_admin_actions(order_id: int, status: str) -> Optional[InlineKeyboardMarkup]:
+    rep = InlineKeyboardButton("💬", callback_data=f"oam:rep:{order_id}")
+    acc = InlineKeyboardButton("✅", callback_data=f"accept_{order_id}")
+    shp = InlineKeyboardButton("🚚", callback_data=f"sent_{order_id}")
+    can = InlineKeyboardButton("❌", callback_data=f"cancel_{order_id}")
+    done_btn = InlineKeyboardButton("🏁", callback_data=f"done_{order_id}")
+    s = str(status or "new")
+    if s == "new":
+        return InlineKeyboardMarkup([[rep, acc], [shp, can]])
+    if s == "accepted":
+        return InlineKeyboardMarkup([[shp, can], [rep]])
+    if s == "shipped":
+        return InlineKeyboardMarkup([[done_btn, can], [rep]])
+    if s in ("done", "canceled", "cancelled"):
+        return InlineKeyboardMarkup([[rep]])
+    return None
+
+
+async def _notify_admin_new_order(
+    context: ContextTypes.DEFAULT_TYPE,
+    user,
+    lines: List[dict],
+    total: int,
+    delivery: Optional[dict] = None,
+) -> Optional[int]:
+    """Новый заказ: только в ORDER_NOTIFY_TARGET, с admin-кнопками; ORDERS; при ошибке — None."""
+    global ORDER_COUNTER
+    log = logging.getLogger(__name__)
+    order_id = int(ORDER_COUNTER)
+    uid = int(user.id) if user else 0
+    uname = (getattr(user, "username", None) or "").strip()
+    drec = deepcopy(delivery) if delivery else {}
+    now = time.time()
+    o_preview = {
+        "user_id": uid,
+        "username": uname,
+        "items": list(lines),
+        "total": int(total),
+        "delivery": drec,
+        "status": "new",
+        "created_at": now,
+    }
+    text = _format_admin_order_detail_text(order_id, o_preview)
+    kb = _kb_order_admin_actions(order_id, "new")
+    try:
+        m = await context.bot.send_message(
+            chat_id=ORDER_NOTIFY_TARGET,
+            text=text,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        log.exception("Ошибка отправки заказа админу (order_id=%s)", order_id)
+        return None
+    ORDER_COUNTER = order_id + 1
+    ORDERS[order_id] = {
+        "user_id": uid,
+        "username": uname,
+        "items": deepcopy(list(lines)),
+        "total": int(total),
+        "delivery": drec,
+        "status": "new",
+        "created_at": now,
+        "admin_chat_id": int(m.chat_id),
+        "admin_message_id": int(m.message_id),
+        "paid": False,
+        "payment_proof_submitted": False,
+        "clear_cart_on_paid": False,
+    }
+    return order_id
+
+
+def _kb_payment_methods() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("💳 Карта", callback_data="pay_card"),
+                InlineKeyboardButton("📱 Перевод", callback_data="pay_transfer"),
+            ],
+            [InlineKeyboardButton("₿ Крипта", callback_data="pay_crypto")],
+        ]
+    )
+
+
+def _kb_paid_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Я оплатил", callback_data="paid")]]
+    )
+
+
+def _format_payment_receipt_text(order_id: int, o: dict) -> str:
+    """Текст чека клиенту после оплаты."""
+    items_block = _format_order_items_for_admin(list(o.get("items") or []))
+    dline = _format_delivery_block(
+        o.get("delivery") if isinstance(o.get("delivery"), dict) else None
+    )
+    tot = int(o.get("total") or 0)
+    lines: List[str] = [
+        f"🧾 #{order_id}",
+        "",
+        items_block,
+    ]
+    if dline:
+        lines.append(dline)
+    lines.append(f"💰 {tot} BYN")
+    lines.extend(
+        [
+            "",
+            "✅ Готово",
+            "🙏",
+        ]
+    )
+    body = "\n".join(lines)
+    if len(body) > 4090:
+        body = body[:4086] + "…"
+    return body
+
+
+def _kb_payment_receipt() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📦 Мои заказы", callback_data="rcpt_orders"),
+                InlineKeyboardButton("💬 Поддержка", callback_data="rcpt_support"),
+            ],
+        ]
+    )
+
+
+async def _send_payment_receipt(
+    bot, chat_id: int, order_id: int, o: dict
+) -> None:
+    log = logging.getLogger(__name__)
+    if not int(chat_id or 0):
+        return
+    text = _format_payment_receipt_text(order_id, o)
+    try:
+        await bot.send_message(
+            chat_id=int(chat_id),
+            text=text,
+            reply_markup=_kb_payment_receipt(),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        log.exception("чек order_id=%s chat_id=%s", order_id, chat_id)
+
+
+def _kb_payment_admin_review(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Подтвердить оплату",
+                    callback_data=f"confirm_payment_{order_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Отклонить",
+                    callback_data=f"reject_payment_{order_id}",
+                ),
+            ],
+        ]
+    )
+
+
+def _user_data_for(application: Application, user_id: int) -> dict:
+    """user_data другого пользователя (для сброса awaiting_* после действия админа)."""
+    raw = application.user_data
+    if user_id not in raw:
+        raw[user_id] = {}
+    return raw[user_id]
+
+
+def _clear_crypto_auto_watch(o: dict, uid: int) -> None:
+    """Снять mock-наблюдение за крипто-оплатой (карта/перевод/ручной скрин)."""
+    o.pop("crypto_auto_active", None)
+    o.pop("crypto_auto_deadline", None)
+    _user_state_pop(uid, "crypto_check")
+
+
+async def _notify_order_customer(
+    context: ContextTypes.DEFAULT_TYPE, order: dict, text: str
+) -> bool:
+    uid = int(order.get("user_id") or 0)
+    return await _send_customer_plain(context.bot, uid, text)
+
+
+async def _refresh_admin_order_message(
+    context: ContextTypes.DEFAULT_TYPE, order_id: int
+) -> None:
+    o = ORDERS.get(order_id)
+    if not o:
+        return
+    cid = o.get("admin_chat_id")
+    mid = o.get("admin_message_id")
+    if cid is None or mid is None:
+        return
+    log = logging.getLogger(__name__)
+    text = _format_admin_order_detail_text(order_id, o)
+    kb = _kb_order_admin_actions(order_id, str(o.get("status") or "new"))
+    try:
+        await context.bot.edit_message_text(
+            chat_id=int(cid),
+            message_id=int(mid),
+            text=text,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        log.warning("Не удалось обновить сообщение заказа #%s", order_id)
+
+
 def _cart_totals(lines: List[dict]) -> Tuple[int, int]:
     t = 0
     n = 0
@@ -378,10 +828,10 @@ def _cart_totals(lines: List[dict]) -> Tuple[int, int]:
 
 def _format_cart_message(lines: List[dict]) -> str:
     if not lines:
-        return "🛒 Твоя корзина:\n\nПока пусто.\n\nНажми 📦 Каталог — выбери карточки и «🛒 В корзину»."
+        return "🛒 ∅"
     total, _ = _cart_totals(lines)
     out: List[str] = [
-        "🛒 Твоя корзина:",
+        "🛒",
         "",
     ]
     for x in lines:
@@ -401,8 +851,8 @@ def _format_cart_message(lines: List[dict]) -> str:
 def _format_user_orders_message(user_id: int) -> str:
     orders = list(USER_ORDERS.get(user_id) or [])
     if not orders:
-        return "📦 Ваши заказы:\n\nПока нет оформленных заказов."
-    lines: List[str] = ["📦 Ваши заказы:", ""]
+        return "📦 ∅"
+    lines: List[str] = ["📦", ""]
     for o in reversed(orders[-20:]):
         oid = str(o.get("id") or "")[:12]
         st = o.get("status") or "—"
@@ -418,6 +868,90 @@ def _format_user_orders_message(user_id: int) -> str:
     return s
 
 
+USER_ORDER_STATUS_ICONS: dict = {
+    "new": "🆕",
+    "accepted": "✅",
+    "shipped": "🚚",
+    "done": "📦",
+    "canceled": "❌",
+    "cancelled": "❌",
+}
+
+
+def _user_order_status_badge(status: str) -> str:
+    sk = str(status or "new").strip()
+    icon = USER_ORDER_STATUS_ICONS.get(sk, "📋")
+    if sk == "cancelled":
+        sk = "canceled"
+    ru = _order_status_label_ru(sk)
+    return f"{icon} {ru}"
+
+
+def _user_orders_registry_for_user(user_id: int) -> List[Tuple[int, dict]]:
+    out: List[Tuple[int, dict]] = []
+    for oid, rec in ORDERS.items():
+        if int(rec.get("user_id") or 0) != int(user_id):
+            continue
+        try:
+            oi = int(oid)
+        except (TypeError, ValueError):
+            continue
+        out.append((oi, rec))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
+
+
+def _format_mine_orders_text_and_kb(
+    user_id: int,
+) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    reg = _user_orders_registry_for_user(user_id)
+    if not reg:
+        return ("📦 ∅", None)
+    lines: List[str] = ["📦", ""]
+    rows: List[List[InlineKeyboardButton]] = []
+    for oid, o in reg[:30]:
+        tot = int(o.get("total") or 0)
+        st = str(o.get("status") or "new")
+        badge = _user_order_status_badge(st)
+        lines.append(f"#{oid} — {tot} BYN — {badge}")
+        rows.append(
+            [
+                InlineKeyboardButton("📦", callback_data=f"user_order_{oid}"),
+            ],
+        )
+    text = "\n".join(lines)
+    if len(text) > 3500:
+        text = text[:3490] + "…"
+        rows = rows[:25]
+    return (text, InlineKeyboardMarkup(rows))
+
+
+def _format_user_order_detail(order_id: int, o: dict) -> str:
+    items_block = _format_order_items_for_admin(list(o.get("items") or []))
+    tot = int(o.get("total") or 0)
+    st = str(o.get("status") or "new")
+    sk = "canceled" if st == "cancelled" else st
+    st_ru = _order_status_label_ru(sk)
+    dline = _format_delivery_block(
+        o.get("delivery") if isinstance(o.get("delivery"), dict) else None
+    )
+    parts: List[str] = [
+        f"📦 Заказ #{order_id}",
+        f"📊 Статус: {st_ru}",
+        "",
+        "🛒",
+        items_block,
+        "",
+        f"💰 {tot} BYN",
+    ]
+    if dline:
+        parts.extend(["", dline])
+    body = "\n".join(parts)
+    if len(body) > 4090:
+        body = body[:4086] + "…"
+    return body
+
+
 def _kb_cart(lines: List[dict]) -> Optional[InlineKeyboardMarkup]:
     if not lines:
         return None
@@ -431,14 +965,14 @@ def _kb_cart(lines: List[dict]) -> Optional[InlineKeyboardMarkup]:
             ],
         )
     rows.append(
-        [InlineKeyboardButton("✅ Оформить заказ", callback_data="co:0")],
+        [InlineKeyboardButton("✅", callback_data="co:0")],
     )
     return InlineKeyboardMarkup(rows)
 
 
 def _format_checkout_preview_for_user(lines: List[dict]) -> str:
     total, _ = _cart_totals(lines)
-    out: List[str] = ["📦 Твой заказ:", ""]
+    out: List[str] = ["🛒", ""]
     for x in lines:
         name = (x.get("name") or "—")[:200]
         if len((x.get("name") or "")) > 200:
@@ -446,7 +980,7 @@ def _format_checkout_preview_for_user(lines: List[dict]) -> str:
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
         out.append(f"• {name} — {p} BYN × {q}")
-    out += ["", f"💰 Итого: {total} BYN"]
+    out += ["", f"💰 {total} BYN"]
     return "\n".join(out)
 
 
@@ -454,12 +988,12 @@ def _kb_delivery_country() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🇧🇾 Беларусь", callback_data="dl:by"),
-                InlineKeyboardButton("🇷🇺 Россия", callback_data="dl:ru"),
+                InlineKeyboardButton("🇧🇾", callback_data="dl:by"),
+                InlineKeyboardButton("🇷🇺", callback_data="dl:ru"),
             ],
             [
-                InlineKeyboardButton("🇺🇦 Украина", callback_data="dl:ua"),
-                InlineKeyboardButton("🌍 Другие страны", callback_data="dl:ot"),
+                InlineKeyboardButton("🇺🇦", callback_data="dl:ua"),
+                InlineKeyboardButton("🌍", callback_data="dl:ot"),
             ],
         ]
     )
@@ -475,7 +1009,7 @@ def _format_order_preview_with_delivery(user_data: dict) -> str:
         return ""
     dlabel, damount, dcur = opt[0], opt[1], opt[2]
     goods_total, _ = _cart_totals(lines)
-    out: List[str] = ["📦 Твой заказ:", ""]
+    out: List[str] = ["🛒", ""]
     for x in lines:
         name = (x.get("name") or "—")[:200]
         if len((x.get("name") or "")) > 200:
@@ -485,12 +1019,11 @@ def _format_order_preview_with_delivery(user_data: dict) -> str:
         sub = p * q
         out.append(f"• {name} — {sub}")
     out.append("")
-    out.append(f"🚚 Доставка: {dlabel} — {damount} {dcur}")
+    out.append(f"🚚 {dlabel} · {damount} {dcur}")
     if code == "by" and dcur == "BYN":
-        out.append(f"💰 Итого: {goods_total + damount} BYN")
+        out.append(f"💰 {goods_total + damount} BYN")
     else:
-        out.append(f"💰 Товары: {goods_total} BYN")
-        out.append(f"📌 Доставка: {damount} {dcur}")
+        out.append(f"💰 {goods_total} BYN · +{damount} {dcur}")
     s = "\n".join(out)
     if len(s) > 4000:
         s = s[:3990] + "…"
@@ -508,57 +1041,6 @@ def _clear_checkout_delivery(user_data: dict) -> None:
         user_data.pop(k, None)
 
 
-async def _send_new_order_to_admin(
-    context: ContextTypes.DEFAULT_TYPE,
-    user,
-    lines: List[dict],
-    delivery_label: Optional[str] = None,
-    delivery_amount: Optional[int] = None,
-    delivery_currency: Optional[str] = None,
-    delivery_country: Optional[str] = None,
-) -> bool:
-    """Заказ в Telegram (по умолчанию @Daniel_official)."""
-    chat_id = ORDER_NOTIFY_TARGET
-    goods_total, _ = _cart_totals(lines)
-    body: List[str] = ["🔥 НОВЫЙ ЗАКАЗ", ""]
-    for x in lines:
-        n = (x.get("name") or "—")[:200]
-        p = int(x.get("price") or 0)
-        q = int(x.get("qty") or 1)
-        sub = p * q
-        body.append(f"• {n} — {sub} BYN")
-    body.append("")
-    if delivery_label and delivery_amount is not None and delivery_currency:
-        body.append(f"💰 Товары: {goods_total} BYN")
-        body.append(
-            f"🚚 Доставка: {delivery_label} — {delivery_amount} {delivery_currency}"
-        )
-        if delivery_country == "by" and delivery_currency == "BYN":
-            body.append(f"💰 Итого: {goods_total + int(delivery_amount)} BYN")
-        else:
-            body.append(
-                f"📌 Товары {goods_total} BYN + доставка {delivery_amount} {delivery_currency}"
-            )
-    else:
-        body.append(f"💰 Итого: {goods_total} BYN")
-    body.append("")
-    u = user
-    uline = f"@{u.username}" if u and u.username else "— (нет @username)"
-    body.append(f"👤 {uline} · id {u.id if u else '—'}")
-    text = "\n".join(body)
-    if len(text) > 4090:
-        text = text[:4086] + "…"
-    log = logging.getLogger(__name__)
-    try:
-        await context.bot.send_message(
-            chat_id=chat_id, text=text, disable_web_page_preview=True
-        )
-    except Exception as e:
-        log.exception("Ошибка отправки заказа админу: %s", e)
-        return False
-    return True
-
-
 def _category_names(products: List[dict]) -> List[str]:
     s = {str(p.get("category", "Без категории") or "Без категории") for p in products}
     return sorted(s, key=str.lower)
@@ -571,7 +1053,7 @@ def _btn_label(s: str, max_len: int = 22) -> str:
 
 def _kb_categories(categories: List[str]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = [
-        [InlineKeyboardButton("🔥 Все категории", callback_data="c:all")],
+        [InlineKeyboardButton("∞", callback_data="c:all")],
     ]
     row: List[InlineKeyboardButton] = []
     for i, name in enumerate(categories):
@@ -686,17 +1168,17 @@ def _tinder_caption(p: dict, cur_1: int, n_total: int) -> str:
 def _tinder_keyboard(cat_tok: str, user_data: dict) -> InlineKeyboardMarkup:
     c = str(cat_tok)[:12]
     if user_data.get("tinder_autoplay_paused", False):
-        auto_btn = InlineKeyboardButton("▶️ Продолжить", callback_data="t:f")
+        auto_btn = InlineKeyboardButton("▶️", callback_data="t:f")
     else:
-        auto_btn = InlineKeyboardButton("⏸ Пауза", callback_data="t:f")
+        auto_btn = InlineKeyboardButton("⏸", callback_data="t:f")
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("⬅️ Назад", callback_data="t:p"),
-                InlineKeyboardButton("❤️ В корзину", callback_data="t:c"),
-                InlineKeyboardButton("➡️ Далее", callback_data="t:n"),
+                InlineKeyboardButton("⬅️", callback_data="t:p"),
+                InlineKeyboardButton("🛒", callback_data="t:c"),
+                InlineKeyboardButton("➡️", callback_data="t:n"),
             ],
-            [auto_btn, InlineKeyboardButton("⬅️ К редкости", callback_data=f"h:{c}")],
+            [auto_btn, InlineKeyboardButton("⬆️", callback_data=f"h:{c}")],
         ]
     )
 
@@ -990,6 +1472,50 @@ async def illucards_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("Illucards: ошибка фоновой синхронизации")
 
 
+async def crypto_auto_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mock: крипто-оплата через 2–5 мин после выбора ₿ (проверка каждые 30 с)."""
+    app = context.application
+    bot = app.bot
+    now = time.time()
+    log = logging.getLogger(__name__)
+    for oid, o in list(ORDERS.items()):
+        if not o.get("crypto_auto_active"):
+            continue
+        if o.get("paid"):
+            o["crypto_auto_active"] = False
+            o.pop("crypto_auto_deadline", None)
+            continue
+        if o.get("payment_proof_submitted"):
+            continue
+        dl = float(o.get("crypto_auto_deadline") or 0)
+        if dl <= 0 or now < dl:
+            continue
+        cust = int(o.get("user_id") or 0)
+        o["crypto_auto_active"] = False
+        o.pop("crypto_auto_deadline", None)
+        o["paid"] = True
+        o["paid_at"] = now
+        clear_cart = bool(o.pop("clear_cart_on_paid", False))
+        if clear_cart and cust:
+            _cart_clear_uid(cust)
+        try:
+            _user_state_clear_payment_states(cust)
+            cud = _user_data_for(app, cust)
+            cud.pop("awaiting_payment_order_id", None)
+        except Exception:
+            log.exception("crypto auto user_data")
+        await _send_payment_receipt(bot, cust, oid, o)
+        admin_txt = f"{CRYPTO_AUTO_OK_ADMIN}\n\n📦 Заказ #{oid}\n👤 {cust}"
+        try:
+            await bot.send_message(
+                ORDER_NOTIFY_TARGET,
+                admin_txt,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            log.exception("crypto auto → админ")
+
+
 def _extract_total_from_order_text(text: str) -> Optional[str]:
     if not (text or "").strip():
         return None
@@ -1008,11 +1534,11 @@ def _extract_total_from_order_text(text: str) -> Optional[str]:
 def _format_deep_link_order_preview(order_text: str) -> str:
     ot = (order_text or "").strip()
     if not ot:
-        return "📦 Твой заказ:\n\n—"
-    lines = ["📦 Твой заказ:", "", ot]
+        return "📦 —"
+    lines = ["📦", "", ot]
     tot = _extract_total_from_order_text(ot)
     if tot:
-        lines.extend(["", f"💰 Итого: {tot}"])
+        lines.extend(["", f"💰 {tot}"])
     s = "\n".join(lines)
     if len(s) > 4000:
         s = s[:3990] + "…"
@@ -1174,7 +1700,7 @@ def _format_user_deep_link_order_message(order: dict) -> str:
     cur = str(d.get("currency") or "BYN")
     country = str(d.get("country") or "")
     goods_total, _ = _cart_totals(lines)
-    out: List[str] = ["📦 Ваш заказ:", ""]
+    out: List[str] = ["📦", ""]
     for x in lines:
         name = (x.get("name") or "—")[:200]
         if len((x.get("name") or "")) > 200:
@@ -1184,12 +1710,11 @@ def _format_user_deep_link_order_message(order: dict) -> str:
         sub = p * q
         out.append(f"• {name} — {sub}")
     out.append("")
-    out.append(f"🚚 Доставка: {label} — {amount} {cur}")
+    out.append(f"🚚 {label} · {amount} {cur}")
     if country == "by" and cur == "BYN":
-        out.append(f"💰 Итого: {goods_total + amount} BYN")
+        out.append(f"💰 {goods_total + amount} BYN")
     else:
-        out.append(f"💰 Товары: {goods_total} BYN")
-        out.append(f"📌 Доставка: {amount} {cur}")
+        out.append(f"💰 {goods_total} BYN · +{amount} {cur}")
     s = "\n".join(out)
     if len(s) > 4000:
         s = s[:3990] + "…"
@@ -1205,7 +1730,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not msg or not msg.from_user:
         return
-    print(update.effective_user.id)
     uid = msg.from_user.id
     args = context.args or []
     if args:
@@ -1214,10 +1738,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if oid:
             order = await _fetch_order_for_deep_link(oid)
             if not order:
-                await msg.reply_text(
-                    "Заказ не найден или ссылка недействительна. Откройте каталог.",
-                    reply_markup=REPLY_KB,
-                )
+                await msg.reply_text("❌", reply_markup=REPLY_KB)
             else:
                 tok = secrets.token_hex(8)
                 context.user_data["deep_link_order_session"] = {
@@ -1231,11 +1752,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         [
                             [
                                 InlineKeyboardButton(
-                                    "✅ Оформить заказ",
+                                    "✅",
                                     callback_data=f"dlco:{tok}",
                                 ),
                                 InlineKeyboardButton(
-                                    "❌ Отменить",
+                                    "❌",
                                     callback_data=f"dlca:{tok}",
                                 ),
                             ],
@@ -1245,7 +1766,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             t = " ".join(args).strip()
             if not t:
-                await msg.reply_text("Привет!", reply_markup=REPLY_KB)
+                await msg.reply_text("·", reply_markup=REPLY_KB)
             else:
                 context.user_data.pop("deep_link_order_session", None)
                 context.user_data["pending_order"] = t
@@ -1256,20 +1777,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         [
                             [
                                 InlineKeyboardButton(
-                                    "✅ Подтвердить заказ",
+                                    "✅",
                                     callback_data="confirm_order",
                                 ),
-                                InlineKeyboardButton(
-                                    "❌ Отменить", callback_data="cancel_order"
-                                ),
+                                InlineKeyboardButton("❌", callback_data="cancel_order"),
                             ],
                         ],
                     ),
                 )
     else:
-        await msg.reply_text("Привет!", reply_markup=REPLY_KB)
+        await msg.reply_text("·", reply_markup=REPLY_KB)
     code = _issue_login_code(uid)
-    await msg.reply_text(f"Твой код для входа на сайт: {code}")
+    await msg.reply_text(f"🔑 {code}")
 
 
 async def on_deep_link_confirm_order(
@@ -1287,15 +1806,7 @@ async def on_deep_link_confirm_order(
     u = q.from_user
     uname = f"@{u.username}" if u and u.username else "—"
     uid = u.id if u else "—"
-    admin_body = "\n".join(
-        [
-            "🔥 НОВЫЙ ЗАКАЗ",
-            "",
-            order_text,
-            "",
-            f"👤 {uname} (ID: {uid})",
-        ]
-    )
+    admin_body = "\n".join(["📦", "", order_text, "", f"👤 {uname} · {uid}"])
     if len(admin_body) > 4090:
         admin_body = admin_body[:4086] + "…"
     log = logging.getLogger(__name__)
@@ -1304,6 +1815,7 @@ async def on_deep_link_confirm_order(
             chat_id=ORDER_NOTIFY_TARGET,
             text=admin_body,
             disable_web_page_preview=True,
+            reply_markup=None,
         )
     except Exception as e:
         log.exception("deep link order → admin: %s", e)
@@ -1315,7 +1827,7 @@ async def on_deep_link_confirm_order(
         await q.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    await q.message.reply_text("✅ Заказ отправлен!")
+    await q.message.reply_text(ORDER_AUTO_ACK)
 
 
 async def on_deep_link_cancel_order(
@@ -1328,9 +1840,9 @@ async def on_deep_link_cancel_order(
     context.user_data.pop("pending_order", None)
     await q.answer()
     try:
-        await q.message.edit_text("❌ Заказ отменён", reply_markup=None)
+        await q.message.edit_text("❌", reply_markup=None)
     except Exception:
-        await q.message.reply_text("❌ Заказ отменён")
+        await q.message.reply_text("❌")
 
 
 async def on_deep_link_structured_submit(
@@ -1367,19 +1879,6 @@ async def on_deep_link_structured_submit(
         d_amt = 0
     d_cur = str(d.get("currency") or "BYN")
     d_cc = str(d.get("country") or "")
-    ok = await _send_new_order_to_admin(
-        context,
-        u,
-        list(lines),
-        delivery_label=d_label,
-        delivery_amount=d_amt,
-        delivery_currency=d_cur,
-        delivery_country=d_cc or None,
-    )
-    if not ok:
-        await _notify_callback_issue(q, context)
-        return
-    ud.pop("deep_link_order_session", None)
     goods_total, _ = _cart_totals(list(lines))
     drec = {
         "country": d_cc,
@@ -1388,7 +1887,7 @@ async def on_deep_link_structured_submit(
         "currency": d_cur,
     }
     order_rec = {
-        "id": str(order.get("external_id") or secrets.token_urlsafe(10)),
+        "id": "0",
         "items": deepcopy(list(lines)),
         "total": int(goods_total),
         "total_goods": int(goods_total),
@@ -1397,16 +1896,27 @@ async def on_deep_link_structured_submit(
     }
     if drec.get("country") == "by" and drec.get("currency") == "BYN":
         order_rec["total"] = int(goods_total) + int(drec.get("amount") or 0)
+    oid = await _notify_admin_new_order(
+        context, u, list(lines), int(order_rec["total"]), deepcopy(drec)
+    )
+    if oid is None:
+        await _notify_callback_issue(q, context)
+        return
+    ud.pop("deep_link_order_session", None)
+    order_rec["id"] = str(oid)
     USER_ORDERS.setdefault(u.id, []).append(order_rec)
+    ORDERS[int(oid)]["clear_cart_on_paid"] = False
+    ud["awaiting_payment_order_id"] = int(oid)
+    ud.pop("payment_pending_method", None)
     await q.answer()
     try:
         await q.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
+    tot = int(order_rec["total"])
     await q.message.reply_text(
-        "✅ Заказ оформлен!\n"
-        "С вами свяжется администратор 👇\n"
-        f"{ORDER_MENTION}"
+        _payment_intro_text(tot),
+        reply_markup=_kb_payment_methods(),
     )
 
 
@@ -1427,60 +1937,79 @@ async def on_deep_link_structured_cancel(
     ud.pop("deep_link_order_session", None)
     await q.answer()
     try:
-        await q.message.edit_text("❌ Заказ отменён", reply_markup=None)
+        await q.message.edit_text("❌", reply_markup=None)
     except Exception:
-        await q.message.reply_text("❌ Заказ отменён")
+        await q.message.reply_text("❌")
 
 
 def _kb_admin_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📦 Заказы", callback_data="adm:orders")],
-            [InlineKeyboardButton("📈 Статистика", callback_data="adm:stats")],
-            [InlineKeyboardButton("📩 Написать клиенту", callback_data="adm:msg")],
+            [InlineKeyboardButton("📦", callback_data="adm:orders")],
+            [InlineKeyboardButton("📈", callback_data="adm:stats")],
         ],
     )
 
 
-def _format_admin_orders_summary() -> str:
-    flat: List[Tuple[int, dict]] = []
-    for uid, lst in USER_ORDERS.items():
-        for rec in lst or []:
-            flat.append((int(uid), rec))
-    if not flat:
-        return "📦 Заказы\n\nПока нет заказов в памяти бота."
-    lines: List[str] = ["📦 Заказы:", ""]
-    for uid, rec in flat[-25:]:
-        oid = str(rec.get("id") or "")[:18]
-        st = str(rec.get("status") or "—")
-        tg = rec.get("total_goods", rec.get("total", "?"))
-        lines.append(f"• <code>{uid}</code> · #{oid} · {st} · {tg} BYN")
-    if len(flat) > 25:
-        lines.append("")
-        lines.append(f"… всего записей: {len(flat)}")
-    s = "\n".join(lines)
-    if len(s) > 3900:
-        s = s[:3890] + "…"
-    return s
+def _kb_admin_orders_list() -> Optional[InlineKeyboardMarkup]:
+    if not ORDERS:
+        return None
+    rows: List[List[InlineKeyboardButton]] = []
+    for oid in sorted(ORDERS.keys(), key=lambda k: int(k)):
+        o = ORDERS[oid]
+        tot = int(o.get("total") or 0)
+        label = f"#{oid} — {tot} BYN"
+        if len(label) > 60:
+            label = label[:57] + "…"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label, callback_data=f"open_order_{int(oid)}"
+                ),
+            ],
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def _format_admin_stats() -> str:
-    n_orders = sum(len(lst or []) for lst in USER_ORDERS.values())
-    n_users_orders = sum(1 for lst in USER_ORDERS.values() if lst)
-    n_carts_nonempty = 0
-    for c in USER_CART.values():
-        if not isinstance(c, dict):
-            continue
-        if list(c.get("items") or []):
-            n_carts_nonempty += 1
-    n_shared_dl = len(SHARED_DEEP_LINK_ORDERS)
-    return (
-        "📈 Статистика (в памяти процесса)\n\n"
-        f"• Заказов всего: {n_orders}\n"
-        f"• Пользователей с заказами: {n_users_orders}\n"
-        f"• Непустых корзин: {n_carts_nonempty}\n"
-        f"• Черновиков по deep link: {n_shared_dl}\n"
-    )
+    """Сводка по ORDERS в памяти процесса (дата «сегодня» — локальное время сервера)."""
+    today_local = datetime.now().date()
+    today_count = 0
+    revenue_byn = 0
+    by_status = {"new": 0, "accepted": 0, "shipped": 0, "done": 0, "canceled": 0}
+    for o in ORDERS.values():
+        st = str(o.get("status") or "new").strip()
+        if st == "cancelled":
+            st = "canceled"
+        if st not in by_status:
+            st = "new"
+        by_status[st] += 1
+        try:
+            ts = float(o.get("created_at") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts > 0 and datetime.fromtimestamp(ts).date() == today_local:
+            today_count += 1
+        try:
+            tot = int(o.get("total") or 0)
+        except (TypeError, ValueError):
+            tot = 0
+        if st != "canceled":
+            revenue_byn += tot
+    n_all = len(ORDERS)
+    lines = [
+        "📈 Статистика:",
+        "",
+        f"Сегодня заказов: {today_count}",
+        f"Всего заказов: {n_all}",
+        f"Выручка: {revenue_byn} BYN",
+        "",
+        "Разбить по статусам:",
+        f"Новый: {by_status['new']}",
+        f"Принят: {by_status['accepted']}",
+        f"Отправлен: {by_status['shipped']}",
+    ]
+    return "\n".join(lines)
 
 
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1489,9 +2018,9 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not msg or not u:
         return
     if not is_admin(u.id):
-        await msg.reply_text("Нет доступа")
+        await msg.reply_text(ADMIN_ACCESS_DENIED)
         return
-    await msg.reply_text("📊 Админ-панель", reply_markup=_kb_admin_panel())
+    await msg.reply_text("⚙️", reply_markup=_kb_admin_panel())
 
 
 async def admin_say_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1501,32 +2030,26 @@ async def admin_say_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not msg or not u:
         return
     if not is_admin(u.id):
-        await msg.reply_text("Нет доступа")
+        await msg.reply_text(ADMIN_ACCESS_DENIED)
         return
     args = context.args or []
     if len(args) < 2:
-        await msg.reply_text(
-            "Формат: /say ID_пользователя текст сообщения\n"
-            "Пример: /say 123456789 Здравствуйте!"
-        )
+        await msg.reply_text("/say ID текст")
         return
     try:
         target_id = int(args[0])
     except (TypeError, ValueError):
-        await msg.reply_text("Некорректный ID пользователя.")
+        await msg.reply_text("❌")
         return
     text = " ".join(args[1:]).strip()
     if not text:
-        await msg.reply_text("Пустой текст.")
+        await msg.reply_text("❌")
         return
-    log = logging.getLogger(__name__)
-    try:
-        await context.bot.send_message(chat_id=target_id, text=text)
-    except Exception as e:
-        log.exception("admin /say → user %s", target_id)
-        await msg.reply_text("Не удалось отправить сообщение. Проверьте ID и то, что пользователь уже писал боту.")
+    ok = await _send_customer_plain(context.bot, target_id, text)
+    if not ok:
+        await msg.reply_text("❌")
         return
-    await msg.reply_text("✅ Сообщение отправлено.")
+    await msg.reply_text("✅")
 
 
 async def on_admin_panel_action(
@@ -1534,30 +2057,192 @@ async def on_admin_panel_action(
     q = update.callback_query
     if not q or not q.from_user or not q.data or not q.message:
         return
-    m = re.match(r"^adm:(orders|stats|msg)$", (q.data or "").strip())
+    m = re.match(r"^adm:(orders|stats)$", (q.data or "").strip())
     if not m:
         return
     if not is_admin(q.from_user.id):
-        try:
-            await q.answer("Нет доступа")
-        except Exception:
-            pass
         return
     action = m.group(1)
     await q.answer()
     if action == "orders":
-        body = _format_admin_orders_summary()
-        await q.message.reply_text(body, parse_mode="HTML")
-    elif action == "stats":
-        await q.message.reply_text(_format_admin_stats())
+        if not ORDERS:
+            await q.message.reply_text("📦 ∅")
+        else:
+            body_lines: List[str] = ["📦", ""]
+            for oid in sorted(ORDERS.keys(), key=int):
+                o = ORDERS[oid]
+                tot = int(o.get("total") or 0)
+                body_lines.append(f"#{oid} — {tot} BYN")
+            text = "\n".join(body_lines)
+            if len(text) > 3500:
+                text = text[:3490] + "…"
+            await q.message.reply_text(
+                text,
+                reply_markup=_kb_admin_orders_list(),
+            )
     else:
-        await q.message.reply_text(
-            "📩 Написать клиенту\n\n"
-            "Отправьте команду:\n"
-            "<code>/say ID_пользователя ваш текст</code>\n\n"
-            "Клиент должен был хотя бы раз написать боту, иначе доставка сообщения невозможна.",
-            parse_mode="HTML",
-        )
+        await q.message.reply_text(_format_admin_stats())
+
+
+async def on_admin_open_order(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    m = re.match(r"^open_order_(\d+)$", (q.data or "").strip())
+    if not m:
+        return
+    if not is_admin(q.from_user.id):
+        return
+    try:
+        oid = int(m.group(1))
+    except ValueError:
+        await q.answer()
+        return
+    o = ORDERS.get(oid)
+    if not o:
+        try:
+            await q.answer("Заказ не найден", show_alert=False)
+        except Exception:
+            pass
+        return
+    await q.answer()
+    st = str(o.get("status") or "new")
+    await q.message.reply_text(
+        _format_admin_order_detail_text(oid, o),
+        reply_markup=_kb_order_admin_actions(oid, st),
+    )
+
+
+async def on_order_admin_action(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Только 💬 Ответить (oam:rep). Принять / отправлен / отмена — accept_ / sent_ / cancel_."""
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    m = re.match(r"^oam:rep:(\d+)$", (q.data or "").strip())
+    if not m:
+        return
+    if not is_admin(q.from_user.id):
+        return
+    try:
+        oid = int(m.group(1))
+    except ValueError:
+        await q.answer()
+        return
+    o = ORDERS.get(oid)
+    if not o:
+        try:
+            await q.answer("Заказ не найден", show_alert=False)
+        except Exception:
+            pass
+        return
+    context.user_data.pop("reply_support_user_id", None)
+    context.user_data["reply_to"] = oid
+    await q.answer()
+    cust = int(o.get("user_id") or 0)
+    if cust:
+        await _send_customer_plain(context.bot, cust, ADMIN_TYPING_NOTICE)
+    await q.message.reply_text("✍️")
+
+
+async def on_support_reply_activate(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """💬 Ответить под сообщением клиента (поддержка): sup:rep:{user_id}."""
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    m = re.match(r"^sup:rep:(\d+)$", (q.data or "").strip())
+    if not m:
+        return
+    if not is_admin(q.from_user.id):
+        return
+    try:
+        client_uid = int(m.group(1))
+    except ValueError:
+        await q.answer()
+        return
+    if not client_uid:
+        await q.answer()
+        return
+    context.user_data.pop("reply_to", None)
+    context.user_data["reply_support_user_id"] = client_uid
+    await q.answer()
+    await _send_customer_plain(context.bot, client_uid, ADMIN_TYPING_NOTICE)
+    await q.message.reply_text("✍️")
+
+
+async def on_user_order_open(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    m = re.match(r"^user_order_(\d+)$", (q.data or "").strip())
+    if not m:
+        return
+    try:
+        oid = int(m.group(1))
+    except ValueError:
+        return
+    uid = q.from_user.id
+    o = ORDERS.get(oid)
+    if not o or int(o.get("user_id") or 0) != int(uid):
+        return
+    await q.answer()
+    await q.message.reply_text(_format_user_order_detail(oid, o))
+
+
+async def on_order_status_buttons(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    m = re.match(r"^(accept|sent|cancel|done)_(\d+)$", (q.data or "").strip())
+    if not m:
+        return
+    if not is_admin(q.from_user.id):
+        return
+    action, oid_s = m.group(1), m.group(2)
+    try:
+        oid = int(oid_s)
+    except ValueError:
+        await q.answer()
+        return
+    o = ORDERS.get(oid)
+    if not o:
+        try:
+            await q.answer("Заказ не найден", show_alert=False)
+        except Exception:
+            pass
+        return
+    st = str(o.get("status") or "new")
+    terminal = ("done", "canceled", "cancelled")
+    if action == "accept":
+        if st != "new":
+            await q.answer("Уже обработан.", show_alert=False)
+            return
+        o["status"] = "accepted"
+    elif action == "sent":
+        if st not in ("new", "accepted"):
+            await q.answer("Недоступно.", show_alert=False)
+            return
+        o["status"] = "shipped"
+    elif action == "done":
+        if st != "shipped":
+            await q.answer("Недоступно.", show_alert=False)
+            return
+        o["status"] = "done"
+    elif action == "cancel":
+        if st in terminal:
+            await q.answer("Недоступно.", show_alert=False)
+            return
+        o["status"] = "canceled"
+    else:
+        return
+    await q.answer("✅", show_alert=False)
+    notice = _format_customer_order_status_notice(oid, str(o.get("status") or ""))
+    await _notify_order_customer(context, o, notice)
+    await _refresh_admin_order_message(context, oid)
 
 
 async def catalog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1575,57 +2260,81 @@ async def send_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     cards = await load_products()
     if not cards:
-        await msg.reply_text("Не удалось загрузить товары")
+        await msg.reply_text("❌")
         return
     context.bot_data["products"] = cards
     context.bot_data["illucards_synced_at"] = time.time()
 
     categories = _category_names(cards)
     if not categories:
-        await msg.reply_text("Категории не найдены")
+        await msg.reply_text("❌")
         return
     log.info("Каталог: %d разделов", len(categories))
-    await msg.reply_text(
-        "🔥 Коллекция",
-        reply_markup=_kb_categories(categories),
-    )
+    await msg.reply_text("💰", reply_markup=_kb_categories(categories))
 
 
 async def send_tinder_mode(
     update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка «🔥 Смотреть карточки» — Tinder по всему каталогу (cat_tok all)."""
+    """Tinder по всему каталогу (cat_tok all); вызывается из кода, не с reply-клавиатуры."""
     msg = update.effective_message
     if not msg:
         return
     products = await _get_products(context)
     if not products:
-        await msg.reply_text(
-            "Пока нет карточек. Сначала открой «📦 Каталог» или подожди загрузки."
-        )
+        await msg.reply_text("❌")
         return
     in_scope = list(products)
     ok = await _tinder_start_deck(
         context, int(msg.chat_id), in_scope, products, "all"
     )
     if not ok:
-        await msg.reply_text("Не получилось открыть просмотр. Попробуй ещё раз.")
+        await msg.reply_text("❌")
+
+
+async def send_popular_deck(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """🔥 Популярное — карточки со скидкой (isSale), иначе весь каталог."""
+    msg = update.effective_message
+    if not msg:
+        return
+    products = await _get_products(context)
+    if not products:
+        await msg.reply_text("❌")
+        return
+    cats = _category_names(products)
+    in_scope, _, _ = _filter_wizard(products, cats, "all", "sale")
+    if not in_scope:
+        in_scope = list(products)
+    ok = await _tinder_start_deck(
+        context, int(msg.chat_id), in_scope, products, "all"
+    )
+    if not ok:
+        await msg.reply_text("❌")
+
+
+async def send_random_card(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """🎁 Случайная карточка — одна позиция в режиме просмотра."""
+    msg = update.effective_message
+    if not msg:
+        return
+    products = await _get_products(context)
+    if not products:
+        await msg.reply_text("❌")
+        return
+    in_scope = [random.choice(products)]
+    ok = await _tinder_start_deck(
+        context, int(msg.chat_id), in_scope, products, "all"
+    )
+    if not ok:
+        await msg.reply_text("❌")
 
 
 async def send_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg:
         return
-    await msg.reply_photo(
-        photo=PROMO_PHOTO,
-        caption="При покупке всей коллекции — подарок 🎁",
-    )
-
-
-async def send_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if not msg:
-        return
-    await msg.reply_text("Напишите: @Daniel_official")
+    await msg.reply_photo(photo=PROMO_PHOTO, caption="🎁")
 
 
 async def _get_products(context: ContextTypes.DEFAULT_TYPE) -> List[dict]:
@@ -1644,16 +2353,13 @@ async def _edit_to_categories(
 ) -> None:
     products = await _get_products(context)
     if not products:
-        await q.edit_message_text("Каталог пуст. Нажми 📦 Каталог ещё раз.")
+        await q.edit_message_text("❌")
         return
     cats = _category_names(products)
     if not cats:
-        await q.edit_message_text("Категорий нет")
+        await q.edit_message_text("❌")
         return
-    await q.edit_message_text(
-        "🔥 Коллекция",
-        reply_markup=_kb_categories(cats),
-    )
+    await q.edit_message_text("💰", reply_markup=_kb_categories(cats))
 
 
 async def on_menu_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1675,7 +2381,7 @@ async def on_pick_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     products = await _get_products(context)
     cats = _category_names(products)
     if key == "all":
-        t = "🔥 Все разделы\n\n⭐ Выбери редкость:"
+        t = "⭐"
         await q.answer()
         await q.edit_message_text(t, reply_markup=_kb_rarities("all"))
         return
@@ -1686,7 +2392,7 @@ async def on_pick_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await q.message.reply_text(FALLBACK_USER_TEXT)
         return
     cat = cats[ci]
-    t = f"🔥 {cat}\n\n⭐ Выбери редкость:"
+    t = f"⭐ {cat}"
     await q.answer()
     await q.edit_message_text(t, reply_markup=_kb_rarities(str(ci)))
 
@@ -1708,12 +2414,12 @@ async def on_pick_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if rar_tok != "all" and not in_scope:
         await q.answer()
         if q.message:
-            await q.message.reply_text("По этому фильтру пока пусто.")
+            await q.message.reply_text("∅")
         return
     if not in_scope:
         await q.answer()
         if q.message:
-            await q.message.reply_text("В выборе пока нет карточек.")
+            await q.message.reply_text("∅")
         return
     await q.answer()
     await _tinder_start(q, context, in_scope, products, cat_tok)
@@ -1739,7 +2445,7 @@ async def on_back_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     products = await _get_products(context)
     cats = _category_names(products)
     if cat_tok == "all":
-        t = "🔥 Все разделы\n\n⭐ Выбери редкость:"
+        t = "⭐"
         kb = _kb_rarities("all")
     else:
         try:
@@ -1751,7 +2457,7 @@ async def on_back_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await _edit_to_categories(q, context)
             return
         cat = cats[cix]
-        t = f"🔥 {cat}\n\n⭐ Выбери редкость:"
+        t = f"⭐ {cat}"
         kb = _kb_rarities(str(cix))
     qm = q.message
     if qm and qm.photo:
@@ -1919,9 +2625,31 @@ async def on_cart_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if re.match(r"^cz:0$", (q.data or "").strip()) is None:
         return
     uid = q.from_user.id if q.from_user else 0
+    ud = context.user_data
+    pend = ud.get("awaiting_payment_order_id")
+    if pend is not None and uid:
+        try:
+            po = ORDERS.get(int(pend))
+        except (TypeError, ValueError):
+            po = None
+        if po and not po.get("paid") and int(po.get("user_id") or 0) == int(uid):
+            _clear_crypto_auto_watch(po, uid)
+            ud.pop("awaiting_payment_order_id", None)
+            ud.pop("payment_pending_method", None)
+    pr = _user_state_get(uid, "awaiting_proof")
+    if pr is not None and uid:
+        try:
+            pro = ORDERS.get(int(pr))
+        except (TypeError, ValueError):
+            _user_state_pop(uid, "awaiting_proof")
+            pro = None
+        if pro and not pro.get("paid") and int(pro.get("user_id") or 0) == int(uid):
+            _clear_crypto_auto_watch(pro, uid)
+            _user_state_pop(uid, "awaiting_proof")
+            ud.pop("payment_pending_method", None)
     if uid:
         _cart_clear_uid(uid)
-    await q.answer("Корзина пуста", show_alert=False)
+    await q.answer("🛒 ∅", show_alert=False)
     await _edit_cart_message(q, context)
 
 
@@ -1943,7 +2671,7 @@ async def on_checkout_ask_username(
     if not lines:
         await q.answer()
         if q.message:
-            await q.message.reply_text("Корзина пуста. Добавь карточки из каталога.")
+            await q.message.reply_text("🛒 ∅")
         return
     ud = context.user_data
     ud["order_checkout"] = deepcopy(lines)
@@ -1952,10 +2680,7 @@ async def on_checkout_ask_username(
     ud.pop("delivery_amount", None)
     ud.pop("delivery_currency", None)
     await q.answer()
-    await q.message.reply_text(
-        "Выберите страну доставки:",
-        reply_markup=_kb_delivery_country(),
-    )
+    await q.message.reply_text("🚚", reply_markup=_kb_delivery_country())
 
 
 async def on_delivery_country_pick(
@@ -1990,7 +2715,7 @@ async def on_delivery_country_pick(
     await q.message.reply_text(
         preview,
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("✅ Подтвердить заказ", callback_data="ta:0")]],
+            [[InlineKeyboardButton("✅", callback_data="ta:0")]],
         ),
     )
 
@@ -2004,6 +2729,33 @@ async def on_send_order_to_admin(
     if (q.data or "").strip() != "ta:0":
         return
     ud = context.user_data
+    uid_chk = q.from_user.id if q.from_user else 0
+    ap = _user_state_get(uid_chk, "awaiting_proof")
+    if ap is not None:
+        try:
+            po = ORDERS.get(int(ap))
+        except (TypeError, ValueError):
+            _user_state_pop(uid_chk, "awaiting_proof")
+            po = None
+        if po is not None and not po.get("paid"):
+            try:
+                await q.answer("📸", show_alert=True)
+            except Exception:
+                pass
+            return
+    pend = ud.get("awaiting_payment_order_id")
+    if pend is not None:
+        try:
+            po = ORDERS.get(int(pend))
+        except (TypeError, ValueError):
+            po = None
+            ud.pop("awaiting_payment_order_id", None)
+        if po is not None and not po.get("paid"):
+            try:
+                await q.answer("💳", show_alert=True)
+            except Exception:
+                pass
+            return
     lines: Optional[List[dict]] = ud.get("order_checkout")
     if not lines:
         await _notify_callback_issue(q, context)
@@ -2016,18 +2768,6 @@ async def on_send_order_to_admin(
         await _notify_callback_issue(q, context)
         return
     uid = u.id
-    ok = await _send_new_order_to_admin(
-        context,
-        u,
-        list(lines),
-        delivery_label=ud.get("delivery_label"),
-        delivery_amount=ud.get("delivery_amount"),
-        delivery_currency=ud.get("delivery_currency"),
-        delivery_country=str(ud.get("delivery_country") or ""),
-    )
-    if not ok:
-        await _notify_callback_issue(q, context)
-        return
     drec = {
         "country": ud.get("delivery_country"),
         "label": ud.get("delivery_label"),
@@ -2036,7 +2776,7 @@ async def on_send_order_to_admin(
     }
     goods_total, _ = _cart_totals(list(lines))
     order_rec = {
-        "id": secrets.token_urlsafe(10),
+        "id": "0",
         "items": deepcopy(list(lines)),
         "total": int(goods_total),
         "total_goods": int(goods_total),
@@ -2045,12 +2785,401 @@ async def on_send_order_to_admin(
     }
     if drec.get("country") == "by" and drec.get("currency") == "BYN":
         order_rec["total"] = int(goods_total) + int(drec.get("amount") or 0)
+    oid = await _notify_admin_new_order(
+        context, u, list(lines), int(order_rec["total"]), deepcopy(drec)
+    )
+    if oid is None:
+        await _notify_callback_issue(q, context)
+        return
+    order_rec["id"] = str(oid)
     USER_ORDERS.setdefault(uid, []).append(order_rec)
-    if uid:
-        _cart_clear_uid(uid)
+    ORDERS[int(oid)]["clear_cart_on_paid"] = True
+    ud["awaiting_payment_order_id"] = int(oid)
+    ud.pop("payment_pending_method", None)
     _clear_checkout_delivery(ud)
-    await q.answer("Готово")
-    await q.message.reply_text("✅ Заказ отправлен!")
+    await q.answer()
+    tot = int(order_rec["total"])
+    await q.message.reply_text(
+        _payment_intro_text(tot),
+        reply_markup=_kb_payment_methods(),
+    )
+
+
+async def on_payment_method(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """pay_card | pay_transfer | pay_crypto — реквизиты и кнопка «Я оплатил»."""
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    m = re.match(r"^pay_(card|transfer|crypto)$", (q.data or "").strip())
+    if not m:
+        return
+    uid = q.from_user.id
+    ud = context.user_data
+    oid_raw = ud.get("awaiting_payment_order_id")
+    if oid_raw is None:
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    try:
+        oid = int(oid_raw)
+    except (TypeError, ValueError):
+        ud.pop("awaiting_payment_order_id", None)
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    o = ORDERS.get(oid)
+    if not o or int(o.get("user_id") or 0) != int(uid):
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    if o.get("paid"):
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    if o.get("payment_proof_submitted") and not o.get("paid"):
+        try:
+            await q.answer(PAY_PROOF_WAIT, show_alert=True)
+        except Exception:
+            pass
+        return
+    if _user_state_get(uid, "awaiting_proof") is not None:
+        try:
+            await q.answer("📸", show_alert=True)
+        except Exception:
+            pass
+        return
+    method = m.group(1)
+    ud["payment_pending_method"] = method
+    if method == "crypto":
+        _user_state_set(uid, "crypto_check", oid)
+        o["crypto_auto_active"] = True
+        o["crypto_auto_deadline"] = time.time() + random.uniform(120.0, 300.0)
+    else:
+        _clear_crypto_auto_watch(o, uid)
+    body_map = {
+        "card": PAY_CARD_BODY,
+        "transfer": PAY_TRANSFER_BODY,
+        "crypto": PAY_CRYPTO_BODY,
+    }
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    await q.message.reply_text(
+        body_map[method],
+        reply_markup=_kb_paid_confirm(),
+    )
+
+
+async def on_payment_paid(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """paid — подтверждение оплаты клиентом."""
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    if (q.data or "").strip() != "paid":
+        return
+    uid = q.from_user.id
+    ud = context.user_data
+    oid_raw = ud.get("awaiting_payment_order_id")
+    if oid_raw is None:
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    try:
+        oid = int(oid_raw)
+    except (TypeError, ValueError):
+        ud.pop("awaiting_payment_order_id", None)
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    o = ORDERS.get(oid)
+    if not o or int(o.get("user_id") or 0) != int(uid):
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    if o.get("paid"):
+        try:
+            await q.answer("✅", show_alert=False)
+        except Exception:
+            pass
+        return
+    if o.get("payment_proof_submitted") and not o.get("paid"):
+        try:
+            await q.answer(PAY_PROOF_WAIT, show_alert=True)
+        except Exception:
+            pass
+        return
+    pr_oid = _user_state_get(uid, "awaiting_proof")
+    if pr_oid is not None and int(pr_oid) == int(oid):
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        try:
+            await q.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await q.message.reply_text(PAY_PROOF_REQUEST)
+        return
+    pm = ud.pop("payment_pending_method", None)
+    if pm:
+        o["payment_pending_method"] = pm
+    _clear_crypto_auto_watch(o, uid)
+    _user_state_set(uid, "awaiting_proof", int(oid))
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await q.message.reply_text(PAY_PROOF_REQUEST)
+
+
+async def _send_or_edit_admin_payment_proof(
+    context: ContextTypes.DEFAULT_TYPE,
+    order_id: int,
+    o: dict,
+    file_id: str,
+    caption: str,
+) -> bool:
+    """Сообщение админу со скрином и кнопками подтверждения; при повторной отправке — edit."""
+    log = logging.getLogger(__name__)
+    kb = _kb_payment_admin_review(order_id)
+    cid = o.get("payment_proof_admin_chat_id")
+    mid = o.get("payment_proof_admin_message_id")
+    if cid is not None and mid is not None:
+        try:
+            await context.bot.edit_message_media(
+                chat_id=int(cid),
+                message_id=int(mid),
+                media=InputMediaPhoto(media=file_id, caption=caption),
+                reply_markup=kb,
+            )
+            return True
+        except Exception as e:
+            log.info("payment proof edit_media: %s", e)
+    try:
+        sent = await context.bot.send_photo(
+            chat_id=ORDER_NOTIFY_TARGET,
+            photo=file_id,
+            caption=caption,
+            reply_markup=kb,
+        )
+        o["payment_proof_admin_chat_id"] = int(sent.chat_id)
+        o["payment_proof_admin_message_id"] = int(sent.message_id)
+        return True
+    except Exception:
+        log.exception("скрин оплаты → админ order_id=%s", order_id)
+        return False
+
+
+async def on_payment_proof_photo(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фото-скрин оплаты при awaiting_proof; оплата у заказа — после подтверждения админом."""
+    msg = update.effective_message
+    if not msg or not msg.photo:
+        return
+    ud = context.user_data
+    uid = msg.from_user.id if msg.from_user else 0
+    oid_raw = _user_state_get(uid, "awaiting_proof")
+    if oid_raw is None:
+        return
+    if not uid:
+        return
+    try:
+        oid = int(oid_raw)
+    except (TypeError, ValueError):
+        _user_state_pop(uid, "awaiting_proof")
+        return
+    o = ORDERS.get(oid)
+    if not o or int(o.get("user_id") or 0) != int(uid):
+        _user_state_pop(uid, "awaiting_proof")
+        return
+    if o.get("paid"):
+        _user_state_pop(uid, "awaiting_proof")
+        await msg.reply_text("✅")
+        return
+    _clear_crypto_auto_watch(o, uid)
+    file_id = msg.photo[-1].file_id
+    cap = f"📸 #{oid} · {uid}"
+    ok = await _send_or_edit_admin_payment_proof(context, oid, o, file_id, cap)
+    if not ok:
+        await msg.reply_text("❌")
+        return
+    o["payment_proof_submitted"] = True
+    o["proof_file_id"] = file_id
+    _user_state_pop(uid, "awaiting_proof")
+    await msg.reply_text(PAY_PROOF_WAIT)
+
+
+async def on_admin_confirm_payment(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    m = re.match(r"^confirm_payment_(\d+)$", (q.data or "").strip())
+    if not m:
+        return
+    if not is_admin(q.from_user.id):
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    try:
+        oid = int(m.group(1))
+    except ValueError:
+        await q.answer()
+        return
+    o = ORDERS.get(oid)
+    if not o:
+        await q.answer()
+        return
+    if o.get("paid"):
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    if not o.get("payment_proof_submitted"):
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    o["paid"] = True
+    o["paid_at"] = time.time()
+    cust = int(o.get("user_id") or 0)
+    clear_cart = bool(o.pop("clear_cart_on_paid", False))
+    if clear_cart and cust:
+        _cart_clear_uid(cust)
+    _user_state_clear_payment_states(cust)
+    cud = _user_data_for(context.application, cust)
+    cud.pop("awaiting_payment_order_id", None)
+    o.pop("crypto_auto_active", None)
+    o.pop("crypto_auto_deadline", None)
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    try:
+        prev = (q.message.caption or "").strip()
+        await q.message.edit_caption(
+            caption=prev + "\n\n✅",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+    if cust:
+        await _send_payment_receipt(context.bot, cust, oid, o)
+
+
+async def on_receipt_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки чека: Мои заказы / Поддержка."""
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    m = re.match(r"^rcpt_(orders|support)$", (q.data or "").strip())
+    if not m:
+        return
+    uid = q.from_user.id if q.from_user else 0
+    if not uid:
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    action = m.group(1)
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    if action == "orders":
+        body, kb = _format_mine_orders_text_and_kb(uid)
+        await q.message.reply_text(body, reply_markup=kb)
+    else:
+        user_support_state[uid] = True
+        await q.message.reply_text("💬")
+
+
+async def on_admin_reject_payment(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    m = re.match(r"^reject_payment_(\d+)$", (q.data or "").strip())
+    if not m:
+        return
+    if not is_admin(q.from_user.id):
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    try:
+        oid = int(m.group(1))
+    except ValueError:
+        await q.answer()
+        return
+    o = ORDERS.get(oid)
+    if not o:
+        await q.answer()
+        return
+    if o.get("paid"):
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    if not o.get("payment_proof_submitted"):
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    cust = int(o.get("user_id") or 0)
+    cud = _user_data_for(context.application, cust) if cust else {}
+    _clear_crypto_auto_watch(o, cust)
+    o["payment_proof_submitted"] = False
+    o.pop("proof_file_id", None)
+    o.pop("payment_proof_admin_chat_id", None)
+    o.pop("payment_proof_admin_message_id", None)
+    if cust:
+        _user_state_set(cust, "awaiting_proof", int(oid))
+        await _send_customer_plain(
+            context.bot, cust, PAY_ADMIN_REJECTED_CLIENT
+        )
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    try:
+        prev = (q.message.caption or "").strip()
+        await q.message.edit_caption(
+            caption=prev + "\n\n❌",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
 
 
 async def on_view_cart_callback(
@@ -2077,14 +3206,138 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = msg.text.strip()
     user_data = context.user_data
+    uid = msg.from_user.id if msg.from_user else 0
 
-    if text in ("📦 Каталог", "🔥 Смотреть карточки", "🔥 Акции", "💬 Связь"):
+    if _user_state_get(uid, "awaiting_proof") is not None:
+        if text in REPLY_MENU_TEXTS:
+            _user_state_pop(uid, "awaiting_proof")
+        else:
+            await msg.reply_text("📸")
+            return
+
+    cc_raw = _user_state_get(uid, "crypto_check")
+    if cc_raw is not None and text in REPLY_MENU_TEXTS:
+        try:
+            co = ORDERS.get(int(cc_raw))
+        except (TypeError, ValueError):
+            co = None
+            _user_state_pop(uid, "crypto_check")
+        if co is not None and not co.get("paid"):
+            _clear_crypto_auto_watch(co, uid)
+
+    menu_keys = (
+        BTN_ORDERS,
+        BTN_CART,
+        BTN_CHAT,
+        BTN_DELIVERY,
+        BTN_MONEY,
+        BTN_POPULAR,
+        BTN_RANDOM_CARD,
+    )
+    sup_uid = user_data.get("reply_support_user_id")
+    rep_oid = user_data.get("reply_to")
+    if is_admin(uid) and (sup_uid is not None or rep_oid is not None):
+        if text in menu_keys:
+            user_data.pop("reply_to", None)
+            user_data.pop("reply_support_user_id", None)
+        elif not text:
+            await msg.reply_text("✍️")
+            return
+        elif sup_uid is not None:
+            target = int(sup_uid)
+            body = "💬 Поддержка:\n\n" + msg.text
+            if len(body) > 4096:
+                body = body[:4090] + "…"
+            ok = await _send_customer_plain(context.bot, target, body)
+            if not ok:
+                await msg.reply_text("❌")
+                return
+            user_data.pop("reply_support_user_id", None)
+            await msg.reply_text("✅")
+            return
+        else:
+            oid_raw = user_data.get("reply_to")
+            try:
+                oid_int = int(oid_raw)
+            except (TypeError, ValueError):
+                user_data.pop("reply_to", None)
+                await msg.reply_text("❌")
+                return
+            o = ORDERS.get(oid_int)
+            if not o:
+                user_data.pop("reply_to", None)
+                await msg.reply_text("❌")
+                return
+            target = int(o.get("user_id") or 0)
+            if not target:
+                user_data.pop("reply_to", None)
+                await msg.reply_text("❌")
+                return
+            body = "💬 Ответ от администратора:\n\n" + msg.text
+            if len(body) > 4096:
+                body = body[:4090] + "…"
+            ok = await _send_customer_plain(context.bot, target, body)
+            if not ok:
+                await msg.reply_text("❌")
+                return
+            user_data.pop("reply_to", None)
+            await msg.reply_text("✅")
+            return
+
+    if text == BTN_CHAT:
+        if not uid:
+            await msg.reply_text(FALLBACK_USER_TEXT)
+            return
+        _clear_checkout_delivery(user_data)
+        user_data.pop("pending_order", None)
+        user_support_state[uid] = True
+        await msg.reply_text("💬")
+        return
+
+    if uid and user_support_state.get(uid):
+        if text in REPLY_MENU_TEXTS:
+            user_support_state.pop(uid, None)
+        elif not text.strip():
+            await msg.reply_text("…")
+            return
+        else:
+            body = "💬 Сообщение от клиента:\n\n" + msg.text
+            uname = (msg.from_user.username or "").strip() if msg.from_user else ""
+            tail = f"\n\n👤 id {uid}"
+            if uname:
+                tail += f" @{uname}"
+            body = (body + tail)[:4096]
+            log = logging.getLogger(__name__)
+            sup_kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "💬",
+                            callback_data=f"sup:rep:{uid}",
+                        )
+                    ],
+                ],
+            )
+            try:
+                await context.bot.send_message(
+                    ORDER_NOTIFY_TARGET,
+                    body,
+                    disable_web_page_preview=True,
+                    reply_markup=sup_kb,
+                )
+            except Exception:
+                log.exception("клиент → админ (поддержка)")
+                await msg.reply_text("❌")
+                return
+            user_support_state.pop(uid, None)
+            await msg.reply_text("✅")
+            return
+
+    if text in (BTN_ORDERS, BTN_MONEY, BTN_DELIVERY, BTN_POPULAR, BTN_RANDOM_CARD):
         _clear_checkout_delivery(user_data)
         user_data.pop("pending_order", None)
 
-    uid = msg.from_user.id if msg.from_user else 0
-
-    if text == "🛒 Корзина":
+    if text == BTN_CART:
         _ensure_user_cart(uid, user_data)
         cl = _cart_get_lines_uid(uid, user_data)
         t = _format_cart_message(cl)
@@ -2092,21 +3345,28 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(t, reply_markup=kb)
         return
 
-    if text == "📦 Ваши заказы":
-        if uid:
-            await msg.reply_text(_format_user_orders_message(uid))
-        else:
+    if text == BTN_ORDERS:
+        if not uid:
             await msg.reply_text(FALLBACK_USER_TEXT)
+            return
+        body, kb = _format_mine_orders_text_and_kb(uid)
+        await msg.reply_text(body, reply_markup=kb)
         return
 
-    if text == "📦 Каталог":
+    if text == BTN_DELIVERY:
+        await msg.reply_text("🚚 BY · RU · UA · 🌍")
+        return
+
+    if text == BTN_POPULAR:
+        await send_popular_deck(update, context)
+        return
+
+    if text == BTN_RANDOM_CARD:
+        await send_random_card(update, context)
+        return
+
+    if text == BTN_MONEY:
         await send_catalog(update, context)
-    elif text == "🔥 Смотреть карточки":
-        await send_tinder_mode(update, context)
-    elif text == "🔥 Акции":
-        await send_promo(update, context)
-    elif text == "💬 Связь":
-        await send_contact(update, context)
 
 
 async def post_init(application: Application) -> None:
@@ -2116,8 +3376,7 @@ async def post_init(application: Application) -> None:
         ORDER_NOTIFY_TARGET,
         ORDER_MENTION,
     )
-    if not ADMIN_ID:
-        log.warning("ADMIN_ID=0 — legacy /start?start= через ADMIN_ID не используется")
+    log.info("Админ-панель: ADMIN_ID=%s", ADMIN_ID)
     try:
         initial = await load_products()
         application.bot_data["products"] = initial
@@ -2134,6 +3393,14 @@ async def post_init(application: Application) -> None:
             name="illucards_sync",
         )
         log.info("Фоновая синхронизация illucards: каждые %s с", SYNC_EVERY_SEC)
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            crypto_auto_check_job,
+            interval=30,
+            first=30,
+            name="crypto_auto_check",
+        )
+        log.info("Крипто mock-проверка: каждые 30 с")
     print("Бот запущен!")
     me = await application.bot.get_me()
     if me.username:
@@ -2148,12 +3415,44 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("catalog", catalog_cmd))
+    app.add_handler(CommandHandler("promo", send_promo))
+    app.add_handler(CommandHandler("swipe", send_tinder_mode))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("say", admin_say_cmd))
     app.add_handler(
         CallbackQueryHandler(
             on_admin_panel_action,
-            pattern=re.compile(r"^adm:(orders|stats|msg)$"),
+            pattern=re.compile(r"^adm:(orders|stats)$"),
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_user_order_open,
+            pattern=re.compile(r"^user_order_\d+$"),
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_admin_open_order,
+            pattern=re.compile(r"^open_order_\d+$"),
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_order_status_buttons,
+            pattern=re.compile(r"^(accept|sent|cancel|done)_\d+$"),
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_order_admin_action,
+            pattern=re.compile(r"^oam:rep:\d+$"),
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_support_reply_activate,
+            pattern=re.compile(r"^sup:rep:\d+$"),
         )
     )
     app.add_handler(
@@ -2178,6 +3477,31 @@ def main() -> None:
     app.add_handler(
         CallbackQueryHandler(on_delivery_country_pick, pattern=re.compile(r"^dl:(by|ru|ua|ot)$"))
     )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_payment_method,
+            pattern=re.compile(r"^pay_(card|transfer|crypto)$"),
+        )
+    )
+    app.add_handler(CallbackQueryHandler(on_payment_paid, pattern=re.compile(r"^paid$")))
+    app.add_handler(
+        CallbackQueryHandler(
+            on_admin_confirm_payment,
+            pattern=re.compile(r"^confirm_payment_\d+$"),
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_admin_reject_payment,
+            pattern=re.compile(r"^reject_payment_\d+$"),
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_receipt_callback,
+            pattern=re.compile(r"^rcpt_(orders|support)$"),
+        )
+    )
     app.add_handler(CallbackQueryHandler(on_send_order_to_admin, pattern=re.compile(r"^ta:0$")))
     app.add_handler(CallbackQueryHandler(on_view_cart_callback, pattern=re.compile(r"^vc:0$")))
     app.add_handler(CallbackQueryHandler(on_cart_increment, pattern=re.compile(r"^ic:(\d+)$")))
@@ -2194,6 +3518,7 @@ def main() -> None:
         )
     )
     app.add_handler(CallbackQueryHandler(on_pick_category, pattern=re.compile(r"^c:(\d+|all)$")))
+    app.add_handler(MessageHandler(filters.PHOTO, on_payment_proof_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
