@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import re
+import secrets
 import sys
 import time
 from copy import deepcopy
@@ -56,14 +57,49 @@ def _read_notify_chat() -> Optional[int]:
 ORDER_NOTIFY_CHAT_ID: Optional[int] = _read_notify_chat()
 ORDER_MENTION = (os.getenv("ORDER_MENTION", "@Daniel_official") or "@Daniel_official").strip()
 
-# Уведомления о заказе из deep link t.me/bot?start=... (числовой user id в Telegram)
+# Сообщения о заказе из t.me/bot?start=... (числовой Telegram id админа)
 try:
     ADMIN_ID: int = int((os.getenv("ADMIN_ID") or "0").strip() or "0")
 except ValueError:
     ADMIN_ID = 0
 
-# callback для «Оформить» после /start <текст заказа> (лимит 64 байт)
-DEEPLINK_ORDER_CB = "dl:ok"
+# Одноразовые коды для входа на сайт: код (строка) -> {user_id, expires (unix time)}
+LOGIN_CODES: dict = {}
+LOGIN_CODE_TTL_SEC = 5 * 60
+
+
+def _cleanup_expired_login_codes() -> None:
+    now = time.time()
+    for k in list(LOGIN_CODES.keys()):
+        v = LOGIN_CODES.get(k) or {}
+        if v.get("expires", 0) < now:
+            LOGIN_CODES.pop(k, None)
+
+
+def _invalidate_user_login_codes(telegram_id: int) -> None:
+    for k, v in list(LOGIN_CODES.items()):
+        if v.get("user_id") == telegram_id:
+            del LOGIN_CODES[k]
+
+
+def _issue_login_code(telegram_id: int) -> str:
+    _cleanup_expired_login_codes()
+    _invalidate_user_login_codes(telegram_id)
+    for _ in range(50):
+        c = f"{secrets.randbelow(9000) + 1000:04d}"
+        if c not in LOGIN_CODES:
+            LOGIN_CODES[c] = {
+                "user_id": telegram_id,
+                "expires": time.time() + LOGIN_CODE_TTL_SEC,
+            }
+            return c
+    c = f"{int(time.time() * 1000) % 10000:04d}"
+    LOGIN_CODES[c] = {
+        "user_id": telegram_id,
+        "expires": time.time() + LOGIN_CODE_TTL_SEC,
+    }
+    return c
+
 
 CARDS_JSON_URL = os.getenv("CARDS_JSON_URL", "https://www.illucards.by/cards.json")
 
@@ -553,6 +589,7 @@ def _numbered_list_view(
 
 async def illucards_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     log = logging.getLogger(__name__)
+    _cleanup_expired_login_codes()
     app = context.application
     try:
         cards = await load_products()
@@ -568,78 +605,51 @@ async def illucards_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
-    if not msg:
+    if not msg or not msg.from_user:
         return
+    uid = msg.from_user.id
     args = context.args or []
     if args:
-        order_text = " ".join(args).strip()
-        if not order_text:
+        t = " ".join(args).strip()
+        if not t:
             await msg.reply_text("Привет!", reply_markup=REPLY_KB)
-            return
-        context.user_data["deeplink_order"] = order_text
-        out = f"🛒 Ваш заказ:\n{order_text}"
-        if len(out) > 4096:
-            out = out[:4090] + "…"
-        await msg.reply_text(
-            out,
-            reply_markup=InlineKeyboardMarkup(
-                [
+        else:
+            out = f"🛒 Ваш заказ:\n{t}"
+            if len(out) > 4096:
+                out = out[:4090] + "…"
+            await msg.reply_text(
+                out,
+                reply_markup=InlineKeyboardMarkup(
                     [
-                        InlineKeyboardButton(
-                            "✅ Оформить заказ",
-                            callback_data=DEEPLINK_ORDER_CB,
-                        ),
+                        [InlineKeyboardButton("✅ Оформить заказ", callback_data="confirm")],
                     ],
-                ],
-            ),
-        )
-        return
-    await msg.reply_text("Привет!", reply_markup=REPLY_KB)
+                ),
+            )
+    else:
+        await msg.reply_text("Привет!", reply_markup=REPLY_KB)
+    code = _issue_login_code(uid)
+    await msg.reply_text(f"Твой код для входа на сайт: {code}")
 
 
-async def on_deeplink_order_confirm(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Кнопка после /start <payload> — уведомление админу (ADMIN_ID)."""
+async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    if not q or not q.data or not q.message:
+    if not q or not q.message:
         return
-    if (q.data or "").strip() != DEEPLINK_ORDER_CB:
-        return
-    order = (context.user_data or {}).get("deeplink_order")
-    if not order or not str(order).strip():
-        await q.answer("Сначала откройте ссылку с заказом ещё раз.", show_alert=True)
+    body = (q.message.text or "").strip()
+    if not body:
+        await q.answer("Сообщение без текста", show_alert=True)
         return
     if not ADMIN_ID:
-        await q.answer("ADMIN_ID не настроен в боте", show_alert=True)
+        await q.answer("ADMIN_ID не настроен", show_alert=True)
         return
-    u = q.from_user
-    un = f"@{u.username}" if u and u.username else "—"
-    name = f"{(u.first_name or '')} {(u.last_name or '')}".strip() or "—"
-    uid = u.id if u else "—"
-    text = f"🔥 Новый заказ:\n{order}\n\nОт: {un} | {name} | id={uid}"
-    if len(text) > 4090:
-        text = text[:4086] + "…"
-    log = logging.getLogger(__name__)
     try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=text,
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        log.exception("Deep link order → админ: %s", e)
-        await q.answer("Не получилось отправить админу", show_alert=True)
-        return
-    context.user_data.pop("deeplink_order", None)
-    await q.answer("Заказ отправлен", show_alert=False)
-    try:
-        await q.message.edit_reply_markup(reply_markup=None)
+        await context.bot.send_message(ADMIN_ID, text=body)
     except Exception:
-        pass
-    await q.message.reply_text(
-        "Готово. Админ получит уведомление о заказе. Скоро с вами свяжутся."
-    )
+        logging.getLogger(__name__).exception("confirm → admin")
+        await q.answer("Не удалось отправить", show_alert=True)
+        return
+    await q.answer("Готово")
+    await q.message.reply_text("Заказ отправлен админу.")
 
 
 async def catalog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1089,10 +1099,8 @@ async def post_init(application: Application) -> None:
         log.warning(
             "TELEGRAM_ORDER_NOTIFY_ID не задан — бот не сможет присылать заказы в чат (см. .env)"
         )
-    if ADMIN_ID:
-        log.info("Deep link /start-заказы: ADMIN_ID=%s", ADMIN_ID)
-    else:
-        log.warning("ADMIN_ID=0 — кнопка «Оформить» с ссылки t.me/...?start= не сможет уведомить админа")
+    if not ADMIN_ID:
+        log.warning("ADMIN_ID=0 — заказы с /start ...?start= не дойдут до админа")
     try:
         initial = await load_products()
         application.bot_data["products"] = initial
@@ -1123,11 +1131,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("catalog", catalog_cmd))
-    app.add_handler(
-        CallbackQueryHandler(
-            on_deeplink_order_confirm, pattern=re.compile(r"^dl:ok$")
-        )
-    )
+    app.add_handler(CallbackQueryHandler(confirm, pattern="confirm"))
     app.add_handler(CallbackQueryHandler(on_checkout_ask_username, pattern=re.compile(r"^co:0$")))
     app.add_handler(CallbackQueryHandler(on_view_cart_callback, pattern=re.compile(r"^vc:0$")))
     app.add_handler(CallbackQueryHandler(on_cart_remove_line, pattern=re.compile(r"^rm:(\d+)$")))
