@@ -806,6 +806,35 @@ async def illucards_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("Illucards: ошибка фоновой синхронизации")
 
 
+def _extract_total_from_order_text(text: str) -> Optional[str]:
+    if not (text or "").strip():
+        return None
+    for pat in (
+        r"💰\s*Итого\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*BYN",
+        r"Итого\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*BYN",
+        r"Итого\s+([0-9]+(?:[.,][0-9]+)?)\s*BYN",
+    ):
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            num = m.group(1).replace(",", ".").replace(" ", "")
+            return f"{num} BYN"
+    return None
+
+
+def _format_deep_link_order_preview(order_text: str) -> str:
+    ot = (order_text or "").strip()
+    if not ot:
+        return "📦 Твой заказ:\n\n—"
+    lines = ["📦 Твой заказ:", "", ot]
+    tot = _extract_total_from_order_text(ot)
+    if tot:
+        lines.extend(["", f"💰 Итого: {tot}"])
+    s = "\n".join(lines)
+    if len(s) > 4000:
+        s = s[:3990] + "…"
+    return s
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not msg or not msg.from_user:
@@ -817,14 +846,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not t:
             await msg.reply_text("Привет!", reply_markup=REPLY_KB)
         else:
-            out = f"📦 Ваш заказ:\n{t}"
-            if len(out) > 4096:
-                out = out[:4090] + "…"
+            context.user_data["pending_order"] = t
+            preview = _format_deep_link_order_preview(t)
             await msg.reply_text(
-                out,
+                preview,
                 reply_markup=InlineKeyboardMarkup(
                     [
-                        [InlineKeyboardButton("✅ Оформить заказ", callback_data="confirm")],
+                        [
+                            InlineKeyboardButton(
+                                "✅ Подтвердить заказ", callback_data="confirm_order"
+                            ),
+                            InlineKeyboardButton("❌ Отменить", callback_data="cancel_order"),
+                        ],
                     ],
                 ),
             )
@@ -834,25 +867,65 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.reply_text(f"Твой код для входа на сайт: {code}")
 
 
-async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_deep_link_confirm_order(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    if not q or not q.message:
+    if not q or not q.data or not q.message:
         return
-    body = (q.message.text or "").strip()
-    if not body:
-        await q.answer("Сообщение без текста", show_alert=True)
+    if (q.data or "").strip() != "confirm_order":
         return
-    if not ADMIN_ID:
-        await q.answer("ADMIN_ID не настроен", show_alert=True)
+    ud = context.user_data
+    order_text = (ud.get("pending_order") or "").strip()
+    if not order_text:
+        await q.answer("Заказ устарел. Открой ссылку с сайта снова.", show_alert=True)
         return
+    u = q.from_user
+    uname = f"@{u.username}" if u and u.username else "—"
+    uid = u.id if u else "—"
+    admin_body = "\n".join(
+        [
+            "🔥 НОВЫЙ ЗАКАЗ",
+            "",
+            order_text,
+            "",
+            f"👤 {uname} (ID: {uid})",
+        ]
+    )
+    if len(admin_body) > 4090:
+        admin_body = admin_body[:4086] + "…"
+    log = logging.getLogger(__name__)
     try:
-        await context.bot.send_message(ADMIN_ID, text=body)
-    except Exception:
-        logging.getLogger(__name__).exception("confirm → admin")
-        await q.answer("Не удалось отправить", show_alert=True)
+        await context.bot.send_message(
+            chat_id=ORDER_NOTIFY_TARGET,
+            text=admin_body,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.exception("deep link order → admin: %s", e)
+        await q.answer("Не удалось отправить заказ.", show_alert=True)
         return
-    await q.answer("Готово")
-    await q.message.reply_text("Заказ отправлен админу.")
+    ud.pop("pending_order", None)
+    await q.answer()
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await q.message.reply_text("✅ Заказ отправлен!")
+
+
+async def on_deep_link_cancel_order(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q or not q.data or not q.message:
+        return
+    if (q.data or "").strip() != "cancel_order":
+        return
+    context.user_data.pop("pending_order", None)
+    await q.answer()
+    try:
+        await q.message.edit_text("❌ Заказ отменён", reply_markup=None)
+    except Exception:
+        await q.message.reply_text("❌ Заказ отменён")
 
 
 async def catalog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1267,6 +1340,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if text in ("📦 Каталог", "🔥 Смотреть карточки", "🔥 Акции", "💬 Связь"):
         user_data.pop("order_checkout", None)
+        user_data.pop("pending_order", None)
 
     if text == "🛒 Корзина":
         cl = _cart_get_lines(user_data)
@@ -1293,7 +1367,7 @@ async def post_init(application: Application) -> None:
         ORDER_MENTION,
     )
     if not ADMIN_ID:
-        log.warning("ADMIN_ID=0 — заказы с /start ...?start= не дойдут до админа")
+        log.warning("ADMIN_ID=0 — legacy /start?start= через ADMIN_ID не используется")
     try:
         initial = await load_products()
         application.bot_data["products"] = initial
@@ -1324,7 +1398,12 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("catalog", catalog_cmd))
-    app.add_handler(CallbackQueryHandler(confirm, pattern="confirm"))
+    app.add_handler(
+        CallbackQueryHandler(on_deep_link_confirm_order, pattern=re.compile(r"^confirm_order$"))
+    )
+    app.add_handler(
+        CallbackQueryHandler(on_deep_link_cancel_order, pattern=re.compile(r"^cancel_order$"))
+    )
     app.add_handler(CallbackQueryHandler(on_checkout_ask_username, pattern=re.compile(r"^co:0$")))
     app.add_handler(CallbackQueryHandler(on_send_order_to_admin, pattern=re.compile(r"^ta:0$")))
     app.add_handler(CallbackQueryHandler(on_view_cart_callback, pattern=re.compile(r"^vc:0$")))
