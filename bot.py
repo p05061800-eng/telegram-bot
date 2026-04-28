@@ -637,13 +637,33 @@ REPLY_MENU_TEXTS = frozenset(
 )
 
 START_WELCOME_TEXT = (
-    "🎴 Добро пожаловать в IlluCards\n\n"
-    "Здесь вы можете:\n\n"
-    "📦 Смотреть коллекцию карточек\n"
-    "🛒 Добавлять в корзину\n"
-    "💳 Оформлять заказ\n\n"
-    "Выберите действие 👇"
+    "Ты вошёл в IlluCards ✅\n\n"
+    "Нажми кнопку ниже, чтобы открыть сайт:"
 )
+
+START_WELCOME_MENU_TEXT = "Выбери действие в меню ниже 👇"
+
+
+def _illucards_site_open_markup(telegram_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Открыть сайт",
+                    url=f"https://illucards.by/?user={int(telegram_id)}",
+                ),
+            ],
+        ],
+    )
+
+
+async def _send_start_welcome_with_site_button(msg: Message, uid: int) -> None:
+    await msg.reply_text(
+        START_WELCOME_TEXT,
+        reply_markup=_illucards_site_open_markup(uid),
+    )
+    await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
+
 
 CATALOG_INTRO_TEXT = (
     "📦 Вся коллекция\n\n"
@@ -2163,7 +2183,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 _telegram_login_code_message(code),
                 reply_markup=REPLY_KB,
             )
-            await msg.reply_text(START_WELCOME_TEXT, reply_markup=REPLY_KB)
+            await _send_start_welcome_with_site_button(msg, uid)
             return
         oid = _parse_order_id_from_start_arg(first)
         if oid:
@@ -2201,7 +2221,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         t = " ".join(args).strip()
         if not t:
-            await msg.reply_text(START_WELCOME_TEXT, reply_markup=REPLY_KB)
+            await _send_start_welcome_with_site_button(msg, uid)
             return
         context.user_data.pop("deep_link_order_session", None)
         context.user_data["pending_order"] = t
@@ -2221,7 +2241,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ),
         )
         return
-    await msg.reply_text(START_WELCOME_TEXT, reply_markup=REPLY_KB)
+    await _send_start_welcome_with_site_button(msg, uid)
 
 
 async def on_deep_link_confirm_order(
