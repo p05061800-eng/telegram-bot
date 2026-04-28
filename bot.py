@@ -708,6 +708,14 @@ async def _http_verify_code(request: web.Request) -> web.Response:
     )
 
 
+def _illucards_site_base_url() -> str:
+    return (
+        os.getenv("ILLUCARDS_SITE_URL")
+        or os.getenv("NEXT_PUBLIC_SITE_URL")
+        or "https://www.illucards.by"
+    ).strip().rstrip("/")
+
+
 async def _http_login_page(request: web.Request) -> web.Response:
     base = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(base, "web", "login.html")
@@ -761,11 +769,20 @@ async def _run_login_http_api(bot) -> None:
         await runner.cleanup()
 
 
-CARDS_JSON_URL = os.getenv("CARDS_JSON_URL", "https://www.illucards.by/cards.json")
+ILLUCARDS_BASE = _illucards_site_base_url()
+CARDS_JSON_URL = os.getenv("CARDS_JSON_URL", f"{ILLUCARDS_BASE}/api/products")
 
 PROMO_PHOTO = "https://picsum.photos/seed/promo/400/300"
-ILLUCARDS_BASE = "https://www.illucards.by"
 SYNC_EVERY_SEC = _env_int("ILLUCARDS_SYNC_EVERY_SEC", 900)
+ORDER_DEEP_LINK_API_URL = os.getenv(
+    "ORDER_DEEP_LINK_API_URL",
+    f"{ILLUCARDS_BASE}/api/order/{{id}}",
+).strip()
+ORDER_STATUS_UPDATE_API_URL = os.getenv(
+    "ORDER_STATUS_UPDATE_API_URL",
+    f"{ILLUCARDS_BASE}/api/order/update",
+).strip()
+ORDER_STATUS_UPDATE_SECRET = os.getenv("ILLUCARDS_ORDER_UPDATE_SECRET", "").strip()
 # Tinder-режим каталога: одна карта на экран, смена через editMessageMedia
 TINDER_NO_IMAGE = "https://picsum.photos/seed/illu-noimg/400/550"
 
@@ -776,6 +793,19 @@ DELIVERY_OPTIONS: dict = {
     "ua": ("🇺🇦 Украина", 3000, "RUB"),
     "ot": ("🌍 Другие страны", 800, "RUB"),
 }
+
+SITE_DELIVERY_TO_BOT: dict = {
+    "BY": "by",
+    "RU": "ru",
+    "UA": "ua",
+    "OTHER": "ot",
+}
+
+
+def _delivery_option_for_site_code(raw: str) -> Tuple[str, str, int, str]:
+    bot_code = SITE_DELIVERY_TO_BOT.get(str(raw or "").strip().upper(), "by")
+    label, amount, currency = DELIVERY_OPTIONS.get(bot_code, DELIVERY_OPTIONS["by"])
+    return bot_code, str(label), int(amount), str(currency)
 
 
 def _delivery_info_text() -> str:
@@ -889,8 +919,7 @@ async def _maybe_thank_first_telegram_auth(msg: Message, uid: int) -> None:
 
 
 async def _reply_site_transition_notice(msg: Message, uid: int) -> None:
-    m = await msg.reply_text(START_SITE_TRANSITION_TEXT, reply_markup=REPLY_KB)
-    _track_temp_message(uid, m)
+    await msg.reply_text(START_SITE_TRANSITION_TEXT, reply_markup=REPLY_KB)
 
 
 async def _send_start_intro_with_site_button(
@@ -958,7 +987,7 @@ async def load_products() -> List[dict]:
     for item in data:
         if not isinstance(item, dict):
             continue
-        front = item.get("frontImage", "") or ""
+        front = item.get("frontImage", item.get("image", "")) or ""
         if isinstance(front, str) and front.startswith("/"):
             image = ILLUCARDS_BASE + front
         else:
@@ -969,8 +998,8 @@ async def load_products() -> List[dict]:
         cards.append(
             {
                 "id": item.get("id"),
-                "name": item.get("title", "Без названия"),
-                "price": item.get("priceRub", 0),
+                "name": item.get("title") or item.get("name") or "Без названия",
+                "price": item.get("priceRub", item.get("price", 0)),
                 "category": item.get("category", "Без категории"),
                 "rarity": (str(rar).strip() or "—"),
                 "image": image,
@@ -2320,15 +2349,6 @@ def _normalize_deep_link_order(raw: dict, external_id: str) -> Optional[dict]:
             continue
         name = str(it.get("name") or it.get("title") or "—")[:200]
         try:
-            price = int(
-                it.get("price")
-                if it.get("price") is not None
-                else it.get("unit_price")
-                or 0
-            )
-        except (TypeError, ValueError):
-            price = 0
-        try:
             qty = int(
                 it.get("qty")
                 if it.get("qty") is not None
@@ -2338,6 +2358,22 @@ def _normalize_deep_link_order(raw: dict, external_id: str) -> Optional[dict]:
         except (TypeError, ValueError):
             qty = 1
         qty = max(1, qty)
+        raw_price = (
+            it.get("price")
+            if it.get("price") is not None
+            else it.get("unit_price")
+            if it.get("unit_price") is not None
+            else it.get("priceByn")
+        )
+        try:
+            price = int(raw_price if raw_price is not None else 0)
+        except (TypeError, ValueError):
+            price = 0
+        if price <= 0 and it.get("lineTotalByn") is not None:
+            try:
+                price = int(round(float(it.get("lineTotalByn")) / qty))
+            except (TypeError, ValueError, ZeroDivisionError):
+                price = 0
         ref = str(it.get("ref") or it.get("id") or name)[:120]
         items_out.append({"name": name, "price": price, "qty": qty, "ref": ref})
     if not items_out:
@@ -2356,6 +2392,8 @@ def _normalize_deep_link_order(raw: dict, external_id: str) -> Optional[dict]:
             amount = 0
         currency = str(d.get("currency") or "BYN").strip() or "BYN"
         country = str(d.get("country") or "").strip()
+    elif isinstance(d, str) and d.strip():
+        country, label, amount, currency = _delivery_option_for_site_code(d)
     else:
         label = str(
             raw.get("delivery_label")
@@ -2387,6 +2425,7 @@ def _normalize_deep_link_order(raw: dict, external_id: str) -> Optional[dict]:
             "currency": currency,
         },
         "external_id": str(raw.get("id") or external_id),
+        "total": raw.get("total"),
     }
 
 
@@ -2416,7 +2455,7 @@ def _fetch_order_from_shared_memory(order_id: str) -> Optional[dict]:
 
 
 async def _fetch_order_from_deep_link_api(order_id: str) -> Optional[dict]:
-    template = (os.getenv("ORDER_DEEP_LINK_API_URL") or "").strip()
+    template = ORDER_DEEP_LINK_API_URL
     if not template or "{id}" not in template:
         return None
     safe_id = urllib.parse.quote(str(order_id), safe="")
@@ -2446,6 +2485,44 @@ async def _fetch_order_for_deep_link(order_id: str) -> Optional[dict]:
     if o:
         return o
     return _find_user_order_snapshot_normalized(order_id)
+
+
+def _site_status_from_bot_status(status: str) -> Optional[str]:
+    return {
+        "new": "new",
+        "accepted": "confirmed",
+        "shipped": "shipped",
+        "done": "delivered",
+        "canceled": "cancelled",
+        "cancelled": "cancelled",
+    }.get(str(status or "").strip().lower())
+
+
+async def _sync_site_order_status(order: dict) -> None:
+    external_id = str(order.get("external_id") or "").strip()
+    status = _site_status_from_bot_status(str(order.get("status") or ""))
+    url = ORDER_STATUS_UPDATE_API_URL
+    if not external_id or not status or not url:
+        return
+    headers = {"Content-Type": "application/json"}
+    if ORDER_STATUS_UPDATE_SECRET:
+        headers["Authorization"] = f"Bearer {ORDER_STATUS_UPDATE_SECRET}"
+    payload = {"order_id": external_id, "status": status}
+    log = logging.getLogger(__name__)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status >= 300:
+                    body = await resp.text()
+                    log.warning(
+                        "IlluCards order status sync failed: order=%s status=%s HTTP %s %s",
+                        external_id,
+                        status,
+                        resp.status,
+                        body[:300],
+                    )
+    except Exception:
+        log.exception("IlluCards order status sync failed: order=%s", external_id)
 
 
 def _format_user_deep_link_order_message(order: dict) -> str:
@@ -2494,8 +2571,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     users_touch(uid, "start")
     _register_login_username(uid, msg.from_user.username)
     args = context.args or []
+    await _reply_site_transition_notice(msg, uid)
     if args:
-        await _reply_site_transition_notice(msg, uid)
         first = (args[0] or "").strip()
         oid = _parse_order_id_from_start_args(list(args))
         if oid:
@@ -2725,13 +2802,20 @@ async def on_deep_link_structured_submit(
     }
     order_rec = {
         "id": "0",
+        "external_id": str(order.get("external_id") or ""),
         "items": deepcopy(list(lines)),
         "total": int(goods_total),
         "total_goods": int(goods_total),
         "delivery": deepcopy(drec),
         "status": "В обработке",
     }
-    if drec.get("country") == "by" and drec.get("currency") == "BYN":
+    try:
+        external_total = int(round(float(order.get("total"))))
+    except (TypeError, ValueError):
+        external_total = 0
+    if external_total > 0:
+        order_rec["total"] = external_total
+    elif drec.get("country") == "by" and drec.get("currency") == "BYN":
         order_rec["total"] = int(goods_total) + int(drec.get("amount") or 0)
     oid = await _notify_admin_new_order(
         context, u, list(lines), int(order_rec["total"]), deepcopy(drec)
@@ -2746,6 +2830,8 @@ async def on_deep_link_structured_submit(
     order_rec["id"] = str(oid)
     USER_ORDERS.setdefault(u.id, []).append(order_rec)
     ORDERS[int(oid)]["clear_cart_on_paid"] = False
+    if order_rec.get("external_id"):
+        ORDERS[int(oid)]["external_id"] = str(order_rec["external_id"])
     ud["awaiting_payment_order_id"] = int(oid)
     ud.pop("payment_pending_method", None)
     await q.answer()
@@ -3092,6 +3178,7 @@ async def on_order_status_buttons(
         o["status"] = "canceled"
     else:
         return
+    await _sync_site_order_status(o)
     await q.answer(MSG_ORDER_STATUS_UPDATED, show_alert=False)
     notice = _format_customer_order_status_notice(oid, str(o.get("status") or ""))
     await _notify_order_customer(context, o, notice)

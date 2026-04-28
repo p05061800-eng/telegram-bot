@@ -14,6 +14,7 @@
     input { width: 100%; padding: 0.5rem; box-sizing: border-box; margin-top: 0.25rem; }
     .row { display: flex; gap: 0.5rem; margin-top: 1rem; }
     button { flex: 1; padding: 0.6rem; cursor: pointer; }
+    .bot-link { display: inline-block; margin: 0.5rem 0; }
     #msg { margin-top: 1rem; min-height: 1.2em; font-size: 0.9rem; }
     .err { color: #c00; }
     .ok { color: #080; }
@@ -31,7 +32,8 @@
   </script>
   <p id="widgetHint" style="font-size:0.85rem;color:#666;margin-top:.5rem;"></p>
   <hr style="margin:1rem 0;" />
-  <p>Сначала напишите боту <strong>/start</strong> в Telegram, затем укажите тот же @username.</p>
+  <p>Сначала откройте бота в Telegram, затем укажите тот же @username.</p>
+  <a id="botStartLink" class="bot-link" href="#" target="_blank" rel="noopener">Открыть бота</a>
   <label for="username">@username</label>
   <input id="username" type="text" autocomplete="username" placeholder="@username" />
   <label for="code">Код из Telegram (4 цифры)</label>
@@ -89,8 +91,15 @@
     };
     (function initWidgetHint() {
       var hint = document.getElementById("widgetHint");
+      var botLink = document.getElementById("botStartLink");
+      var botUsername = ("__BOT_USERNAME__" || "").trim();
+      if (botLink && botUsername) {
+        botLink.href = "https://t.me/" + encodeURIComponent(botUsername) + "?start=web_login";
+      } else if (botLink) {
+        botLink.style.display = "none";
+      }
       if (!hint) return;
-      if (!("__BOT_USERNAME__" || "").trim()) {
+      if (!botUsername) {
         hint.textContent = "Telegram-виджет временно недоступен: не удалось определить username бота.";
       } else {
         hint.textContent = "Нажмите кнопку Telegram выше для входа без кода.";
