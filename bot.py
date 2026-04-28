@@ -1827,6 +1827,12 @@ def _product_category_number(products: List[dict], target: dict) -> int:
     return max(1, n)
 
 
+def _product_category_label(products: List[dict], target: dict) -> str:
+    cat = str(target.get("category", "Без категории") or "Без категории")
+    no = _product_category_number(products, target)
+    return f"{cat} {no}"
+
+
 def _tinder_caption(p: dict, cur_1: int, n_total: int, products: List[dict]) -> str:
     name = (p.get("name") or "—")
     r_raw = str(p.get("rarity", "") or "").strip() or "—"
@@ -1837,7 +1843,7 @@ def _tinder_caption(p: dict, cur_1: int, n_total: int, products: List[dict]) -> 
     except (TypeError, ValueError):
         pstr = "—"
     cat = str(p.get("category", "Без категории") or "Без категории")
-    cat_no = _product_category_number(products, p)
+    card_label = _product_category_label(products, p)
     if len(name) > 200:
         name = name[:197] + "…"
     c = (
@@ -1845,7 +1851,7 @@ def _tinder_caption(p: dict, cur_1: int, n_total: int, products: List[dict]) -> 
         f"💰 {pstr}\n"
         f"⭐ {r}\n"
         f"📂 {cat}\n"
-        f"🔢 № в категории: {cat_no}\n\n"
+        f"🔢 Карточка: {card_label}\n\n"
         f"🔎 {cur_1} из {n_total}"
     )
     if len(c) > 1024:
@@ -2887,7 +2893,7 @@ async def on_admin_panel_action(
                 "📦 Пока нет заказов\n\n"
                 "Как только клиент оформит покупку — заказ появится здесь ✨"
             )
-            else:
+        else:
             body_lines: List[str] = ["📦 Заказы", "", "Выберите заказ 👇", ""]
             for oid in sorted(ORDERS.keys(), key=int):
                 o = ORDERS[oid]
