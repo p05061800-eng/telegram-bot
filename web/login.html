@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Если страница открыта не с того же хоста, что и API бота, задайте полный URL (без слэша в конце): -->
+  <meta name="login-api-base" content="" />
+  <title>Вход — IlluCards</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 420px; margin: 2rem auto; padding: 0 1rem; }
+    label { display: block; margin-top: 1rem; font-size: 0.85rem; color: #555; }
+    input { width: 100%; padding: 0.5rem; box-sizing: border-box; margin-top: 0.25rem; }
+    .row { display: flex; gap: 0.5rem; margin-top: 1rem; }
+    button { flex: 1; padding: 0.6rem; cursor: pointer; }
+    #msg { margin-top: 1rem; min-height: 1.2em; font-size: 0.9rem; }
+    .err { color: #c00; }
+    .ok { color: #080; }
+  </style>
+</head>
+<body>
+  <h1>Вход через Telegram</h1>
+  <p>Сначала напишите боту <strong>/start</strong> в Telegram, затем укажите тот же @username.</p>
+  <label for="username">@username</label>
+  <input id="username" type="text" autocomplete="username" placeholder="@username" />
+  <label for="code">Код из Telegram (4 цифры)</label>
+  <input id="code" type="text" inputmode="numeric" maxlength="4" placeholder="0000" />
+  <div class="row">
+    <button type="button" id="btnSend">Получить код</button>
+    <button type="button" id="btnVerify">Войти</button>
+  </div>
+  <div id="msg"></div>
+  <script>
+    const meta = document.querySelector('meta[name="login-api-base"]');
+    const API = ((meta && meta.getAttribute("content")) || "").trim().replace(/\/+$/, "");
+    const msgEl = document.getElementById("msg");
+    function setMsg(t, cls) {
+      msgEl.textContent = t || "";
+      msgEl.className = cls || "";
+    }
+    async function post(path, body) {
+      const url = (API || "") + path;
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await r.json().catch(function () { return {}; });
+      return { ok: r.ok, data: data };
+    }
+    document.getElementById("btnSend").onclick = async function () {
+      var u = document.getElementById("username").value.trim();
+      if (!u) { setMsg("Введите @username", "err"); return; }
+      setMsg("Отправляем…", "");
+      this.disabled = true;
+      var res = await post("/api/send-code", { username: u });
+      this.disabled = false;
+      if (res.ok && res.data.success) setMsg("Код отправлен в Telegram.", "ok");
+      else setMsg(res.data.error || "Ошибка", "err");
+    };
+    document.getElementById("btnVerify").onclick = async function () {
+      var u = document.getElementById("username").value.trim();
+      var c = document.getElementById("code").value.trim();
+      if (!u || !c) { setMsg("Введите username и код", "err"); return; }
+      setMsg("Проверяем…", "");
+      this.disabled = true;
+      var res = await post("/api/verify-code", { username: u, code: c });
+      this.disabled = false;
+      if (res.ok && res.data.success) {
+        try {
+          localStorage.setItem("illucards_auth", JSON.stringify({
+            user_id: res.data.user_id,
+            username: res.data.username,
+            at: Date.now(),
+          }));
+        } catch (e) {}
+        setMsg("Вход выполнен.", "ok");
+      } else setMsg(res.data.error || "Ошибка", "err");
+    };
+  </script>
+</body>
+</html>
