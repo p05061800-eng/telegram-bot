@@ -51,6 +51,24 @@ logging.basicConfig(
 
 load_dotenv()
 token = os.getenv("TELEGRAM_BOT_TOKEN")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        logging.getLogger(__name__).warning(
+            "%s=%r is not an integer; using %s",
+            name,
+            raw,
+            default,
+        )
+        return default
+
+
 # Куда бот пишет о новых заказах: по умолчанию @Daniel_official; переопределение — TELEGRAM_ORDER_NOTIFY_ID (int или @username).
 def _read_order_notify_target():
     """Куда слать заказы: по умолчанию @Daniel_official; из .env — int id или @username."""
@@ -119,7 +137,7 @@ user_support_state: dict = {}
 user_states: Dict[int, Dict[str, int]] = {}
 # Отслеживание пользователей (память процесса): активность, снимок корзины, флаг заказов
 USERS: Dict[int, dict] = {}
-TEMP_MESSAGE_TTL_SEC = int(os.getenv("TEMP_MESSAGE_TTL_SEC", "180"))
+TEMP_MESSAGE_TTL_SEC = _env_int("TEMP_MESSAGE_TTL_SEC", 180)
 
 # Вход на сайт illucards.by: POST /api/send-code, /api/verify-code (память процесса)
 LOGIN_CODES: dict = {}
@@ -747,7 +765,7 @@ CARDS_JSON_URL = os.getenv("CARDS_JSON_URL", "https://www.illucards.by/cards.jso
 
 PROMO_PHOTO = "https://picsum.photos/seed/promo/400/300"
 ILLUCARDS_BASE = "https://www.illucards.by"
-SYNC_EVERY_SEC = int(os.getenv("ILLUCARDS_SYNC_EVERY_SEC", "900"))
+SYNC_EVERY_SEC = _env_int("ILLUCARDS_SYNC_EVERY_SEC", 900)
 # Tinder-режим каталога: одна карта на экран, смена через editMessageMedia
 TINDER_NO_IMAGE = "https://picsum.photos/seed/illu-noimg/400/550"
 
