@@ -68,7 +68,7 @@ ORDER_MENTION = (os.getenv("ORDER_MENTION", "@Daniel_official") or "@Daniel_offi
 
 # Админ-панель (/admin) и /say — только этот Telegram user id
 ADMIN_ID = 711309799
-ADMIN_ACCESS_DENIED = "⛔ Нет доступа"
+ADMIN_ACCESS_DENIED = "Нет доступа: эта команда только для администратора."
 
 
 def is_admin(user_id):
@@ -250,7 +250,57 @@ def _user_state_clear_payment_states(uid: int) -> None:
         user_states.pop(uid, None)
 
 
-FALLBACK_USER_TEXT = "❌"
+FALLBACK_USER_TEXT = (
+    "Действие устарело или сейчас недоступно "
+    "(например, прошло время или сообщение уже не то). "
+    "Откройте каталог или нужный раздел снова из меню внизу."
+)
+
+# Короткие ответы словами (одно эмодзи в сообщении часто показывается как крупная анимация)
+MSG_ORDER_PREVIEW_CANCELLED = (
+    "Оформление заказа отменено — к этому сообщению кнопки больше не привязаны."
+)
+MSG_ORDER_DEEPLINK_DECLINED = "Заказ по ссылке отменён."
+MSG_CATALOG_LOAD_FAIL = (
+    "Не удалось загрузить каталог. Проверьте соединение и попробуйте снова "
+    "или напишите в «Связь»."
+)
+MSG_CATALOG_EMPTY_SECTION = (
+    "В этом разделе сейчас нет карточек. Загляните в другой раздел или в акции."
+)
+MSG_VIEWER_FAIL = "Не удалось открыть просмотр карточек. Попробуйте снова из каталога."
+MSG_ADMIN_SAY_BAD_ID = (
+    "Не получилось разобрать ID пользователя. Пример: /say 123456789 Здравствуйте"
+)
+MSG_ADMIN_SAY_NO_TEXT = "После ID нужен текст сообщения. Пример: /say 123456789 Ваш заказ готов"
+MSG_ADMIN_SAY_FAIL = (
+    "Сообщение не доставлено: проверьте числовой ID и что пользователь писал боту."
+)
+MSG_ADMIN_SAY_OK = "Сообщение отправлено клиенту."
+MSG_FORWARD_FAIL = "Не удалось доставить сообщение получателю."
+MSG_ADMIN_REPLY_SESSION_RESET = (
+    "Режим ответа устарел или заказ не найден. "
+    "Снова откройте заказ в админке и нажмите «Ответить»."
+)
+MSG_REPLY_MODE_ACTIVE = "Режим ответа включён — напишите одним сообщением текст для клиента."
+MSG_EXPECT_PHOTO_PROOF = "Сейчас ждём фото чека оплаты (скриншот), а не текст. Пришлите изображение."
+MSG_TYPE_REPLY_TEXT = "Напишите текст ответа обычным сообщением."
+MSG_EMPTY_INPUT = "Введите текст сообщения."
+MSG_OK = "Готово."
+MSG_SUPPORT_THANKS = "Сообщение принято, мы ответим в этом чате."
+MSG_SEND_SUPPORT_FAIL = "Не удалось отправить сообщение. Попробуйте позже."
+MSG_ORDER_ALREADY_PAID_SKIP_PROOF = "По этому заказу оплата уже учтена, скрин не нужен."
+MSG_PAY_PROOF_TO_ADMIN_FAIL = (
+    "Не удалось передать скрин администратору. Попробуйте ещё раз или напишите в поддержку."
+)
+MSG_CALLBACK_CATEGORY_INVALID = "Такой категории нет. Откройте каталог заново."
+MSG_CART_CLEARED_TOAST = "Корзина очищена."
+MSG_PAY_NEED_PROOF_FIRST = "Сначала пришлите фото чека оплаты."
+MSG_PAY_FINISH_CURRENT = "Сначала завершите оплату по текущему заказу."
+MSG_ORDER_STATUS_UPDATED = "Статус заказа обновлён."
+MSG_ORDER_ALREADY_PAID_TOAST = "Заказ уже отмечен как оплаченный."
+MSG_PAYMENT_CAPTION_CONFIRMED = "\n\nОплата подтверждена."
+MSG_PAYMENT_CAPTION_REJECTED = "\n\nЧек отклонён: пришлите новый скрин оплаты."
 
 # Reply-клавиатура: короткие подписи + эмодзи
 BTN_CATALOG = "📦 Каталог"
@@ -299,8 +349,8 @@ PAY_PROOF_REQUEST = (
     "⏳ Мы проверим платёж в течение нескольких минут"
 )
 PAY_PROOF_WAIT = "⏳ Проверяем оплату..."
-PAY_ADMIN_CONFIRMED_CLIENT = "✅"
-PAY_ADMIN_REJECTED_CLIENT = "📸 Ещё раз"
+PAY_ADMIN_CONFIRMED_CLIENT = "Оплата подтверждена."
+PAY_ADMIN_REJECTED_CLIENT = "Чек не подошёл — пришлите, пожалуйста, новый скрин оплаты."
 CRYPTO_AUTO_OK_CLIENT = "✅ Крипто-платеж получен!"
 CRYPTO_AUTO_OK_ADMIN = "💰 КРИПТА ОПЛАЧЕНА"
 
@@ -650,7 +700,7 @@ def _illucards_site_open_markup(telegram_id: int) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     "Открыть сайт",
-                    url=f"https://illucards.by/?user={int(telegram_id)}",
+                    url=f"https://illucards.by/?user_id={int(telegram_id)}",
                 ),
             ],
         ],
@@ -1838,7 +1888,9 @@ async def on_tinder_swipe(
             )
         except Exception:
             pass
-        await q.answer("⏸ Пауза" if new_paused else "▶ Автопоказ, следующая — через 3 с")
+        await q.answer(
+            "Автолистание на паузе." if new_paused else "Автолистание: следующая карта через 3 с."
+        )
         if not new_paused:
             _tinder_start_autoplay(context, ud)
         return
@@ -2293,9 +2345,9 @@ async def on_deep_link_cancel_order(
     context.user_data.pop("pending_order", None)
     await q.answer()
     try:
-        await q.message.edit_text("❌", reply_markup=None)
+        await q.message.edit_text(MSG_ORDER_PREVIEW_CANCELLED, reply_markup=None)
     except Exception:
-        await q.message.reply_text("❌")
+        await q.message.reply_text(MSG_ORDER_PREVIEW_CANCELLED)
 
 
 async def on_deep_link_structured_submit(
@@ -2391,9 +2443,9 @@ async def on_deep_link_structured_cancel(
     ud.pop("deep_link_order_session", None)
     await q.answer()
     try:
-        await q.message.edit_text("❌", reply_markup=None)
+        await q.message.edit_text(MSG_ORDER_DEEPLINK_DECLINED, reply_markup=None)
     except Exception:
-        await q.message.reply_text("❌")
+        await q.message.reply_text(MSG_ORDER_DEEPLINK_DECLINED)
 
 
 def _kb_admin_panel() -> InlineKeyboardMarkup:
@@ -2495,22 +2547,24 @@ async def admin_say_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     args = context.args or []
     if len(args) < 2:
-        await msg.reply_text("/say ID текст")
+        await msg.reply_text(
+            "Формат: /say TELEGRAM_USER_ID текст, который увидит клиент."
+        )
         return
     try:
         target_id = int(args[0])
     except (TypeError, ValueError):
-        await msg.reply_text("❌")
+        await msg.reply_text(MSG_ADMIN_SAY_BAD_ID)
         return
     text = " ".join(args[1:]).strip()
     if not text:
-        await msg.reply_text("❌")
+        await msg.reply_text(MSG_ADMIN_SAY_NO_TEXT)
         return
     ok = await _send_customer_plain(context.bot, target_id, text)
     if not ok:
-        await msg.reply_text("❌")
+        await msg.reply_text(MSG_ADMIN_SAY_FAIL)
         return
-    await msg.reply_text("✅")
+    await msg.reply_text(MSG_ADMIN_SAY_OK)
 
 
 async def on_admin_panel_action(
@@ -2607,7 +2661,7 @@ async def on_order_admin_action(
     cust = int(o.get("user_id") or 0)
     if cust:
         await _send_customer_plain(context.bot, cust, ADMIN_TYPING_NOTICE)
-    await q.message.reply_text("✍️")
+    await q.message.reply_text(MSG_REPLY_MODE_ACTIVE)
 
 
 async def on_support_reply_activate(
@@ -2633,7 +2687,7 @@ async def on_support_reply_activate(
     context.user_data["reply_support_user_id"] = client_uid
     await q.answer()
     await _send_customer_plain(context.bot, client_uid, ADMIN_TYPING_NOTICE)
-    await q.message.reply_text("✍️")
+    await q.message.reply_text(MSG_REPLY_MODE_ACTIVE)
 
 
 async def on_user_order_open(
@@ -2703,7 +2757,7 @@ async def on_order_status_buttons(
         o["status"] = "canceled"
     else:
         return
-    await q.answer("✅", show_alert=False)
+    await q.answer(MSG_ORDER_STATUS_UPDATED, show_alert=False)
     notice = _format_customer_order_status_notice(oid, str(o.get("status") or ""))
     await _notify_order_customer(context, o, notice)
     await _refresh_admin_order_message(context, oid)
@@ -2724,14 +2778,14 @@ async def send_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     cards = await load_products()
     if not cards:
-        await msg.reply_text("❌")
+        await msg.reply_text(MSG_CATALOG_LOAD_FAIL)
         return
     context.bot_data["products"] = cards
     context.bot_data["illucards_synced_at"] = time.time()
 
     categories = _category_names(cards)
     if not categories:
-        await msg.reply_text("❌")
+        await msg.reply_text(MSG_CATALOG_EMPTY_SECTION)
         return
     log.info("Каталог: %d разделов", len(categories))
     if msg.from_user:
@@ -2747,14 +2801,14 @@ async def send_tinder_mode(
         return
     products = await _get_products(context)
     if not products:
-        await msg.reply_text("❌")
+        await msg.reply_text(MSG_CATALOG_LOAD_FAIL)
         return
     in_scope = list(products)
     ok = await _tinder_start_deck(
         context, int(msg.chat_id), in_scope, products, "all"
     )
     if not ok:
-        await msg.reply_text("❌")
+        await msg.reply_text(MSG_VIEWER_FAIL)
 
 
 async def send_popular_deck(
@@ -2765,7 +2819,7 @@ async def send_popular_deck(
         return
     products = await _get_products(context)
     if not products:
-        await msg.reply_text("❌")
+        await msg.reply_text(MSG_CATALOG_LOAD_FAIL)
         return
     cats = _category_names(products)
     in_scope, _, _ = _filter_wizard(products, cats, "all", "sale")
@@ -2775,7 +2829,7 @@ async def send_popular_deck(
         context, int(msg.chat_id), in_scope, products, "all"
     )
     if not ok:
-        await msg.reply_text("❌")
+        await msg.reply_text(MSG_VIEWER_FAIL)
 
 
 async def send_random_card(
@@ -2786,14 +2840,14 @@ async def send_random_card(
         return
     products = await _get_products(context)
     if not products:
-        await msg.reply_text("❌")
+        await msg.reply_text(MSG_CATALOG_LOAD_FAIL)
         return
     in_scope = [random.choice(products)]
     ok = await _tinder_start_deck(
         context, int(msg.chat_id), in_scope, products, "all"
     )
     if not ok:
-        await msg.reply_text("❌")
+        await msg.reply_text(MSG_VIEWER_FAIL)
 
 
 async def send_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2819,11 +2873,11 @@ async def _edit_to_categories(
 ) -> None:
     products = await _get_products(context)
     if not products:
-        await q.edit_message_text("❌")
+        await q.edit_message_text(MSG_CATALOG_LOAD_FAIL)
         return
     cats = _category_names(products)
     if not cats:
-        await q.edit_message_text("❌")
+        await q.edit_message_text(MSG_CATALOG_EMPTY_SECTION)
         return
     await q.edit_message_text(CATALOG_INTRO_TEXT, reply_markup=_kb_categories(cats))
     if q.from_user:
@@ -2878,7 +2932,7 @@ async def on_pick_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if ci < 0 or ci >= len(cats):
             await q.answer()
             if q.message:
-                await q.message.reply_text(FALLBACK_USER_TEXT)
+                await q.message.reply_text(MSG_CALLBACK_CATEGORY_INVALID)
             return
         cat_tok = str(ci)
         base, cat_label, _ = _filter_wizard(products, cats, cat_tok, "all")
@@ -3162,7 +3216,7 @@ async def on_cart_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         _cart_clear_uid(uid)
     if uid:
         users_touch(uid, "cart")
-    await q.answer("🧹 Готово", show_alert=False)
+    await q.answer(MSG_CART_CLEARED_TOAST, show_alert=False)
     await _edit_cart_message(q, context)
 
 
@@ -3259,7 +3313,7 @@ async def on_send_order_to_admin(
             po = None
         if po is not None and not po.get("paid"):
             try:
-                await q.answer("📸", show_alert=True)
+                await q.answer(MSG_PAY_NEED_PROOF_FIRST, show_alert=True)
             except Exception:
                 pass
             return
@@ -3272,7 +3326,7 @@ async def on_send_order_to_admin(
             ud.pop("awaiting_payment_order_id", None)
         if po is not None and not po.get("paid"):
             try:
-                await q.answer("💳", show_alert=True)
+                await q.answer(MSG_PAY_FINISH_CURRENT, show_alert=True)
             except Exception:
                 pass
             return
@@ -3374,7 +3428,7 @@ async def on_payment_method(
         return
     if _user_state_get(uid, "awaiting_proof") is not None:
         try:
-            await q.answer("📸", show_alert=True)
+            await q.answer(MSG_PAY_NEED_PROOF_FIRST, show_alert=True)
         except Exception:
             pass
         return
@@ -3437,7 +3491,7 @@ async def on_payment_paid(
         return
     if o.get("paid"):
         try:
-            await q.answer("✅", show_alert=False)
+            await q.answer(MSG_ORDER_ALREADY_PAID_TOAST, show_alert=False)
         except Exception:
             pass
         return
@@ -3537,14 +3591,14 @@ async def on_payment_proof_photo(
         return
     if o.get("paid"):
         _user_state_pop(uid, "awaiting_proof")
-        await msg.reply_text("✅")
+        await msg.reply_text(MSG_ORDER_ALREADY_PAID_SKIP_PROOF)
         return
     _clear_crypto_auto_watch(o, uid)
     file_id = msg.photo[-1].file_id
     cap = f"📸 #{oid} · {uid}"
     ok = await _send_or_edit_admin_payment_proof(context, oid, o, file_id, cap)
     if not ok:
-        await msg.reply_text("❌")
+        await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL)
         return
     o["payment_proof_submitted"] = True
     o["proof_file_id"] = file_id
@@ -3605,7 +3659,7 @@ async def on_admin_confirm_payment(
     try:
         prev = (q.message.caption or "").strip()
         await q.message.edit_caption(
-            caption=prev + "\n\n✅",
+            caption=prev + MSG_PAYMENT_CAPTION_CONFIRMED,
             reply_markup=None,
         )
     except Exception:
@@ -3697,7 +3751,7 @@ async def on_admin_reject_payment(
     try:
         prev = (q.message.caption or "").strip()
         await q.message.edit_caption(
-            caption=prev + "\n\n❌",
+            caption=prev + MSG_PAYMENT_CAPTION_REJECTED,
             reply_markup=None,
         )
     except Exception:
@@ -3734,7 +3788,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if text in REPLY_MENU_TEXTS:
             _user_state_pop(uid, "awaiting_proof")
         else:
-            await msg.reply_text("📸")
+            await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
             return
 
     cc_raw = _user_state_get(uid, "crypto_check")
@@ -3763,7 +3817,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             user_data.pop("reply_to", None)
             user_data.pop("reply_support_user_id", None)
         elif not text:
-            await msg.reply_text("✍️")
+            await msg.reply_text(MSG_TYPE_REPLY_TEXT)
             return
         elif sup_uid is not None:
             target = int(sup_uid)
@@ -3772,10 +3826,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 body = body[:4090] + "…"
             ok = await _send_customer_plain(context.bot, target, body)
             if not ok:
-                await msg.reply_text("❌")
+                await msg.reply_text(MSG_FORWARD_FAIL)
                 return
             user_data.pop("reply_support_user_id", None)
-            await msg.reply_text("✅")
+            await msg.reply_text(MSG_ADMIN_SAY_OK)
             return
         else:
             oid_raw = user_data.get("reply_to")
@@ -3783,27 +3837,27 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 oid_int = int(oid_raw)
             except (TypeError, ValueError):
                 user_data.pop("reply_to", None)
-                await msg.reply_text("❌")
+                await msg.reply_text(MSG_ADMIN_REPLY_SESSION_RESET)
                 return
             o = ORDERS.get(oid_int)
             if not o:
                 user_data.pop("reply_to", None)
-                await msg.reply_text("❌")
+                await msg.reply_text(MSG_ADMIN_REPLY_SESSION_RESET)
                 return
             target = int(o.get("user_id") or 0)
             if not target:
                 user_data.pop("reply_to", None)
-                await msg.reply_text("❌")
+                await msg.reply_text(MSG_ADMIN_REPLY_SESSION_RESET)
                 return
             body = "💬 Ответ от администратора:\n\n" + msg.text
             if len(body) > 4096:
                 body = body[:4090] + "…"
             ok = await _send_customer_plain(context.bot, target, body)
             if not ok:
-                await msg.reply_text("❌")
+                await msg.reply_text(MSG_FORWARD_FAIL)
                 return
             user_data.pop("reply_to", None)
-            await msg.reply_text("✅")
+            await msg.reply_text(MSG_ADMIN_SAY_OK)
             return
 
     if text == BTN_CHAT:
@@ -3820,7 +3874,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if text in REPLY_MENU_TEXTS:
             user_support_state.pop(uid, None)
         elif not text.strip():
-            await msg.reply_text("…")
+            await msg.reply_text(MSG_EMPTY_INPUT)
             return
         else:
             body = "💬 Сообщение от клиента:\n\n" + msg.text
@@ -3849,10 +3903,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
             except Exception:
                 log.exception("клиент → админ (поддержка)")
-                await msg.reply_text("❌")
+                await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
                 return
             user_support_state.pop(uid, None)
-            await msg.reply_text("✅")
+            await msg.reply_text(MSG_SUPPORT_THANKS)
             return
 
     if text in (
