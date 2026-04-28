@@ -21,7 +21,6 @@ from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
 import aiohttp
-from aiohttp import web
 from telegram import (
     CallbackQuery,
     InputMediaPhoto,
@@ -100,12 +99,6 @@ async def _send_customer_plain(bot, user_id: int, text: str) -> bool:
         return False
 
 
-# Одноразовые коды входа на сайт (4 цифры): код -> { user_id, username, expires }
-LOGIN_CODES: dict = {}
-LOGIN_CODE_TTL_SEC = 5 * 60
-# Нормализованный username (без @, lower) -> telegram user_id (кто писал боту и указал @ в профиле)
-USERNAME_TO_USER_ID: Dict[str, int] = {}
-
 # Корзина и оформленные заказы в памяти процесса (ключ — Telegram user_id)
 USER_CART: dict = {}
 USER_ORDERS: dict = {}
@@ -152,6 +145,7 @@ def users_ensure(uid: int) -> dict:
             "cart": [],
             "last_activity": 0.0,
             "has_order": False,
+            "tg_auth_thanked": False,
         }
     return USERS[uid]
 
@@ -190,7 +184,6 @@ async def track_user_activity(
         return
     try:
         users_touch(int(u.id), activity_only=True)
-        _register_login_username(int(u.id), getattr(u, "username", None))
     except Exception:
         logging.getLogger(__name__).exception("USERS touch")
 
@@ -379,229 +372,6 @@ async def _notify_callback_issue(
             except Exception:
                 pass
 
-
-def _normalize_login_username(raw: str) -> str:
-    s = (raw or "").strip()
-    if s.startswith("@"):
-        s = s[1:]
-    return s.lower()
-
-
-def _register_login_username(user_id: int, username: Optional[str]) -> None:
-    """Запомнить @username → user_id для POST /api/send-code."""
-    uid = int(user_id or 0)
-    if not uid:
-        return
-    un = (username or "").strip()
-    if not un:
-        return
-    key = _normalize_login_username(un)
-    if key:
-        USERNAME_TO_USER_ID[key] = uid
-
-
-def _cleanup_expired_login_codes() -> None:
-    now = time.time()
-    for k in list(LOGIN_CODES.keys()):
-        v = LOGIN_CODES.get(k) or {}
-        if v.get("expires", 0) < now:
-            LOGIN_CODES.pop(k, None)
-
-
-def _invalidate_user_login_codes(telegram_id: int) -> None:
-    for k, v in list(LOGIN_CODES.items()):
-        if int(v.get("user_id") or 0) == int(telegram_id):
-            del LOGIN_CODES[k]
-
-
-def _telegram_login_code_message(code: str) -> str:
-    return (
-        "🔐 Ваш код для входа:\n\n"
-        f"{code}\n\n"
-        "⏳ Действует 5 минут"
-    )
-
-
-def _issue_login_code(telegram_id: int, username: str = "") -> str:
-    """4-значный код; в LOGIN_CODES сохраняются user_id, нормализованный username, expires."""
-    _cleanup_expired_login_codes()
-    _invalidate_user_login_codes(telegram_id)
-    norm = _normalize_login_username(username) if username else ""
-    for _ in range(50):
-        c = f"{secrets.randbelow(9000) + 1000:04d}"
-        if c not in LOGIN_CODES:
-            LOGIN_CODES[c] = {
-                "user_id": int(telegram_id),
-                "username": norm,
-                "expires": time.time() + LOGIN_CODE_TTL_SEC,
-            }
-            return c
-    c = f"{int(time.time() * 1000) % 10000:04d}"
-    LOGIN_CODES[c] = {
-        "user_id": int(telegram_id),
-        "username": norm,
-        "expires": time.time() + LOGIN_CODE_TTL_SEC,
-    }
-    return c
-
-
-def _login_cors_headers() -> dict:
-    origin = (os.getenv("LOGIN_CORS_ORIGIN") or "*").strip()
-    return {
-        "Access-Control-Allow-Origin": origin,
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
-    }
-
-
-def _login_json_response(data: dict, status: int = 200) -> web.Response:
-    return web.json_response(data, status=status, headers=_login_cors_headers())
-
-
-async def _http_login_options(_request: web.Request) -> web.Response:
-    return web.Response(status=204, headers=_login_cors_headers())
-
-
-async def _http_send_code(request: web.Request) -> web.Response:
-    try:
-        data = await request.json()
-    except Exception:
-        return _login_json_response(
-            {"success": False, "error": "Некорректный JSON"},
-            status=400,
-        )
-    raw_u = data.get("username")
-    if raw_u is None or str(raw_u).strip() == "":
-        return _login_json_response(
-            {"success": False, "error": "Укажите username"},
-            status=400,
-        )
-    key = _normalize_login_username(str(raw_u))
-    if not key:
-        return _login_json_response(
-            {"success": False, "error": "Укажите username"},
-            status=400,
-        )
-    uid = USERNAME_TO_USER_ID.get(key)
-    if not uid:
-        return _login_json_response(
-            {"success": False, "error": "Пользователь не писал боту"},
-            status=404,
-        )
-    bot = request.app.get("bot")
-    if bot is None:
-        return _login_json_response(
-            {"success": False, "error": "Бот недоступен"},
-            status=503,
-        )
-    code = _issue_login_code(int(uid), key)
-    try:
-        await bot.send_message(
-            chat_id=int(uid),
-            text=_telegram_login_code_message(code),
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        logging.getLogger(__name__).exception("send-code → Telegram user_id=%s", uid)
-        return _login_json_response(
-            {"success": False, "error": "Не удалось отправить код в Telegram"},
-            status=502,
-        )
-    return _login_json_response({"success": True})
-
-
-async def _http_verify_code(request: web.Request) -> web.Response:
-    try:
-        data = await request.json()
-    except Exception:
-        return _login_json_response(
-            {"success": False, "error": "Некорректный JSON"},
-            status=400,
-        )
-    raw_u = data.get("username")
-    code = str(data.get("code") or "").strip()
-    if not code or raw_u is None or str(raw_u).strip() == "":
-        return _login_json_response(
-            {"success": False, "error": "Укажите username и код"},
-            status=400,
-        )
-    key = _normalize_login_username(str(raw_u))
-    entry = LOGIN_CODES.get(code)
-    if not entry:
-        return _login_json_response(
-            {"success": False, "error": "Неверный код или срок действия истёк"},
-            status=401,
-        )
-    try:
-        exp = float(entry.get("expires") or 0)
-    except (TypeError, ValueError):
-        exp = 0.0
-    if exp < time.time():
-        LOGIN_CODES.pop(code, None)
-        return _login_json_response(
-            {"success": False, "error": "Неверный код или срок действия истёк"},
-            status=401,
-        )
-    if str(entry.get("username") or "").lower() != key:
-        return _login_json_response(
-            {"success": False, "error": "Неверный код или username"},
-            status=401,
-        )
-    uid = int(entry.get("user_id") or 0)
-    LOGIN_CODES.pop(code, None)
-    return _login_json_response(
-        {
-            "success": True,
-            "user_id": uid,
-            "username": f"@{key}" if key else "",
-        },
-    )
-
-
-async def _http_login_page(_request: web.Request) -> web.Response:
-    base = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(base, "web", "login.html")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            html = f.read()
-    except OSError:
-        return web.Response(
-            text="login.html not found",
-            status=404,
-            content_type="text/plain",
-            charset="utf-8",
-        )
-    return web.Response(text=html, content_type="text/html", charset="utf-8")
-
-
-async def _run_login_http_api(bot) -> None:
-    """Фоновый HTTP: POST /api/send-code, /api/verify-code и страница входа."""
-    log = logging.getLogger(__name__)
-    app = web.Application()
-    app["bot"] = bot
-    app.router.add_get("/", _http_login_page)
-    app.router.add_get("/login", _http_login_page)
-    app.router.add_options("/api/send-code", _http_login_options)
-    app.router.add_options("/api/verify-code", _http_login_options)
-    app.router.add_post("/api/send-code", _http_send_code)
-    app.router.add_post("/api/verify-code", _http_verify_code)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    host = (os.getenv("LOGIN_API_HOST") or "127.0.0.1").strip()
-    try:
-        port = int(os.getenv("LOGIN_API_PORT", "8765"))
-    except ValueError:
-        port = 8765
-    site = web.TCPSite(runner, host=host, port=port)
-    await site.start()
-    log.info("Вход через Telegram: HTTP %s:%s (/, /login, /api/*)", host, port)
-    stop = asyncio.Event()
-    try:
-        await stop.wait()
-    finally:
-        await runner.cleanup()
-
-
 CARDS_JSON_URL = os.getenv("CARDS_JSON_URL", "https://www.illucards.by/cards.json")
 
 PROMO_PHOTO = "https://picsum.photos/seed/promo/400/300"
@@ -686,9 +456,15 @@ REPLY_MENU_TEXTS = frozenset(
     },
 )
 
-START_WELCOME_TEXT = (
-    "Ты вошёл в IlluCards ✅\n\n"
-    "Нажми кнопку ниже, чтобы открыть сайт:"
+START_INTRO_TEXT = (
+    "Добро пожаловать в IlluCards!\n\n"
+    "Полную коллекцию карточек удобно смотреть на сайте — нажмите «Открыть сайт».\n\n"
+    "Если вы оформили заказ на сайте по нашей ссылке, он уже продублирован в этом чате: "
+    "останется только подтвердить его здесь."
+)
+
+START_ORDER_FROM_SITE_HEADER = (
+    "Заказ с сайта уже в боте. Проверьте состав и подтвердите оформление:"
 )
 
 START_WELCOME_MENU_TEXT = "Выбери действие в меню ниже 👇"
@@ -707,9 +483,17 @@ def _illucards_site_open_markup(telegram_id: int) -> InlineKeyboardMarkup:
     )
 
 
-async def _send_start_welcome_with_site_button(msg: Message, uid: int) -> None:
+async def _maybe_thank_first_telegram_auth(msg: Message, uid: int) -> None:
+    row = users_ensure(uid)
+    if not row.get("tg_auth_thanked"):
+        row["tg_auth_thanked"] = True
+        await msg.reply_text("Спасибо за авторизацию! Рады видеть вас в IlluCards.")
+
+
+async def _send_start_intro_with_site_button(msg: Message, uid: int) -> None:
+    await _maybe_thank_first_telegram_auth(msg, uid)
     await msg.reply_text(
-        START_WELCOME_TEXT,
+        START_INTRO_TEXT,
         reply_markup=_illucards_site_open_markup(uid),
     )
     await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
@@ -1939,7 +1723,6 @@ async def on_tinder_swipe(
 
 async def illucards_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     log = logging.getLogger(__name__)
-    _cleanup_expired_login_codes()
     app = context.application
     try:
         cards = await load_products()
@@ -2217,83 +2000,88 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     uid = msg.from_user.id
     users_touch(uid, "start")
-    _register_login_username(uid, msg.from_user.username)
     args = context.args or []
     if args:
         first = (args[0] or "").strip()
-        if first.lower() == "login":
-            un = (msg.from_user.username or "").strip()
-            if not un:
-                await msg.reply_text(
-                    "⚠️ В настройках Telegram не указан username.\n\n"
-                    "Задайте @username в профиле, затем снова: /start login",
-                    reply_markup=REPLY_KB,
-                )
-                return
-            code = _issue_login_code(uid, un)
-            await msg.reply_text(
-                _telegram_login_code_message(code),
-                reply_markup=REPLY_KB,
-            )
-            await _send_start_welcome_with_site_button(msg, uid)
-            return
         oid = _parse_order_id_from_start_arg(first)
         if oid:
             order = await _fetch_order_for_deep_link(oid)
             if not order:
                 await msg.reply_text(
-                    "😔 Заказ по ссылке не найден\n\n"
-                    "Проверьте ссылку или напишите нам в 💬 Связь",
+                    "Заказ по ссылке не найден или ссылка устарела.\n\n"
+                    "Проверьте письмо с сайта или напишите в «Связь».",
                     reply_markup=REPLY_KB,
                 )
+                await _send_start_intro_with_site_button(msg, uid)
                 return
+            await _maybe_thank_first_telegram_auth(msg, uid)
             tok = secrets.token_hex(8)
             context.user_data["deep_link_order_session"] = {
                 "token": tok,
                 "order": deepcopy(order),
             }
             preview = _format_user_deep_link_order_message(order)
+            body = f"{START_ORDER_FROM_SITE_HEADER}\n\n{preview}"
+            if len(body) > 4000:
+                body = body[:3990] + "…"
             await msg.reply_text(
-                preview,
+                body,
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
-                                "✅",
+                                "Подтвердить заказ",
                                 callback_data=f"dlco:{tok}",
                             ),
                             InlineKeyboardButton(
-                                "❌",
+                                "Отмена",
                                 callback_data=f"dlca:{tok}",
                             ),
                         ],
                     ],
                 ),
             )
+            await msg.reply_text(
+                "Полную коллекцию можно открыть на сайте:",
+                reply_markup=_illucards_site_open_markup(uid),
+            )
+            await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
             return
         t = " ".join(args).strip()
         if not t:
-            await _send_start_welcome_with_site_button(msg, uid)
+            await _send_start_intro_with_site_button(msg, uid)
             return
         context.user_data.pop("deep_link_order_session", None)
         context.user_data["pending_order"] = t
         preview = _format_deep_link_order_preview(t)
+        await _maybe_thank_first_telegram_auth(msg, uid)
+        body = f"{START_ORDER_FROM_SITE_HEADER}\n\n{preview}"
+        if len(body) > 4000:
+            body = body[:3990] + "…"
         await msg.reply_text(
-            preview,
+            body,
             reply_markup=InlineKeyboardMarkup(
                 [
                     [
                         InlineKeyboardButton(
-                            "✅",
+                            "Подтвердить и отправить",
                             callback_data="confirm_order",
                         ),
-                        InlineKeyboardButton("❌", callback_data="cancel_order"),
+                        InlineKeyboardButton(
+                            "Отмена",
+                            callback_data="cancel_order",
+                        ),
                     ],
                 ],
             ),
         )
+        await msg.reply_text(
+            "Полную коллекцию можно открыть на сайте:",
+            reply_markup=_illucards_site_open_markup(uid),
+        )
+        await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
         return
-    await _send_start_welcome_with_site_button(msg, uid)
+    await _send_start_intro_with_site_button(msg, uid)
 
 
 async def on_deep_link_confirm_order(
@@ -3289,7 +3077,7 @@ async def on_delivery_country_pick(
     await q.message.reply_text(
         preview,
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("✅", callback_data="ta:0")]],
+            [[InlineKeyboardButton("Подтвердить заказ", callback_data="ta:0")]],
         ),
     )
 
@@ -3987,11 +3775,6 @@ async def post_init(application: Application) -> None:
     me = await application.bot.get_me()
     if me.username:
         print(f"https://t.me/{me.username}")
-    if os.getenv("LOGIN_API_DISABLE", "").strip() != "1":
-        try:
-            asyncio.create_task(_run_login_http_api(application.bot))
-        except Exception:
-            log.exception("Вход через Telegram: HTTP API не запущен")
 
 
 def main() -> None:
