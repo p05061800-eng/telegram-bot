@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <!-- Если страница открыта не с того же хоста, что и API бота, задайте полный URL (без слэша в конце): -->
   <meta name="login-api-base" content="" />
+  <!-- Куда перенаправлять после успешного входа -->
+  <meta name="post-login-redirect" content="https://illucards.by/catalog" />
   <title>Вход — IlluCards</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 420px; margin: 2rem auto; padding: 0 1rem; }
@@ -19,6 +21,16 @@
 </head>
 <body>
   <h1>Вход через Telegram</h1>
+  <p><strong>Быстрый вход без кода:</strong></p>
+  <script async src="https://telegram.org/js/telegram-widget.js?22"
+          data-telegram-login="__BOT_USERNAME__"
+          data-size="large"
+          data-userpic="false"
+          data-request-access="write"
+          data-onauth="onTelegramAuth(user)">
+  </script>
+  <p id="widgetHint" style="font-size:0.85rem;color:#666;margin-top:.5rem;"></p>
+  <hr style="margin:1rem 0;" />
   <p>Сначала напишите боту <strong>/start</strong> в Telegram, затем укажите тот же @username.</p>
   <label for="username">@username</label>
   <input id="username" type="text" autocomplete="username" placeholder="@username" />
@@ -32,6 +44,8 @@
   <script>
     const meta = document.querySelector('meta[name="login-api-base"]');
     const API = ((meta && meta.getAttribute("content")) || "").trim().replace(/\/+$/, "");
+    const redirMeta = document.querySelector('meta[name="post-login-redirect"]');
+    const REDIRECT_TO = ((redirMeta && redirMeta.getAttribute("content")) || "").trim();
     const msgEl = document.getElementById("msg");
     function setMsg(t, cls) {
       msgEl.textContent = t || "";
@@ -47,6 +61,41 @@
       const data = await r.json().catch(function () { return {}; });
       return { ok: r.ok, data: data };
     }
+    function redirectAfterLogin() {
+      if (!REDIRECT_TO) return;
+      setTimeout(function () {
+        window.location.href = REDIRECT_TO;
+      }, 700);
+    }
+    window.onTelegramAuth = async function (user) {
+      setMsg("Проверяем вход через Telegram…", "");
+      var res = await post("/api/telegram-auth", user || {});
+      if (res.ok && res.data.success) {
+        try {
+          localStorage.setItem("illucards_auth", JSON.stringify({
+            user_id: res.data.user_id,
+            username: res.data.username,
+            first_name: res.data.first_name || "",
+            last_name: res.data.last_name || "",
+            at: Date.now(),
+            method: "telegram_widget"
+          }));
+        } catch (e) {}
+        setMsg("Вход выполнен автоматически через Telegram.", "ok");
+        redirectAfterLogin();
+      } else {
+        setMsg(res.data.error || "Не удалось выполнить вход через Telegram.", "err");
+      }
+    };
+    (function initWidgetHint() {
+      var hint = document.getElementById("widgetHint");
+      if (!hint) return;
+      if (!("__BOT_USERNAME__" || "").trim()) {
+        hint.textContent = "Telegram-виджет временно недоступен: не удалось определить username бота.";
+      } else {
+        hint.textContent = "Нажмите кнопку Telegram выше для входа без кода.";
+      }
+    })();
     document.getElementById("btnSend").onclick = async function () {
       var u = document.getElementById("username").value.trim();
       if (!u) { setMsg("Введите @username", "err"); return; }
@@ -74,6 +123,7 @@
           }));
         } catch (e) {}
         setMsg("Вход выполнен.", "ok");
+        redirectAfterLogin();
       } else setMsg(res.data.error || "Ошибка", "err");
     };
   </script>

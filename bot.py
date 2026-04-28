@@ -6,6 +6,8 @@
 #   python bot.py
 # Если pip не найден: python3 -m pip install python-dotenv
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
 import random
@@ -117,6 +119,7 @@ user_support_state: dict = {}
 user_states: Dict[int, Dict[str, int]] = {}
 # Отслеживание пользователей (память процесса): активность, снимок корзины, флаг заказов
 USERS: Dict[int, dict] = {}
+TEMP_MESSAGE_TTL_SEC = int(os.getenv("TEMP_MESSAGE_TTL_SEC", "180"))
 
 # Вход на сайт illucards.by: POST /api/send-code, /api/verify-code (память процесса)
 LOGIN_CODES: dict = {}
@@ -174,8 +177,36 @@ def users_ensure(uid: int) -> dict:
             "last_activity": 0.0,
             "has_order": False,
             "tg_auth_thanked": False,
+            "temp_messages": [],
         }
     return USERS[uid]
+
+
+def _track_temp_message(uid: int, message: Optional[Message]) -> None:
+    if not uid or not message:
+        return
+    row = users_ensure(uid)
+    items = list(row.get("temp_messages") or [])
+    items.append((int(message.chat_id), int(message.message_id), time.time()))
+    # Держим только последние 30 временных сообщений.
+    row["temp_messages"] = items[-30:]
+
+
+async def _delete_user_temp_messages(bot, uid: int) -> None:
+    if not uid:
+        return
+    row = users_ensure(uid)
+    items = list(row.get("temp_messages") or [])
+    row["temp_messages"] = []
+    now = time.time()
+    for chat_id, message_id, created_at in items:
+        # Старые хвосты просто забываем.
+        if (now - float(created_at or 0)) > TEMP_MESSAGE_TTL_SEC:
+            continue
+        try:
+            await bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
+        except Exception:
+            pass
 
 
 def users_touch(
@@ -486,6 +517,83 @@ async def _http_login_options(_request: web.Request) -> web.Response:
     return web.Response(status=204, headers=_login_cors_headers())
 
 
+def _verify_telegram_widget_auth(payload: dict) -> Tuple[bool, str]:
+    """Проверка подписи Telegram Login Widget."""
+    if not token:
+        return False, "TELEGRAM_BOT_TOKEN не настроен"
+    tg_hash = str(payload.get("hash") or "").strip()
+    if not tg_hash:
+        return False, "Отсутствует подпись Telegram"
+    auth_date_raw = str(payload.get("auth_date") or "").strip()
+    try:
+        auth_date = int(auth_date_raw)
+    except (TypeError, ValueError):
+        return False, "Некорректный auth_date"
+    # Ограничим срок валидности данных виджета (10 минут)
+    if auth_date < int(time.time()) - 600:
+        return False, "Сессия Telegram устарела"
+
+    pairs: List[str] = []
+    for k, v in payload.items():
+        if k == "hash" or v is None:
+            continue
+        sv = str(v)
+        if sv == "":
+            continue
+        pairs.append(f"{k}={sv}")
+    pairs.sort()
+    data_check_string = "\n".join(pairs)
+
+    secret = hashlib.sha256(token.encode("utf-8")).digest()
+    calc = hmac.new(
+        secret,
+        data_check_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(calc, tg_hash):
+        return False, "Подпись Telegram не прошла проверку"
+    return True, ""
+
+
+async def _http_telegram_auth(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return _login_json_response(
+            {"success": False, "error": "Некорректный JSON"},
+            status=400,
+        )
+    if not isinstance(data, dict):
+        return _login_json_response(
+            {"success": False, "error": "Некорректные данные авторизации"},
+            status=400,
+        )
+    ok, err = _verify_telegram_widget_auth(data)
+    if not ok:
+        return _login_json_response(
+            {"success": False, "error": err or "Авторизация Telegram не подтверждена"},
+            status=401,
+        )
+    try:
+        uid = int(data.get("id") or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    username = str(data.get("username") or "").strip()
+    if uid:
+        users_touch(uid, "telegram_widget_auth")
+        _register_login_username(uid, username)
+    uname = _normalize_login_username(username)
+    return _login_json_response(
+        {
+            "success": True,
+            "user_id": uid,
+            "username": f"@{uname}" if uname else "",
+            "first_name": str(data.get("first_name") or ""),
+            "last_name": str(data.get("last_name") or ""),
+        }
+    )
+
+
 async def _http_send_code(request: web.Request) -> web.Response:
     try:
         data = await request.json()
@@ -582,7 +690,7 @@ async def _http_verify_code(request: web.Request) -> web.Response:
     )
 
 
-async def _http_login_page(_request: web.Request) -> web.Response:
+async def _http_login_page(request: web.Request) -> web.Response:
     base = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(base, "web", "login.html")
     try:
@@ -595,6 +703,8 @@ async def _http_login_page(_request: web.Request) -> web.Response:
             content_type="text/plain",
             charset="utf-8",
         )
+    bot_username = str(request.app.get("bot_username") or "").strip()
+    html = html.replace("__BOT_USERNAME__", bot_username)
     return web.Response(text=html, content_type="text/html", charset="utf-8")
 
 
@@ -603,12 +713,19 @@ async def _run_login_http_api(bot) -> None:
     log = logging.getLogger(__name__)
     app = web.Application()
     app["bot"] = bot
+    try:
+        me = await bot.get_me()
+        app["bot_username"] = str(me.username or "").strip()
+    except Exception:
+        app["bot_username"] = ""
     app.router.add_get("/", _http_login_page)
     app.router.add_get("/login", _http_login_page)
     app.router.add_options("/api/send-code", _http_login_options)
     app.router.add_options("/api/verify-code", _http_login_options)
+    app.router.add_options("/api/telegram-auth", _http_login_options)
     app.router.add_post("/api/send-code", _http_send_code)
     app.router.add_post("/api/verify-code", _http_verify_code)
+    app.router.add_post("/api/telegram-auth", _http_telegram_auth)
     runner = web.AppRunner(app)
     await runner.setup()
     host = (os.getenv("LOGIN_API_HOST") or "127.0.0.1").strip()
@@ -757,11 +874,13 @@ async def _send_start_intro_with_site_button(
         ud.pop("pending_order", None)
         ud.pop("deep_link_order_session", None)
     await _maybe_thank_first_telegram_auth(msg, uid)
-    await msg.reply_text(
+    m1 = await msg.reply_text(
         START_INTRO_TEXT,
         reply_markup=_illucards_site_open_markup(uid),
     )
-    await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
+    _track_temp_message(uid, m1)
+    m2 = await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
+    _track_temp_message(uid, m2)
 
 
 CATALOG_INTRO_TEXT = (
@@ -1157,9 +1276,28 @@ def _kb_payment_methods() -> InlineKeyboardMarkup:
     )
 
 
-def _kb_paid_confirm() -> InlineKeyboardMarkup:
+def _payment_total_label(o: dict) -> str:
+    d = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
+    cur = str(d.get("currency") or "BYN")
+    cc = str(d.get("country") or "").strip().lower()
+    try:
+        goods = int(o.get("total_goods") if o.get("total_goods") is not None else o.get("total") or 0)
+    except (TypeError, ValueError):
+        goods = 0
+    try:
+        d_amt = int(d.get("amount") or 0)
+    except (TypeError, ValueError):
+        d_amt = 0
+    if cc == "by" and cur == "BYN":
+        return f"{goods + d_amt} {cur}"
+    if d_amt > 0:
+        return f"{goods} BYN + {d_amt} {cur}"
+    return f"{goods} BYN"
+
+
+def _kb_paid_confirm(total_label: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Я оплатил", callback_data="paid")]]
+        [[InlineKeyboardButton(f"✅ Оплатить + {total_label}", callback_data="paid")]]
     )
 
 
@@ -1657,7 +1795,7 @@ def _filter_wizard(
 def _needs_rarity_step(base: List[dict]) -> bool:
     """Несколько разных редкостей в выборке — показываем экран «⭐ редкость»."""
     if len(base) < 2:
-        return False
+                    return False
     keys: set = set()
     for p in base:
         r = str(p.get("rarity", "") or "").strip().lower()
@@ -1724,10 +1862,10 @@ def _tinder_keyboard(cat_tok: str, user_data: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🟢⬅️", callback_data="t:p"),
+                InlineKeyboardButton("◀️", callback_data="t:p"),
                 InlineKeyboardButton("💚", callback_data="t:v"),
-                InlineKeyboardButton("💚🛒", callback_data="t:c"),
-                InlineKeyboardButton("➡️🟢", callback_data="t:n"),
+                InlineKeyboardButton("🛍️", callback_data="t:c"),
+                InlineKeyboardButton("▶️", callback_data="t:n"),
             ],
             [auto_btn, InlineKeyboardButton("⬆️", callback_data=f"h:{c}")],
         ]
@@ -1752,7 +1890,7 @@ async def _tinder_message_edit(
     gixs: List[int] = list(ud.get("tinder_gidxs") or [])
     products: List[dict] = list(context.application.bot_data.get("products") or [])
     if not gixs or not products:
-        return False
+                    return False
     n = len(gixs)
     if n == 0:
         return False
@@ -2355,7 +2493,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     [
                         [
                             InlineKeyboardButton(
-                                "Подтвердить заказ",
+                                "✅ Подтвердить заказ",
                                 callback_data=f"dlco:{tok}",
                             ),
                             InlineKeyboardButton(
@@ -2390,6 +2528,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         joined = " ".join(args).strip()
         jl = joined.lower()
         fl = (first or "").strip().lower()
+        if jl == "web_login" or fl == "web_login":
+            await _maybe_thank_first_telegram_auth(msg, uid)
+            un = (msg.from_user.username or "").strip()
+            if not un:
+                await msg.reply_text(
+                    "Чтобы войти на сайте, нужен @username в профиле Telegram.\n\n"
+                    "Добавьте username в настройках Telegram и снова перейдите по кнопке входа с сайта.",
+                    reply_markup=REPLY_KB,
+                )
+                return
+            code = _issue_login_code(uid, un)
+            await msg.reply_text(
+                _telegram_login_code_message(code),
+                reply_markup=REPLY_KB,
+            )
+            await msg.reply_text(
+                "Код уже отправлен. Вернитесь на сайт, вставьте его и нажмите «Войти».",
+                reply_markup=REPLY_KB,
+            )
+            return
         if jl in START_IGNORED_DEEP_LINK or fl in START_IGNORED_DEEP_LINK:
             await _send_start_intro_with_site_button(msg, uid, context.user_data)
             return
@@ -2410,7 +2568,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 [
                     [
                         InlineKeyboardButton(
-                            "Подтвердить и отправить",
+                            "✅ Подтвердить и отправить",
                             callback_data="confirm_order",
                         ),
                         InlineKeyboardButton(
@@ -2614,8 +2772,8 @@ def _kb_admin_orders_list() -> Optional[InlineKeyboardMarkup]:
         if len(label) > 60:
             label = label[:57] + "…"
         rows.append(
-            [
-                InlineKeyboardButton(
+                [
+                    InlineKeyboardButton(
                     label, callback_data=f"open_order_{int(oid)}"
                 ),
             ],
@@ -2729,7 +2887,7 @@ async def on_admin_panel_action(
                 "📦 Пока нет заказов\n\n"
                 "Как только клиент оформит покупку — заказ появится здесь ✨"
             )
-        else:
+            else:
             body_lines: List[str] = ["📦 Заказы", "", "Выберите заказ 👇", ""]
             for oid in sorted(ORDERS.keys(), key=int):
                 o = ORDERS[oid]
@@ -3100,7 +3258,10 @@ async def on_pick_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await q.answer()
     if _needs_rarity_step(base):
-        hdr = "⭐ Выберите редкость:\n\nКакие карточки показать? 👇"
+        hdr = (
+            f"✅ Вы выбрали категорию: {cat_label}\n\n"
+            "Теперь выберите редкость 👇"
+        )
         await q.edit_message_text(hdr, reply_markup=_kb_rarities(cat_tok))
     else:
         await _tinder_start(q, context, base, products, cat_tok)
@@ -3452,7 +3613,7 @@ async def on_delivery_country_pick(
     await q.message.reply_text(
         preview,
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Подтвердить заказ", callback_data="ta:0")]],
+            [[InlineKeyboardButton("✅ Подтвердить заказ", callback_data="ta:0")]],
         ),
     )
 
@@ -3495,10 +3656,23 @@ async def on_send_order_to_admin(
             return
     lines: Optional[List[dict]] = ud.get("order_checkout")
     if not lines:
-        await _notify_callback_issue(q, context)
-        return
+        # Восстанавливаемся после устаревшей сессии: берём актуальные позиции из корзины.
+        fallback_lines = _cart_get_lines_uid(uid_chk, context.user_data) if uid_chk else []
+        if not fallback_lines:
+            await q.answer()
+            await q.message.reply_text(
+                "Корзина пустая или шаг оформления устарел. Добавьте карточки и попробуйте снова.",
+                reply_markup=_kb_cart([]),
+            )
+            return
+        lines = deepcopy(fallback_lines)
+        ud["order_checkout"] = deepcopy(lines)
     if not ud.get("delivery_country"):
-        await _notify_callback_issue(q, context)
+        await q.answer()
+        await q.message.reply_text(
+            "Нужно заново выбрать страну доставки перед подтверждением заказа 👇",
+            reply_markup=_kb_delivery_country(),
+        )
         return
     u = q.from_user
     if not u:
@@ -3613,9 +3787,10 @@ async def on_payment_method(
     except Exception:
         pass
     users_touch(uid, "payment")
+    total_label = _payment_total_label(o)
     await q.message.reply_text(
         body_map[method],
-        reply_markup=_kb_paid_confirm(),
+        reply_markup=_kb_paid_confirm(total_label),
     )
 
 
@@ -4107,6 +4282,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not uid:
             await msg.reply_text(FALLBACK_USER_TEXT)
             return
+        await _delete_user_temp_messages(context.bot, uid)
         _clear_checkout_delivery(user_data)
         user_data.pop("pending_order", None)
         user_support_state[uid] = True
@@ -4145,11 +4321,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     reply_markup=sup_kb,
                 )
             except Exception:
-                log.exception("клиент → админ (поддержка)")
-                await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
-                return
+                log.exception("клиент → поддержка: target=%s", ORDER_NOTIFY_TARGET)
+                # Fallback: если кастомный target недоступен, шлём админу по user_id.
+                try:
+                    await context.bot.send_message(
+                        ADMIN_ID,
+                        body,
+                        disable_web_page_preview=True,
+                        reply_markup=sup_kb,
+                    )
+                except Exception:
+                    log.exception("клиент → поддержка fallback admin_id=%s", ADMIN_ID)
+                    await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
+                    return
             user_support_state.pop(uid, None)
-            await msg.reply_text(MSG_SUPPORT_THANKS)
+            m_ok = await msg.reply_text(MSG_SUPPORT_THANKS)
+            _track_temp_message(uid, m_ok)
             return
 
     if uid and await _handle_buy_quick_text(msg, context, text, uid):
@@ -4167,6 +4354,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user_data.pop("pending_order", None)
 
     if text == BTN_CART:
+        await _delete_user_temp_messages(context.bot, uid)
         _ensure_user_cart(uid, user_data)
         cl = _cart_get_lines_uid(uid, user_data)
         t = _format_cart_message(cl)
@@ -4175,6 +4363,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if text == BTN_MY_ORDERS:
+        await _delete_user_temp_messages(context.bot, uid)
         if not uid:
             await msg.reply_text(FALLBACK_USER_TEXT)
             return
