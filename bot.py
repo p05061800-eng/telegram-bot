@@ -863,6 +863,9 @@ START_ORDER_FROM_SITE_HEADER = (
 )
 
 START_WELCOME_MENU_TEXT = "Выбери действие в меню ниже 👇"
+START_SITE_TRANSITION_TEXT = (
+    "Вы перешли с сайта IlluCards в Telegram. Сейчас продолжим здесь."
+)
 
 
 def _illucards_site_open_markup(telegram_id: int) -> InlineKeyboardMarkup:
@@ -883,6 +886,11 @@ async def _maybe_thank_first_telegram_auth(msg: Message, uid: int) -> None:
     if not row.get("tg_auth_thanked"):
         row["tg_auth_thanked"] = True
         await msg.reply_text("Спасибо за авторизацию! Рады видеть вас в IlluCards.")
+
+
+async def _reply_site_transition_notice(msg: Message, uid: int) -> None:
+    m = await msg.reply_text(START_SITE_TRANSITION_TEXT, reply_markup=REPLY_KB)
+    _track_temp_message(uid, m)
 
 
 async def _send_start_intro_with_site_button(
@@ -2487,6 +2495,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _register_login_username(uid, msg.from_user.username)
     args = context.args or []
     if args:
+        await _reply_site_transition_notice(msg, uid)
         first = (args[0] or "").strip()
         oid = _parse_order_id_from_start_args(list(args))
         if oid:
