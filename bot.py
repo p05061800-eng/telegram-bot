@@ -383,6 +383,9 @@ MSG_CALLBACK_STALE_ORDER = (
 MSG_ORDER_SUBMIT_ADMIN_FAIL = (
     "Не удалось отправить заказ администратору. Попробуйте позже или напишите в «Связь»."
 )
+MSG_UNKNOWN_TEXT = (
+    "Не понял сообщение. Отправьте /start или выберите действие в меню ниже 👇"
+)
 
 # Reply-клавиатура: короткие подписи + эмодзи
 BTN_CATALOG = "📦 Каталог"
@@ -4510,6 +4513,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if text == BTN_RANDOM_CARD:
         await send_random_card(update, context)
         return
+
+    await msg.reply_text(MSG_UNKNOWN_TEXT, reply_markup=REPLY_KB)
 
 async def post_init(application: Application) -> None:
     log = logging.getLogger(__name__)
