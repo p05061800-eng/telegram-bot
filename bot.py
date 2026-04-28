@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
 import aiohttp
+from aiohttp import web
 from telegram import (
     CallbackQuery,
     InputMediaPhoto,
@@ -37,6 +38,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -98,9 +100,11 @@ async def _send_customer_plain(bot, user_id: int, text: str) -> bool:
         return False
 
 
-# Одноразовые коды для входа на сайт: код (строка) -> {user_id, expires (unix time)}
+# Одноразовые коды входа на сайт (4 цифры): код -> { user_id, username, expires }
 LOGIN_CODES: dict = {}
 LOGIN_CODE_TTL_SEC = 5 * 60
+# Нормализованный username (без @, lower) -> telegram user_id (кто писал боту и указал @ в профиле)
+USERNAME_TO_USER_ID: Dict[str, int] = {}
 
 # Корзина и оформленные заказы в памяти процесса (ключ — Telegram user_id)
 USER_CART: dict = {}
@@ -116,6 +120,79 @@ user_support_state: dict = {}
 # Состояния оплаты по user_id (вне user_data — не теряются при смене контекста чата)
 # user_states[user_id] = { "awaiting_proof": order_id, "crypto_check": order_id }
 user_states: Dict[int, Dict[str, int]] = {}
+# Отслеживание пользователей (память процесса): активность, снимок корзины, флаг заказов
+USERS: Dict[int, dict] = {}
+
+
+def _users_snapshot_cart(uid: int) -> List[dict]:
+    raw = USER_CART.get(int(uid))
+    if not isinstance(raw, dict):
+        return []
+    return deepcopy(list(raw.get("items") or []))
+
+
+def _users_has_order(uid: int) -> bool:
+    uid = int(uid or 0)
+    if not uid:
+        return False
+    if USER_ORDERS.get(uid):
+        return True
+    for o in ORDERS.values():
+        if int(o.get("user_id") or 0) == uid:
+            return True
+    return False
+
+
+def users_ensure(uid: int) -> dict:
+    """Создать запись USERS[user_id] с полями по умолчанию."""
+    uid = int(uid)
+    if uid not in USERS:
+        USERS[uid] = {
+            "last_action": "start",
+            "cart": [],
+            "last_activity": 0.0,
+            "has_order": False,
+        }
+    return USERS[uid]
+
+
+def users_touch(
+    uid: int,
+    action: Optional[str] = None,
+    *,
+    activity_only: bool = False,
+) -> None:
+    """Обновить last_activity, снимок корзины, has_order.
+
+    Если activity_only=False и передан непустой action — обновить last_action.
+    activity_only=True — только активность и снимки (любой update).
+    """
+    uid = int(uid or 0)
+    if not uid:
+        return
+    row = users_ensure(uid)
+    row["last_activity"] = time.time()
+    row["cart"] = _users_snapshot_cart(uid)
+    row["has_order"] = _users_has_order(uid)
+    if (
+        not activity_only
+        and action is not None
+        and str(action).strip() != ""
+    ):
+        row["last_action"] = str(action).strip()
+
+
+async def track_user_activity(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """При любом update — last_activity и снимки; last_action задаётся в хендлерах."""
+    u = update.effective_user
+    if not u:
+        return
+    try:
+        users_touch(int(u.id), activity_only=True)
+        _register_login_username(int(u.id), getattr(u, "username", None))
+    except Exception:
+        logging.getLogger(__name__).exception("USERS touch")
 
 
 def _user_state_bucket(uid: int) -> Dict[str, int]:
@@ -176,12 +253,12 @@ def _user_state_clear_payment_states(uid: int) -> None:
 FALLBACK_USER_TEXT = "❌"
 
 # Reply-клавиатура: короткие подписи + эмодзи
-BTN_ORDERS = "📦 заказы"
-BTN_CART = "🛒 корзина"
-BTN_CHAT = "💬 чат"
-BTN_DELIVERY = "🚚 доставка"
-BTN_MONEY = "💰 деньги"
-BTN_POPULAR = "🔥 Популярное"
+BTN_CATALOG = "📦 Каталог"
+BTN_CART = "🛒 Корзина"
+BTN_POPULAR = "🔥 Акции"
+BTN_CHAT = "💬 Связь"
+BTN_MY_ORDERS = "📋 Мои заказы"
+BTN_DELIVERY = "🚚 Доставка"
 BTN_RANDOM_CARD = "🎁 Случайная карточка"
 
 # Уведомление клиенту при входе админа в режим ответа
@@ -189,14 +266,38 @@ ADMIN_TYPING_NOTICE = "⏳ Администратор печатает..."
 # Автоответ после успешной отправки заказа админу
 ORDER_AUTO_ACK = "📦 Заказ принят"
 
-# Шаги воронки оплаты (короткая подсказка)
-PAY_FLOW_STEPS = "Оплата → Скрин → Проверка → Готово"
+# Шаги воронки оплаты (подсказка в сообщениях)
+PAY_FLOW_STEPS = "💳 Оплата → 📸 Скрин → ⏳ Проверка → ✅ Готово"
 
 # Оплата (реквизиты + callback)
-PAY_CARD_BODY = "💳\n9112 3810 0954 6243\nDANIL PARFIONAU"
-PAY_TRANSFER_BODY = "📱\n+375298124337\nDANIL PARFIONAU"
-PAY_CRYPTO_BODY = "₿ USDT TRC20\nTBRKDLTC6QXED4pEVVm1RpZNKeB4ScJChf"
-PAY_PROOF_REQUEST = "📸 Скрин"
+PAY_CARD_BODY = (
+    "💳 Оплата картой\n\n"
+    "Номер карты:\n"
+    "9112 3810 0954 6243\n\n"
+    "Имя на карте:\n"
+    "DANIL PARFIONAU\n\n"
+    "После оплаты нажмите:\n"
+    "✅ Я оплатил"
+)
+PAY_TRANSFER_BODY = (
+    "📱 Перевод на номер\n\n"
+    "Телефон:\n"
+    "+375298124337\n\n"
+    "Получатель:\n"
+    "DANIL PARFIONAU\n\n"
+    "После оплаты нажмите:\n"
+    "✅ Я оплатил"
+)
+PAY_CRYPTO_BODY = (
+    "₿ Крипто (USDT TRC20)\n\n"
+    "TBRKDLTC6QXED4pEVVm1RpZNKeB4ScJChf\n\n"
+    "После оплаты нажмите:\n"
+    "✅ Я оплатил"
+)
+PAY_PROOF_REQUEST = (
+    "📸 Отправьте скрин оплаты\n\n"
+    "⏳ Мы проверим платёж в течение нескольких минут"
+)
 PAY_PROOF_WAIT = "⏳ Проверяем оплату..."
 PAY_ADMIN_CONFIRMED_CLIENT = "✅"
 PAY_ADMIN_REJECTED_CLIENT = "📸 Ещё раз"
@@ -229,6 +330,26 @@ async def _notify_callback_issue(
                 pass
 
 
+def _normalize_login_username(raw: str) -> str:
+    s = (raw or "").strip()
+    if s.startswith("@"):
+        s = s[1:]
+    return s.lower()
+
+
+def _register_login_username(user_id: int, username: Optional[str]) -> None:
+    """Запомнить @username → user_id для POST /api/send-code."""
+    uid = int(user_id or 0)
+    if not uid:
+        return
+    un = (username or "").strip()
+    if not un:
+        return
+    key = _normalize_login_username(un)
+    if key:
+        USERNAME_TO_USER_ID[key] = uid
+
+
 def _cleanup_expired_login_codes() -> None:
     now = time.time()
     for k in list(LOGIN_CODES.keys()):
@@ -239,27 +360,196 @@ def _cleanup_expired_login_codes() -> None:
 
 def _invalidate_user_login_codes(telegram_id: int) -> None:
     for k, v in list(LOGIN_CODES.items()):
-        if v.get("user_id") == telegram_id:
+        if int(v.get("user_id") or 0) == int(telegram_id):
             del LOGIN_CODES[k]
 
 
-def _issue_login_code(telegram_id: int) -> str:
+def _telegram_login_code_message(code: str) -> str:
+    return (
+        "🔐 Ваш код для входа:\n\n"
+        f"{code}\n\n"
+        "⏳ Действует 5 минут"
+    )
+
+
+def _issue_login_code(telegram_id: int, username: str = "") -> str:
+    """4-значный код; в LOGIN_CODES сохраняются user_id, нормализованный username, expires."""
     _cleanup_expired_login_codes()
     _invalidate_user_login_codes(telegram_id)
+    norm = _normalize_login_username(username) if username else ""
     for _ in range(50):
         c = f"{secrets.randbelow(9000) + 1000:04d}"
         if c not in LOGIN_CODES:
             LOGIN_CODES[c] = {
-                "user_id": telegram_id,
+                "user_id": int(telegram_id),
+                "username": norm,
                 "expires": time.time() + LOGIN_CODE_TTL_SEC,
             }
             return c
     c = f"{int(time.time() * 1000) % 10000:04d}"
     LOGIN_CODES[c] = {
-        "user_id": telegram_id,
+        "user_id": int(telegram_id),
+        "username": norm,
         "expires": time.time() + LOGIN_CODE_TTL_SEC,
     }
     return c
+
+
+def _login_cors_headers() -> dict:
+    origin = (os.getenv("LOGIN_CORS_ORIGIN") or "*").strip()
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    }
+
+
+def _login_json_response(data: dict, status: int = 200) -> web.Response:
+    return web.json_response(data, status=status, headers=_login_cors_headers())
+
+
+async def _http_login_options(_request: web.Request) -> web.Response:
+    return web.Response(status=204, headers=_login_cors_headers())
+
+
+async def _http_send_code(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return _login_json_response(
+            {"success": False, "error": "Некорректный JSON"},
+            status=400,
+        )
+    raw_u = data.get("username")
+    if raw_u is None or str(raw_u).strip() == "":
+        return _login_json_response(
+            {"success": False, "error": "Укажите username"},
+            status=400,
+        )
+    key = _normalize_login_username(str(raw_u))
+    if not key:
+        return _login_json_response(
+            {"success": False, "error": "Укажите username"},
+            status=400,
+        )
+    uid = USERNAME_TO_USER_ID.get(key)
+    if not uid:
+        return _login_json_response(
+            {"success": False, "error": "Пользователь не писал боту"},
+            status=404,
+        )
+    bot = request.app.get("bot")
+    if bot is None:
+        return _login_json_response(
+            {"success": False, "error": "Бот недоступен"},
+            status=503,
+        )
+    code = _issue_login_code(int(uid), key)
+    try:
+        await bot.send_message(
+            chat_id=int(uid),
+            text=_telegram_login_code_message(code),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logging.getLogger(__name__).exception("send-code → Telegram user_id=%s", uid)
+        return _login_json_response(
+            {"success": False, "error": "Не удалось отправить код в Telegram"},
+            status=502,
+        )
+    return _login_json_response({"success": True})
+
+
+async def _http_verify_code(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return _login_json_response(
+            {"success": False, "error": "Некорректный JSON"},
+            status=400,
+        )
+    raw_u = data.get("username")
+    code = str(data.get("code") or "").strip()
+    if not code or raw_u is None or str(raw_u).strip() == "":
+        return _login_json_response(
+            {"success": False, "error": "Укажите username и код"},
+            status=400,
+        )
+    key = _normalize_login_username(str(raw_u))
+    entry = LOGIN_CODES.get(code)
+    if not entry:
+        return _login_json_response(
+            {"success": False, "error": "Неверный код или срок действия истёк"},
+            status=401,
+        )
+    try:
+        exp = float(entry.get("expires") or 0)
+    except (TypeError, ValueError):
+        exp = 0.0
+    if exp < time.time():
+        LOGIN_CODES.pop(code, None)
+        return _login_json_response(
+            {"success": False, "error": "Неверный код или срок действия истёк"},
+            status=401,
+        )
+    if str(entry.get("username") or "").lower() != key:
+        return _login_json_response(
+            {"success": False, "error": "Неверный код или username"},
+            status=401,
+        )
+    uid = int(entry.get("user_id") or 0)
+    LOGIN_CODES.pop(code, None)
+    return _login_json_response(
+        {
+            "success": True,
+            "user_id": uid,
+            "username": f"@{key}" if key else "",
+        },
+    )
+
+
+async def _http_login_page(_request: web.Request) -> web.Response:
+    base = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base, "web", "login.html")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            html = f.read()
+    except OSError:
+        return web.Response(
+            text="login.html not found",
+            status=404,
+            content_type="text/plain",
+            charset="utf-8",
+        )
+    return web.Response(text=html, content_type="text/html", charset="utf-8")
+
+
+async def _run_login_http_api(bot) -> None:
+    """Фоновый HTTP: POST /api/send-code, /api/verify-code и страница входа."""
+    log = logging.getLogger(__name__)
+    app = web.Application()
+    app["bot"] = bot
+    app.router.add_get("/", _http_login_page)
+    app.router.add_get("/login", _http_login_page)
+    app.router.add_options("/api/send-code", _http_login_options)
+    app.router.add_options("/api/verify-code", _http_login_options)
+    app.router.add_post("/api/send-code", _http_send_code)
+    app.router.add_post("/api/verify-code", _http_verify_code)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    host = (os.getenv("LOGIN_API_HOST") or "127.0.0.1").strip()
+    try:
+        port = int(os.getenv("LOGIN_API_PORT", "8765"))
+    except ValueError:
+        port = 8765
+    site = web.TCPSite(runner, host=host, port=port)
+    await site.start()
+    log.info("Вход через Telegram: HTTP %s:%s (/, /login, /api/*)", host, port)
+    stop = asyncio.Event()
+    try:
+        await stop.wait()
+    finally:
+        await runner.cleanup()
 
 
 CARDS_JSON_URL = os.getenv("CARDS_JSON_URL", "https://www.illucards.by/cards.json")
@@ -277,6 +567,21 @@ DELIVERY_OPTIONS: dict = {
     "ua": ("🇺🇦 Украина", 3000, "RUB"),
     "ot": ("🌍 Другие страны", 800, "RUB"),
 }
+
+
+def _delivery_info_text() -> str:
+    parts: List[str] = [
+        "🚚 Доставка IlluCards",
+        "",
+        "Отправляем заказы по всему миру ✨",
+        "",
+    ]
+    for _code, (label, amt, cur) in DELIVERY_OPTIONS.items():
+        parts.append(f"📍 {label}")
+        parts.append(f"   💰 от {amt} {cur}")
+        parts.append("")
+    parts.append("Точную сумму увидите при оформлении заказа 👇")
+    return "\n".join(parts).rstrip()
 
 # Редкости как на illucards.by (фильтры каталога — индексы callback j:cat:0..4)
 CATALOG_RARITY_FILTERS: Tuple[str, ...] = (
@@ -310,10 +615,10 @@ def _rarity_label_ru(s: str) -> str:
 
 REPLY_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(BTN_ORDERS), KeyboardButton(BTN_CART)],
-        [KeyboardButton(BTN_CHAT), KeyboardButton(BTN_DELIVERY)],
-        [KeyboardButton(BTN_MONEY)],
-        [KeyboardButton(BTN_POPULAR), KeyboardButton(BTN_RANDOM_CARD)],
+        [KeyboardButton(BTN_CATALOG), KeyboardButton(BTN_CART)],
+        [KeyboardButton(BTN_POPULAR), KeyboardButton(BTN_CHAT)],
+        [KeyboardButton(BTN_MY_ORDERS), KeyboardButton(BTN_DELIVERY)],
+        [KeyboardButton(BTN_RANDOM_CARD)],
     ],
     resize_keyboard=True,
 )
@@ -321,14 +626,37 @@ REPLY_KB = ReplyKeyboardMarkup(
 # Тексты reply-клавиатуры (сброс режима «чат с админом» при переходе в меню)
 REPLY_MENU_TEXTS = frozenset(
     {
-        BTN_ORDERS,
+        BTN_CATALOG,
         BTN_CART,
-        BTN_CHAT,
-        BTN_DELIVERY,
-        BTN_MONEY,
         BTN_POPULAR,
+        BTN_CHAT,
+        BTN_MY_ORDERS,
+        BTN_DELIVERY,
         BTN_RANDOM_CARD,
     },
+)
+
+START_WELCOME_TEXT = (
+    "🎴 Добро пожаловать в IlluCards\n\n"
+    "Здесь вы можете:\n\n"
+    "📦 Смотреть коллекцию карточек\n"
+    "🛒 Добавлять в корзину\n"
+    "💳 Оформлять заказ\n\n"
+    "Выберите действие 👇"
+)
+
+CATALOG_INTRO_TEXT = (
+    "📦 Вся коллекция\n\n"
+    "Выберите категорию карточек 👇"
+)
+
+SUPPORT_INTRO_TEXT = (
+    "💬 Связь с нами\n\n"
+    "Напишите сюда, если:\n\n"
+    "— есть вопросы по карточкам\n"
+    "— нужна помощь с заказом\n"
+    "— хотите уточнить наличие\n\n"
+    "Администратор ответит вам прямо здесь 👇"
 )
 
 
@@ -533,8 +861,14 @@ def _format_customer_order_status_notice(order_id: int, status_key: str) -> str:
 
 
 def _payment_intro_text(total: int) -> str:
-    """После оформления: заказ принят, шаги, сумма и выбор способа оплаты (кнопки)."""
-    return f"📦 Заказ принят\n\n{PAY_FLOW_STEPS}\n\n💰 {int(total)} BYN"
+    """После оформления: сумма и выбор способа оплаты (кнопки — карта / перевод / крипта)."""
+    return (
+        f"💰 Итого: {int(total)} BYN\n\n"
+        "Выберите способ оплаты:\n\n"
+        "💳 Карта · 📱 Перевод · ₿ Крипта\n\n"
+        f"{PAY_FLOW_STEPS}\n\n"
+        "👇 Нажмите кнопку ниже"
+    )
 
 
 def _format_delivery_block(d: Optional[dict]) -> str:
@@ -573,29 +907,45 @@ def _format_admin_order_detail_text(order_id: int, o: dict) -> str:
     tot = int(o.get("total") or 0)
     st = str(o.get("status") or "new")
     st_ru = _order_status_label_ru(st)
-    dline = _format_delivery_block(o.get("delivery") if isinstance(o.get("delivery"), dict) else None)
+    d = o.get("delivery") if isinstance(o.get("delivery"), dict) else None
+    dline = _format_delivery_block(d)
+    d_country = "—"
+    if d:
+        cc = str(d.get("country") or "").strip().lower()
+        opt = DELIVERY_OPTIONS.get(cc)
+        if opt:
+            d_country = str(opt[0])
+        elif d.get("label"):
+            d_country = str(d.get("label"))
     try:
         ts = float(o.get("created_at") or 0)
     except (TypeError, ValueError):
         ts = 0.0
     tss = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts > 0 else "—"
-    user_line = f"👤 {uid}"
-    if un_s:
-        user_line += f" · @{un_s}"
+    u_show = f"@{un_s}" if un_s else "—"
     parts: List[str] = [
         f"📦 Заказ #{order_id}",
         "",
-        user_line,
-        "🛒",
+        f"👤 Пользователь: {u_show}",
+        f"🆔 id: {uid}",
+        "",
+        "📦 Состав:",
         items_block,
         "",
+        f"🚚 Доставка: {d_country}",
     ]
     if dline:
-        parts.append(dline)
-        parts.append("")
-    parts.append(f"💰 {tot} BYN")
-    parts.append(f"📊 Статус: {st_ru}")
-    parts.append(f"🕐 Создан: {tss}")
+        parts.extend(["", dline])
+    parts.extend(
+        [
+            "",
+            f"💰 Сумма: {tot} BYN",
+            "",
+            f"📊 Статус: {st_ru}",
+            "",
+            f"🕐 Создан: {tss}",
+        ]
+    )
     body = "\n".join(parts)
     if len(body) > 4090:
         body = body[:4086] + "…"
@@ -603,11 +953,11 @@ def _format_admin_order_detail_text(order_id: int, o: dict) -> str:
 
 
 def _kb_order_admin_actions(order_id: int, status: str) -> Optional[InlineKeyboardMarkup]:
-    rep = InlineKeyboardButton("💬", callback_data=f"oam:rep:{order_id}")
-    acc = InlineKeyboardButton("✅", callback_data=f"accept_{order_id}")
-    shp = InlineKeyboardButton("🚚", callback_data=f"sent_{order_id}")
-    can = InlineKeyboardButton("❌", callback_data=f"cancel_{order_id}")
-    done_btn = InlineKeyboardButton("🏁", callback_data=f"done_{order_id}")
+    rep = InlineKeyboardButton("💬 Ответить", callback_data=f"oam:rep:{order_id}")
+    acc = InlineKeyboardButton("✅ Принять", callback_data=f"accept_{order_id}")
+    shp = InlineKeyboardButton("🚚 Отправлен", callback_data=f"sent_{order_id}")
+    can = InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_{order_id}")
+    done_btn = InlineKeyboardButton("🏁 Завершён", callback_data=f"done_{order_id}")
     s = str(status or "new")
     if s == "new":
         return InlineKeyboardMarkup([[rep, acc], [shp, can]])
@@ -671,6 +1021,8 @@ async def _notify_admin_new_order(
         "payment_proof_submitted": False,
         "clear_cart_on_paid": False,
     }
+    if uid:
+        users_touch(uid, activity_only=True)
     return order_id
 
 
@@ -695,23 +1047,34 @@ def _kb_paid_confirm() -> InlineKeyboardMarkup:
 def _format_payment_receipt_text(order_id: int, o: dict) -> str:
     """Текст чека клиенту после оплаты."""
     items_block = _format_order_items_for_admin(list(o.get("items") or []))
-    dline = _format_delivery_block(
-        o.get("delivery") if isinstance(o.get("delivery"), dict) else None
-    )
+    d = o.get("delivery") if isinstance(o.get("delivery"), dict) else None
+    dline = _format_delivery_block(d)
+    if not dline and d:
+        cc = str(d.get("country") or "").strip().lower()
+        opt = DELIVERY_OPTIONS.get(cc)
+        dline = f"🚚 {opt[0]}" if opt else ""
     tot = int(o.get("total") or 0)
     lines: List[str] = [
-        f"🧾 #{order_id}",
+        "📄 Чек:",
         "",
+        f"🧾 Заказ #{order_id}",
+        "",
+        "📦 Состав:",
         items_block,
+        "",
     ]
     if dline:
         lines.append(dline)
-    lines.append(f"💰 {tot} BYN")
+    else:
+        lines.append("🚚 Доставка: —")
+    lines.append("")
+    lines.append(f"💰 Сумма: {tot} BYN")
     lines.extend(
         [
             "",
-            "✅ Готово",
-            "🙏",
+            "📊 Статус: Оплачен",
+            "",
+            "🙏 Спасибо за покупку!",
         ]
     )
     body = "\n".join(lines)
@@ -725,7 +1088,7 @@ def _kb_payment_receipt() -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton("📦 Мои заказы", callback_data="rcpt_orders"),
-                InlineKeyboardButton("💬 Поддержка", callback_data="rcpt_support"),
+                InlineKeyboardButton("💬 Связь", callback_data="rcpt_support"),
             ],
         ]
     )
@@ -754,13 +1117,13 @@ def _kb_payment_admin_review(order_id: int) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    "✅ Подтвердить оплату",
+                    "✅ Оплата получена",
                     callback_data=f"confirm_payment_{order_id}",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    "❌ Отклонить",
+                    "❌ Скрин не подходит",
                     callback_data=f"reject_payment_{order_id}",
                 ),
             ],
@@ -828,10 +1191,14 @@ def _cart_totals(lines: List[dict]) -> Tuple[int, int]:
 
 def _format_cart_message(lines: List[dict]) -> str:
     if not lines:
-        return "🛒 ∅"
+        return (
+            "🛒 Ваша корзина пуста\n\n"
+            "Вы ещё не добавили ни одной карточки\n"
+            "Перейдите в каталог 👇"
+        )
     total, _ = _cart_totals(lines)
     out: List[str] = [
-        "🛒",
+        "🛒 Ваша корзина:",
         "",
     ]
     for x in lines:
@@ -840,7 +1207,10 @@ def _format_cart_message(lines: List[dict]) -> str:
             name = name.rstrip() + "…"
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
-        out.append(f"• {name} — {p} BYN × {q}")
+        if q <= 1:
+            out.append(f"• {name} — {p} BYN")
+        else:
+            out.append(f"• {name} — {p * q} BYN (×{q})")
     out += ["", f"💰 Итого: {total} BYN"]
     s = "\n".join(out)
     if len(s) > 3900:
@@ -906,8 +1276,17 @@ def _format_mine_orders_text_and_kb(
 ) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
     reg = _user_orders_registry_for_user(user_id)
     if not reg:
-        return ("📦 ∅", None)
-    lines: List[str] = ["📦", ""]
+        return (
+            "📋 Пока нет заказов\n\n"
+            "Оформите первый заказ из корзины — и он появится здесь ✨",
+            None,
+        )
+    lines: List[str] = [
+        "📋 Мои заказы",
+        "",
+        "Нажмите на заказ, чтобы открыть подробности 👇",
+        "",
+    ]
     rows: List[List[InlineKeyboardButton]] = []
     for oid, o in reg[:30]:
         tot = int(o.get("total") or 0)
@@ -937,12 +1316,13 @@ def _format_user_order_detail(order_id: int, o: dict) -> str:
     )
     parts: List[str] = [
         f"📦 Заказ #{order_id}",
+        "",
         f"📊 Статус: {st_ru}",
         "",
-        "🛒",
+        "📦 Состав:",
         items_block,
         "",
-        f"💰 {tot} BYN",
+        f"💰 Итого: {tot} BYN",
     ]
     if dline:
         parts.extend(["", dline])
@@ -952,9 +1332,16 @@ def _format_user_order_detail(order_id: int, o: dict) -> str:
     return body
 
 
-def _kb_cart(lines: List[dict]) -> Optional[InlineKeyboardMarkup]:
+def _kb_cart(lines: List[dict]) -> InlineKeyboardMarkup:
     if not lines:
-        return None
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("📦 Каталог", callback_data="m:0"),
+                    InlineKeyboardButton("🔥 Акции", callback_data="pop:0"),
+                ],
+            ],
+        )
     rows: List[List[InlineKeyboardButton]] = []
     for i in range(len(lines)):
         rows.append(
@@ -965,7 +1352,10 @@ def _kb_cart(lines: List[dict]) -> Optional[InlineKeyboardMarkup]:
             ],
         )
     rows.append(
-        [InlineKeyboardButton("✅", callback_data="co:0")],
+        [InlineKeyboardButton("✅ Оформить заказ", callback_data="co:0")],
+    )
+    rows.append(
+        [InlineKeyboardButton("📦 Продолжить покупки", callback_data="m:0")],
     )
     return InlineKeyboardMarkup(rows)
 
@@ -1009,7 +1399,10 @@ def _format_order_preview_with_delivery(user_data: dict) -> str:
         return ""
     dlabel, damount, dcur = opt[0], opt[1], opt[2]
     goods_total, _ = _cart_totals(lines)
-    out: List[str] = ["🛒", ""]
+    out: List[str] = [
+        "📦 Ваш заказ:",
+        "",
+    ]
     for x in lines:
         name = (x.get("name") or "—")[:200]
         if len((x.get("name") or "")) > 200:
@@ -1017,13 +1410,14 @@ def _format_order_preview_with_delivery(user_data: dict) -> str:
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
         sub = p * q
-        out.append(f"• {name} — {sub}")
+        out.append(f"• {name} — {sub} BYN")
     out.append("")
-    out.append(f"🚚 {dlabel} · {damount} {dcur}")
+    out.append(f"🚚 Доставка: {dlabel}")
+    out.append("")
     if code == "by" and dcur == "BYN":
-        out.append(f"💰 {goods_total + damount} BYN")
+        out.append(f"💰 Итого: {goods_total + damount} BYN")
     else:
-        out.append(f"💰 {goods_total} BYN · +{damount} {dcur}")
+        out.append(f"💰 Итого: {goods_total} BYN (+{damount} {dcur} доставка)")
     s = "\n".join(out)
     if len(s) > 4000:
         s = s[:3990] + "…"
@@ -1053,7 +1447,7 @@ def _btn_label(s: str, max_len: int = 22) -> str:
 
 def _kb_categories(categories: List[str]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = [
-        [InlineKeyboardButton("∞", callback_data="c:all")],
+        [InlineKeyboardButton("🌐 Вся коллекция", callback_data="c:all")],
     ]
     row: List[InlineKeyboardButton] = []
     for i, name in enumerate(categories):
@@ -1075,18 +1469,20 @@ def _kb_rarities(cat_tok: str) -> InlineKeyboardMarkup:
     c = str(cat_tok)[:12]
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("⭐ Все редкости", callback_data=f"j:{c}:all")],
-            [InlineKeyboardButton("🔥 Горячая цена", callback_data=f"j:{c}:sale")],
             [
-                InlineKeyboardButton("Обычная", callback_data=f"j:{c}:0"),
-                InlineKeyboardButton("Лимитированная", callback_data=f"j:{c}:1"),
+                InlineKeyboardButton("⭐ Обычная", callback_data=f"j:{c}:0"),
+                InlineKeyboardButton("🔥 Горячая цена", callback_data=f"j:{c}:sale"),
             ],
             [
-                InlineKeyboardButton("Новинка", callback_data=f"j:{c}:2"),
-                InlineKeyboardButton("Реплика", callback_data=f"j:{c}:3"),
+                InlineKeyboardButton("💎 Лимитированная", callback_data=f"j:{c}:1"),
+                InlineKeyboardButton("♻️ Реплика", callback_data=f"j:{c}:3"),
             ],
-            [InlineKeyboardButton("18+", callback_data=f"j:{c}:4")],
-            [InlineKeyboardButton("⬅ К категориям", callback_data="m:0")],
+            [
+                InlineKeyboardButton("💫 Новинка", callback_data=f"j:{c}:2"),
+                InlineKeyboardButton("🔞 18+", callback_data=f"j:{c}:4"),
+            ],
+            [InlineKeyboardButton("🌟 Все карточки", callback_data=f"j:{c}:all")],
+            [InlineKeyboardButton("⬅️ К категориям", callback_data="m:0")],
         ]
     )
 
@@ -1139,6 +1535,17 @@ def _filter_wizard(
     return out, cat_label, rlab
 
 
+def _needs_rarity_step(base: List[dict]) -> bool:
+    """Несколько разных редкостей в выборке — показываем экран «⭐ редкость»."""
+    if len(base) < 2:
+        return False
+    keys: set = set()
+    for p in base:
+        r = str(p.get("rarity", "") or "").strip().lower()
+        keys.add(r if r else "_")
+    return len(keys) > 1
+
+
 def _tinder_photo_url(p: dict) -> str:
     u = str(p.get("image") or "").strip()
     if u and u.startswith("http"):
@@ -1159,7 +1566,7 @@ def _tinder_caption(p: dict, cur_1: int, n_total: int) -> str:
         pstr = "—"
     if len(name) > 200:
         name = name[:197] + "…"
-    c = f"{name}\n\n💰 {pstr}\n⭐ {r}\n\n{cur_1} / {n_total}"
+    c = f"{name}\n\n💰 {pstr}\n⭐ {r}\n\n🔎 {cur_1} из {n_total}"
     if len(c) > 1024:
         c = c[:1020] + "…"
     return c
@@ -1436,6 +1843,8 @@ async def on_tinder_swipe(
             p_cur.get("name") or "—",
             _product_price(p_cur),
         )
+        if uid_t:
+            users_touch(uid_t, "cart")
         i = (i + 1) % n
     ud["tinder_i"] = i
     cid = int(q.message.chat_id)
@@ -1448,8 +1857,8 @@ async def on_tinder_swipe(
         uid_t = q.from_user.id if q.from_user else 0
         lines = _cart_get_lines_uid(uid_t, ud)
         tot, _ = _cart_totals(lines)
-        short = f"{len(lines)} п. · {tot} BYN"
-        await q.answer(f"В корзине: {short}", show_alert=False)
+        short = f"{len(lines)} поз. · {tot} BYN"
+        await q.answer(f"🛒 В корзине: {short}", show_alert=False)
     else:
         await q.answer()
     if not ud.get("tinder_autoplay_paused", False):
@@ -1700,7 +2109,10 @@ def _format_user_deep_link_order_message(order: dict) -> str:
     cur = str(d.get("currency") or "BYN")
     country = str(d.get("country") or "")
     goods_total, _ = _cart_totals(lines)
-    out: List[str] = ["📦", ""]
+    out: List[str] = [
+        "📦 Ваш заказ",
+        "",
+    ]
     for x in lines:
         name = (x.get("name") or "—")[:200]
         if len((x.get("name") or "")) > 200:
@@ -1708,13 +2120,14 @@ def _format_user_deep_link_order_message(order: dict) -> str:
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
         sub = p * q
-        out.append(f"• {name} — {sub}")
+        out.append(f"• {name} — {sub} BYN")
     out.append("")
-    out.append(f"🚚 {label} · {amount} {cur}")
+    out.append(f"🚚 Доставка: {label}")
+    out.append("")
     if country == "by" and cur == "BYN":
-        out.append(f"💰 {goods_total + amount} BYN")
+        out.append(f"💰 Итого: {goods_total + amount} BYN")
     else:
-        out.append(f"💰 {goods_total} BYN · +{amount} {cur}")
+        out.append(f"💰 Итого: {goods_total} BYN (+{amount} {cur})")
     s = "\n".join(out)
     if len(s) > 4000:
         s = s[:3990] + "…"
@@ -1731,64 +2144,84 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not msg or not msg.from_user:
         return
     uid = msg.from_user.id
+    users_touch(uid, "start")
+    _register_login_username(uid, msg.from_user.username)
     args = context.args or []
     if args:
         first = (args[0] or "").strip()
+        if first.lower() == "login":
+            un = (msg.from_user.username or "").strip()
+            if not un:
+                await msg.reply_text(
+                    "⚠️ В настройках Telegram не указан username.\n\n"
+                    "Задайте @username в профиле, затем снова: /start login",
+                    reply_markup=REPLY_KB,
+                )
+                return
+            code = _issue_login_code(uid, un)
+            await msg.reply_text(
+                _telegram_login_code_message(code),
+                reply_markup=REPLY_KB,
+            )
+            await msg.reply_text(START_WELCOME_TEXT, reply_markup=REPLY_KB)
+            return
         oid = _parse_order_id_from_start_arg(first)
         if oid:
             order = await _fetch_order_for_deep_link(oid)
             if not order:
-                await msg.reply_text("❌", reply_markup=REPLY_KB)
-            else:
-                tok = secrets.token_hex(8)
-                context.user_data["deep_link_order_session"] = {
-                    "token": tok,
-                    "order": deepcopy(order),
-                }
-                preview = _format_user_deep_link_order_message(order)
                 await msg.reply_text(
-                    preview,
-                    reply_markup=InlineKeyboardMarkup(
-                        [
-                            [
-                                InlineKeyboardButton(
-                                    "✅",
-                                    callback_data=f"dlco:{tok}",
-                                ),
-                                InlineKeyboardButton(
-                                    "❌",
-                                    callback_data=f"dlca:{tok}",
-                                ),
-                            ],
-                        ],
-                    ),
+                    "😔 Заказ по ссылке не найден\n\n"
+                    "Проверьте ссылку или напишите нам в 💬 Связь",
+                    reply_markup=REPLY_KB,
                 )
-        else:
-            t = " ".join(args).strip()
-            if not t:
-                await msg.reply_text("·", reply_markup=REPLY_KB)
-            else:
-                context.user_data.pop("deep_link_order_session", None)
-                context.user_data["pending_order"] = t
-                preview = _format_deep_link_order_preview(t)
-                await msg.reply_text(
-                    preview,
-                    reply_markup=InlineKeyboardMarkup(
+                return
+            tok = secrets.token_hex(8)
+            context.user_data["deep_link_order_session"] = {
+                "token": tok,
+                "order": deepcopy(order),
+            }
+            preview = _format_user_deep_link_order_message(order)
+            await msg.reply_text(
+                preview,
+                reply_markup=InlineKeyboardMarkup(
+                    [
                         [
-                            [
-                                InlineKeyboardButton(
-                                    "✅",
-                                    callback_data="confirm_order",
-                                ),
-                                InlineKeyboardButton("❌", callback_data="cancel_order"),
-                            ],
+                            InlineKeyboardButton(
+                                "✅",
+                                callback_data=f"dlco:{tok}",
+                            ),
+                            InlineKeyboardButton(
+                                "❌",
+                                callback_data=f"dlca:{tok}",
+                            ),
                         ],
-                    ),
-                )
-    else:
-        await msg.reply_text("·", reply_markup=REPLY_KB)
-    code = _issue_login_code(uid)
-    await msg.reply_text(f"🔑 {code}")
+                    ],
+                ),
+            )
+            return
+        t = " ".join(args).strip()
+        if not t:
+            await msg.reply_text(START_WELCOME_TEXT, reply_markup=REPLY_KB)
+            return
+        context.user_data.pop("deep_link_order_session", None)
+        context.user_data["pending_order"] = t
+        preview = _format_deep_link_order_preview(t)
+        await msg.reply_text(
+            preview,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅",
+                            callback_data="confirm_order",
+                        ),
+                        InlineKeyboardButton("❌", callback_data="cancel_order"),
+                    ],
+                ],
+            ),
+        )
+        return
+    await msg.reply_text(START_WELCOME_TEXT, reply_markup=REPLY_KB)
 
 
 async def on_deep_link_confirm_order(
@@ -1918,6 +2351,7 @@ async def on_deep_link_structured_submit(
         _payment_intro_text(tot),
         reply_markup=_kb_payment_methods(),
     )
+    users_touch(u.id, "payment")
 
 
 async def on_deep_link_structured_cancel(
@@ -1945,8 +2379,10 @@ async def on_deep_link_structured_cancel(
 def _kb_admin_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📦", callback_data="adm:orders")],
-            [InlineKeyboardButton("📈", callback_data="adm:stats")],
+            [
+                InlineKeyboardButton("📦 Заказы", callback_data="adm:orders"),
+                InlineKeyboardButton("📈 Статистика", callback_data="adm:stats"),
+            ],
         ],
     )
 
@@ -1998,16 +2434,18 @@ def _format_admin_stats() -> str:
             revenue_byn += tot
     n_all = len(ORDERS)
     lines = [
-        "📈 Статистика:",
+        "📈 Статистика",
         "",
-        f"Сегодня заказов: {today_count}",
-        f"Всего заказов: {n_all}",
-        f"Выручка: {revenue_byn} BYN",
+        f"📅 Сегодня заказов: {today_count}",
+        f"📦 Всего заказов: {n_all}",
+        f"💰 Выручка: {revenue_byn} BYN",
         "",
-        "Разбить по статусам:",
-        f"Новый: {by_status['new']}",
-        f"Принят: {by_status['accepted']}",
-        f"Отправлен: {by_status['shipped']}",
+        "📊 По статусам:",
+        f"🆕 Новые: {by_status['new']}",
+        f"✅ Приняты: {by_status['accepted']}",
+        f"🚚 Отправлены: {by_status['shipped']}",
+        f"🏁 Завершены: {by_status['done']}",
+        f"❌ Отменены: {by_status['canceled']}",
     ]
     return "\n".join(lines)
 
@@ -2020,7 +2458,10 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(u.id):
         await msg.reply_text(ADMIN_ACCESS_DENIED)
         return
-    await msg.reply_text("⚙️", reply_markup=_kb_admin_panel())
+    await msg.reply_text(
+        "👑 Админ-панель\n\nВыберите раздел 👇",
+        reply_markup=_kb_admin_panel(),
+    )
 
 
 async def admin_say_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2066,9 +2507,12 @@ async def on_admin_panel_action(
     await q.answer()
     if action == "orders":
         if not ORDERS:
-            await q.message.reply_text("📦 ∅")
+            await q.message.reply_text(
+                "📦 Пока нет заказов\n\n"
+                "Как только клиент оформит покупку — заказ появится здесь ✨"
+            )
         else:
-            body_lines: List[str] = ["📦", ""]
+            body_lines: List[str] = ["📦 Заказы", "", "Выберите заказ 👇", ""]
             for oid in sorted(ORDERS.keys(), key=int):
                 o = ORDERS[oid]
                 tot = int(o.get("total") or 0)
@@ -2270,7 +2714,9 @@ async def send_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text("❌")
         return
     log.info("Каталог: %d разделов", len(categories))
-    await msg.reply_text("💰", reply_markup=_kb_categories(categories))
+    if msg.from_user:
+        users_touch(msg.from_user.id, "catalog")
+    await msg.reply_text(CATALOG_INTRO_TEXT, reply_markup=_kb_categories(categories))
 
 
 async def send_tinder_mode(
@@ -2359,7 +2805,9 @@ async def _edit_to_categories(
     if not cats:
         await q.edit_message_text("❌")
         return
-    await q.edit_message_text("💰", reply_markup=_kb_categories(cats))
+    await q.edit_message_text(CATALOG_INTRO_TEXT, reply_markup=_kb_categories(cats))
+    if q.from_user:
+        users_touch(q.from_user.id, "catalog")
 
 
 async def on_menu_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2368,6 +2816,28 @@ async def on_menu_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await q.answer()
     await _edit_to_categories(q, context)
+
+
+async def on_popular_inline(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """🔥 Акции из inline-кнопки (корзина / навигация)."""
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    if (q.data or "").strip() != "pop:0":
+        return
+    await q.answer()
+    products = await _get_products(context)
+    if not products:
+        await q.message.reply_text(
+            "😔 Сейчас не удалось загрузить каталог\n\nПопробуйте чуть позже 🙏"
+        )
+        return
+    cats = _category_names(products)
+    in_scope, _, _ = _filter_wizard(products, cats, "all", "sale")
+    if not in_scope:
+        in_scope = list(products)
+    await _tinder_start(q, context, in_scope, products, "all")
 
 
 async def on_pick_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2381,20 +2851,26 @@ async def on_pick_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     products = await _get_products(context)
     cats = _category_names(products)
     if key == "all":
-        t = "⭐"
-        await q.answer()
-        await q.edit_message_text(t, reply_markup=_kb_rarities("all"))
+        cat_tok = "all"
+        base, cat_label, _ = _filter_wizard(products, cats, "all", "all")
+    else:
+        ci = int(key)
+        if ci < 0 or ci >= len(cats):
+            await q.answer()
+            if q.message:
+                await q.message.reply_text(FALLBACK_USER_TEXT)
+            return
+        cat_tok = str(ci)
+        base, cat_label, _ = _filter_wizard(products, cats, cat_tok, "all")
+    if not cat_label or not base:
+        await _notify_callback_issue(q, context)
         return
-    ci = int(key)
-    if ci < 0 or ci >= len(cats):
-        await q.answer()
-        if q.message:
-            await q.message.reply_text(FALLBACK_USER_TEXT)
-        return
-    cat = cats[ci]
-    t = f"⭐ {cat}"
     await q.answer()
-    await q.edit_message_text(t, reply_markup=_kb_rarities(str(ci)))
+    if _needs_rarity_step(base):
+        hdr = "⭐ Выберите редкость:\n\nКакие карточки показать? 👇"
+        await q.edit_message_text(hdr, reply_markup=_kb_rarities(cat_tok))
+    else:
+        await _tinder_start(q, context, base, products, cat_tok)
 
 
 async def on_pick_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2414,12 +2890,18 @@ async def on_pick_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if rar_tok != "all" and not in_scope:
         await q.answer()
         if q.message:
-            await q.message.reply_text("∅")
+            await q.message.reply_text(
+                "🔍 В этой категории таких карточек пока нет\n\n"
+                "Попробуйте другую редкость или загляните в акции 🔥"
+            )
         return
     if not in_scope:
         await q.answer()
         if q.message:
-            await q.message.reply_text("∅")
+            await q.message.reply_text(
+                "🔍 Сейчас здесь пусто\n\n"
+                "Загляните в другую категорию или в акции 🔥"
+            )
         return
     await q.answer()
     await _tinder_start(q, context, in_scope, products, cat_tok)
@@ -2444,8 +2926,13 @@ async def on_back_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     udi.pop("tinder_autoplay_paused", None)
     products = await _get_products(context)
     cats = _category_names(products)
+    base, _, _ = _filter_wizard(products, cats, cat_tok, "all")
+    if not base or not _needs_rarity_step(base):
+        await _edit_to_categories(q, context)
+        return
+    hdr_base = "⭐ Выберите редкость:\n\nКакие карточки показать? 👇"
     if cat_tok == "all":
-        t = "⭐"
+        t = hdr_base
         kb = _kb_rarities("all")
     else:
         try:
@@ -2457,7 +2944,7 @@ async def on_back_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await _edit_to_categories(q, context)
             return
         cat = cats[cix]
-        t = f"⭐ {cat}"
+        t = f"⭐ Категория: {cat}\n\nКакие карточки показать? 👇"
         kb = _kb_rarities(str(cix))
     qm = q.message
     if qm and qm.photo:
@@ -2486,7 +2973,7 @@ async def _edit_cart_message(q: CallbackQuery, context: ContextTypes.DEFAULT_TYP
     _ensure_user_cart(uid, context.user_data)
     lines = _cart_get_lines_uid(uid, context.user_data)
     t = _format_cart_message(lines)
-    kb = _kb_cart(lines) if lines else None
+    kb = _kb_cart(lines)
     try:
         await q.edit_message_text(t, reply_markup=kb)
     except Exception:
@@ -2534,7 +3021,8 @@ async def on_add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     tot, npos = _cart_totals(lines)
     nlines = len(lines)
     short = f"{tot} BYN, шт. {npos}"
-    await q.answer(f"В корзине: {nlines} п. · {short}", show_alert=False)
+    users_touch(uid, "cart")
+    await q.answer(f"🛒 В корзине: {nlines} поз. · {short}", show_alert=False)
 
 
 async def on_cart_remove_line(
@@ -2552,6 +3040,7 @@ async def on_cart_remove_line(
     if not _cart_remove_line_uid(uid, context.user_data, ix):
         await _notify_callback_issue(q, context)
         return
+    users_touch(uid, "cart")
     await q.answer()
     await _edit_cart_message(q, context)
 
@@ -2595,6 +3084,7 @@ async def on_cart_increment(
         product.get("name") or "—",
         _product_price(product),
     )
+    users_touch(uid, "cart")
     await q.answer()
     await _edit_cart_message(q, context)
 
@@ -2614,6 +3104,7 @@ async def on_cart_decrement(
     if not _cart_dec_line_uid(uid, context.user_data, ix):
         await _notify_callback_issue(q, context)
         return
+    users_touch(uid, "cart")
     await q.answer()
     await _edit_cart_message(q, context)
 
@@ -2649,7 +3140,9 @@ async def on_cart_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             ud.pop("payment_pending_method", None)
     if uid:
         _cart_clear_uid(uid)
-    await q.answer("🛒 ∅", show_alert=False)
+    if uid:
+        users_touch(uid, "cart")
+    await q.answer("🧹 Готово", show_alert=False)
     await _edit_cart_message(q, context)
 
 
@@ -2671,7 +3164,10 @@ async def on_checkout_ask_username(
     if not lines:
         await q.answer()
         if q.message:
-            await q.message.reply_text("🛒 ∅")
+            await q.message.reply_text(
+                _format_cart_message([]),
+                reply_markup=_kb_cart([]),
+            )
         return
     ud = context.user_data
     ud["order_checkout"] = deepcopy(lines)
@@ -2679,8 +3175,12 @@ async def on_checkout_ask_username(
     ud.pop("delivery_label", None)
     ud.pop("delivery_amount", None)
     ud.pop("delivery_currency", None)
+    users_touch(uid, "checkout")
     await q.answer()
-    await q.message.reply_text("🚚", reply_markup=_kb_delivery_country())
+    await q.message.reply_text(
+        "🚚 Куда доставить заказ?\n\nВыберите страну 👇",
+        reply_markup=_kb_delivery_country(),
+    )
 
 
 async def on_delivery_country_pick(
@@ -2803,6 +3303,7 @@ async def on_send_order_to_admin(
         _payment_intro_text(tot),
         reply_markup=_kb_payment_methods(),
     )
+    users_touch(uid, "payment")
 
 
 async def on_payment_method(
@@ -2874,6 +3375,7 @@ async def on_payment_method(
         await q.answer()
     except Exception:
         pass
+    users_touch(uid, "payment")
     await q.message.reply_text(
         body_map[method],
         reply_markup=_kb_paid_confirm(),
@@ -3118,7 +3620,7 @@ async def on_receipt_callback(
         await q.message.reply_text(body, reply_markup=kb)
     else:
         user_support_state[uid] = True
-        await q.message.reply_text("💬")
+        await q.message.reply_text(SUPPORT_INTRO_TEXT)
 
 
 async def on_admin_reject_payment(
@@ -3196,7 +3698,7 @@ async def on_view_cart_callback(
     _ensure_user_cart(uid, context.user_data)
     lines = _cart_get_lines_uid(uid, context.user_data)
     t = _format_cart_message(lines)
-    kb = _kb_cart(lines) if lines else None
+    kb = _kb_cart(lines)
     await q.message.reply_text(t, reply_markup=kb)
 
 
@@ -3226,11 +3728,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             _clear_crypto_auto_watch(co, uid)
 
     menu_keys = (
-        BTN_ORDERS,
+        BTN_CATALOG,
         BTN_CART,
         BTN_CHAT,
         BTN_DELIVERY,
-        BTN_MONEY,
+        BTN_MY_ORDERS,
         BTN_POPULAR,
         BTN_RANDOM_CARD,
     )
@@ -3291,7 +3793,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _clear_checkout_delivery(user_data)
         user_data.pop("pending_order", None)
         user_support_state[uid] = True
-        await msg.reply_text("💬")
+        await msg.reply_text(SUPPORT_INTRO_TEXT)
         return
 
     if uid and user_support_state.get(uid):
@@ -3333,7 +3835,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text("✅")
             return
 
-    if text in (BTN_ORDERS, BTN_MONEY, BTN_DELIVERY, BTN_POPULAR, BTN_RANDOM_CARD):
+    if text in (
+        BTN_CATALOG,
+        BTN_MY_ORDERS,
+        BTN_DELIVERY,
+        BTN_POPULAR,
+        BTN_RANDOM_CARD,
+    ):
         _clear_checkout_delivery(user_data)
         user_data.pop("pending_order", None)
 
@@ -3341,11 +3849,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _ensure_user_cart(uid, user_data)
         cl = _cart_get_lines_uid(uid, user_data)
         t = _format_cart_message(cl)
-        kb = _kb_cart(cl) if cl else None
+        kb = _kb_cart(cl)
         await msg.reply_text(t, reply_markup=kb)
         return
 
-    if text == BTN_ORDERS:
+    if text == BTN_MY_ORDERS:
         if not uid:
             await msg.reply_text(FALLBACK_USER_TEXT)
             return
@@ -3353,8 +3861,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(body, reply_markup=kb)
         return
 
+    if text == BTN_CATALOG:
+        await send_catalog(update, context)
+        return
+
     if text == BTN_DELIVERY:
-        await msg.reply_text("🚚 BY · RU · UA · 🌍")
+        await msg.reply_text(_delivery_info_text())
         return
 
     if text == BTN_POPULAR:
@@ -3364,10 +3876,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if text == BTN_RANDOM_CARD:
         await send_random_card(update, context)
         return
-
-    if text == BTN_MONEY:
-        await send_catalog(update, context)
-
 
 async def post_init(application: Application) -> None:
     log = logging.getLogger(__name__)
@@ -3405,6 +3913,11 @@ async def post_init(application: Application) -> None:
     me = await application.bot.get_me()
     if me.username:
         print(f"https://t.me/{me.username}")
+    if os.getenv("LOGIN_API_DISABLE", "").strip() != "1":
+        try:
+            asyncio.create_task(_run_login_http_api(application.bot))
+        except Exception:
+            log.exception("Вход через Telegram: HTTP API не запущен")
 
 
 def main() -> None:
@@ -3413,6 +3926,10 @@ def main() -> None:
 
     app = Application.builder().token(token).post_init(post_init).build()
 
+    app.add_handler(
+        TypeHandler(Update, track_user_activity, block=False),
+        group=-1,
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("catalog", catalog_cmd))
     app.add_handler(CommandHandler("promo", send_promo))
@@ -3511,6 +4028,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_tinder_swipe, pattern=re.compile(r"^t:([pncf])$")))
     app.add_handler(CallbackQueryHandler(on_add_to_cart, pattern=re.compile(r"^a:(.+)$")))
     app.add_handler(CallbackQueryHandler(on_back_rarity, pattern=re.compile(r"^h:([^:]{1,12})$")))
+    app.add_handler(CallbackQueryHandler(on_popular_inline, pattern=re.compile(r"^pop:0$")))
     app.add_handler(CallbackQueryHandler(on_menu_main, pattern=re.compile(r"^m:0$")))
     app.add_handler(
         CallbackQueryHandler(
