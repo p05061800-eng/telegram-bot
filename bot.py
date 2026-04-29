@@ -34,6 +34,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -144,6 +145,7 @@ LOGIN_CODES: dict = {}
 LOGIN_CODE_TTL_SEC = 5 * 60
 # нормализованный @username (без @, lower) → telegram user_id (кто писал боту)
 USERNAME_TO_USER_ID: Dict[str, int] = {}
+SYNC_API_SECRET = (os.getenv("TELEGRAM_SYNC_API_SECRET") or "").strip()
 
 
 def _normalize_login_username(raw: str) -> str:
@@ -713,6 +715,132 @@ async def _http_verify_code(request: web.Request) -> web.Response:
     )
 
 
+def _sync_auth_ok(request: web.Request, data: dict) -> bool:
+    """Проверка секрета синхронизации сайта -> бот."""
+    if not SYNC_API_SECRET:
+        return True
+    header_secret = (request.headers.get("X-Sync-Secret") or "").strip()
+    body_secret = str(data.get("secret") or "").strip()
+    return hmac.compare_digest(header_secret or body_secret, SYNC_API_SECRET)
+
+
+def _resolve_sync_uid(data: dict) -> int:
+    raw_uid = data.get("user_id")
+    try:
+        uid = int(raw_uid or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    if uid > 0:
+        return uid
+    raw_username = data.get("username")
+    if raw_username is None:
+        return 0
+    key = _normalize_login_username(str(raw_username))
+    if not key:
+        return 0
+    try:
+        return int(USERNAME_TO_USER_ID.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalize_sync_cart_items(raw_items: object) -> List[dict]:
+    out: List[dict] = []
+    if not isinstance(raw_items, list):
+        return out
+    for x in raw_items:
+        if not isinstance(x, dict):
+            continue
+        name = str(x.get("name") or "—").strip() or "—"
+        ref = str(x.get("ref") or x.get("id") or name).strip()[:120]
+        try:
+            price = int(float(x.get("price") or 0))
+        except (TypeError, ValueError):
+            price = 0
+        try:
+            qty = int(x.get("qty") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        qty = max(1, min(qty, 999))
+        out.append({"ref": ref, "name": name[:200], "price": max(0, price), "qty": qty})
+    return out
+
+
+def _normalize_sync_favorites(raw_items: object) -> List[str]:
+    refs: List[str] = []
+    if not isinstance(raw_items, list):
+        return refs
+    seen: set = set()
+    for x in raw_items:
+        if isinstance(x, dict):
+            ref = str(x.get("ref") or x.get("id") or "").strip()[:120]
+        else:
+            ref = str(x or "").strip()[:120]
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        refs.append(ref)
+    return refs
+
+
+async def _http_sync_cart(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return _login_json_response({"success": False, "error": "Некорректный JSON"}, status=400)
+    if not isinstance(data, dict):
+        return _login_json_response({"success": False, "error": "Некорректные данные"}, status=400)
+    if not _sync_auth_ok(request, data):
+        return _login_json_response({"success": False, "error": "Forbidden"}, status=403)
+    uid = _resolve_sync_uid(data)
+    if not uid:
+        return _login_json_response({"success": False, "error": "Пользователь не найден"}, status=404)
+    lines = _normalize_sync_cart_items(data.get("items"))
+    _cart_set_items_uid(uid, lines)
+    users_touch(uid, "cart_sync")
+    return _login_json_response({"success": True, "user_id": uid, "items": len(lines)})
+
+
+async def _http_sync_favorites(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return _login_json_response({"success": False, "error": "Некорректный JSON"}, status=400)
+    if not isinstance(data, dict):
+        return _login_json_response({"success": False, "error": "Некорректные данные"}, status=400)
+    if not _sync_auth_ok(request, data):
+        return _login_json_response({"success": False, "error": "Forbidden"}, status=403)
+    uid = _resolve_sync_uid(data)
+    if not uid:
+        return _login_json_response({"success": False, "error": "Пользователь не найден"}, status=404)
+    refs = _normalize_sync_favorites(data.get("items"))
+    USER_FAVORITES[uid] = refs
+    users_touch(uid, "favorites_sync")
+    return _login_json_response({"success": True, "user_id": uid, "items": len(refs)})
+
+
+async def _http_sync_state(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return _login_json_response({"success": False, "error": "Некорректный JSON"}, status=400)
+    if not isinstance(data, dict):
+        return _login_json_response({"success": False, "error": "Некорректные данные"}, status=400)
+    if not _sync_auth_ok(request, data):
+        return _login_json_response({"success": False, "error": "Forbidden"}, status=403)
+    uid = _resolve_sync_uid(data)
+    if not uid:
+        return _login_json_response({"success": False, "error": "Пользователь не найден"}, status=404)
+    lines = _normalize_sync_cart_items(data.get("cart"))
+    refs = _normalize_sync_favorites(data.get("favorites"))
+    _cart_set_items_uid(uid, lines)
+    USER_FAVORITES[uid] = refs
+    users_touch(uid, "sync")
+    return _login_json_response(
+        {"success": True, "user_id": uid, "cart_items": len(lines), "favorite_items": len(refs)}
+    )
+
+
 def _illucards_site_base_url() -> str:
     return (
         os.getenv("ILLUCARDS_SITE_URL")
@@ -779,9 +907,15 @@ async def _run_login_http_api(bot) -> None:
     app.router.add_options("/api/send-code", _http_login_options)
     app.router.add_options("/api/verify-code", _http_login_options)
     app.router.add_options("/api/telegram-auth", _http_login_options)
+    app.router.add_options("/api/sync/cart", _http_login_options)
+    app.router.add_options("/api/sync/favorites", _http_login_options)
+    app.router.add_options("/api/sync/state", _http_login_options)
     app.router.add_post("/api/send-code", _http_send_code)
     app.router.add_post("/api/verify-code", _http_verify_code)
     app.router.add_post("/api/telegram-auth", _http_telegram_auth)
+    app.router.add_post("/api/sync/cart", _http_sync_cart)
+    app.router.add_post("/api/sync/favorites", _http_sync_favorites)
+    app.router.add_post("/api/sync/state", _http_sync_state)
     runner = web.AppRunner(app)
     await runner.setup()
     # Railway / Render / Heroku задают PORT — слушаем его на всех интерфейсах, иначе с сайта не достучаться.
@@ -801,8 +935,36 @@ async def _run_login_http_api(bot) -> None:
     stop = asyncio.Event()
     try:
         await stop.wait()
+    except asyncio.CancelledError:
+        raise
     finally:
         await runner.cleanup()
+
+
+async def post_shutdown(application: Application) -> None:
+    """Корректно гасим aiohttp-сервер входа, чтобы при деплое не оставались pending-task."""
+    log = logging.getLogger(__name__)
+    task = application.bot_data.get("login_http_api_task")
+    if isinstance(task, asyncio.Task) and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("Остановка HTTP API входа")
+    application.bot_data.pop("login_http_api_task", None)
+
+
+async def on_ptb_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    if isinstance(err, Conflict):
+        logging.getLogger(__name__).error(
+            "Telegram Conflict: уже идёт getUpdates с этим TELEGRAM_BOT_TOKEN. "
+            "Остановите второй инстанс (локальный python, второй сервис на Render/Railway, старый деплой)."
+        )
+        return
+    logging.getLogger(__name__).exception("Необработанная ошибка в обработчике", exc_info=err)
 
 
 ILLUCARDS_BASE = _illucards_site_base_url()
@@ -1333,8 +1495,17 @@ async def _notify_admin_new_order(
             disable_web_page_preview=True,
         )
     except Exception:
-        log.exception("Ошибка отправки заказа админу (order_id=%s)", order_id)
-        return None
+        log.exception("Ошибка отправки заказа в ORDER_NOTIFY_TARGET (order_id=%s)", order_id)
+        try:
+            m = await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=text,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            log.exception("Ошибка fallback-отправки заказа в ADMIN_ID (order_id=%s)", order_id)
+            return None
     ORDER_COUNTER = order_id + 1
     ORDERS[order_id] = {
         "user_id": uid,
@@ -2761,12 +2932,21 @@ async def on_deep_link_confirm_order(
             reply_markup=None,
         )
     except Exception as e:
-        log.exception("deep link order → admin: %s", e)
+        log.exception("deep link order → ORDER_NOTIFY_TARGET: %s", e)
         try:
-            await q.answer(MSG_ORDER_SUBMIT_ADMIN_FAIL, show_alert=True)
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=admin_body,
+                disable_web_page_preview=True,
+                reply_markup=None,
+            )
         except Exception:
-            pass
-        return
+            log.exception("deep link order fallback → ADMIN_ID")
+            try:
+                await q.answer(MSG_ORDER_SUBMIT_ADMIN_FAIL, show_alert=True)
+            except Exception:
+                pass
+            return
     ud.pop("pending_order", None)
     await q.answer()
     try:
@@ -4621,6 +4801,11 @@ async def post_init(application: Application) -> None:
     if me.username:
         print(f"https://t.me/{me.username}")
     try:
+        await application.bot.delete_webhook(drop_pending_updates=False)
+        log.info("Telegram: webhook снят (если был); дальше только polling")
+    except Exception:
+        log.exception("Telegram: не удалось вызвать delete_webhook")
+    try:
         _ensure_login_http_api_task(application)
     except Exception:
         log.exception("HTTP API входа на сайт не запущен")
@@ -4630,7 +4815,14 @@ def main() -> None:
     if not token:
         sys.exit("TELEGRAM_BOT_TOKEN is not set")
 
-    app = Application.builder().token(token).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+    app.add_error_handler(on_ptb_error)
 
     app.add_handler(
         TypeHandler(Update, track_user_activity, block=False),
