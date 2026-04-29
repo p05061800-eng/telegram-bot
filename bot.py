@@ -671,14 +671,14 @@ async def _http_verify_code(request: web.Request) -> web.Response:
             {"success": False, "error": "Некорректный JSON"},
             status=400,
         )
-    raw_u = data.get("username")
     code = str(data.get("code") or "").strip()
-    if not code or raw_u is None or str(raw_u).strip() == "":
+    raw_u = data.get("username")
+    key = _normalize_login_username(str(raw_u)) if raw_u is not None else ""
+    if not code:
         return _login_json_response(
-            {"success": False, "error": "Укажите username и код"},
+            {"success": False, "error": "Укажите код"},
             status=400,
         )
-    key = _normalize_login_username(str(raw_u))
     entry = LOGIN_CODES.get(code)
     if not entry:
         return _login_json_response(
@@ -695,7 +695,9 @@ async def _http_verify_code(request: web.Request) -> web.Response:
             {"success": False, "error": "Неверный код или срок действия истёк"},
             status=401,
         )
-    if str(entry.get("username") or "").lower() != key:
+    # Совместимость: часть страниц кабинета отправляет только 4-значный код без @username.
+    # Если username передан, проверяем его строго; если нет — достаточно валидного кода.
+    if key and str(entry.get("username") or "").lower() != key:
         return _login_json_response(
             {"success": False, "error": "Неверный код или username"},
             status=401,
