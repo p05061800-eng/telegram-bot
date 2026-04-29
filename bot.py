@@ -51,7 +51,19 @@ logging.basicConfig(
 )
 
 load_dotenv()
-token = os.getenv("TELEGRAM_BOT_TOKEN")
+
+
+def _normalize_bot_token(raw: Optional[str]) -> str:
+    """Render/панели часто добавляют пробелы или оборачивают значение в кавычки."""
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1].strip()
+    return s
+
+
+token = _normalize_bot_token(os.getenv("TELEGRAM_BOT_TOKEN"))
 
 
 def _env_int(name: str, default: int) -> int:
@@ -957,14 +969,15 @@ async def post_shutdown(application: Application) -> None:
 
 
 async def on_ptb_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log = logging.getLogger(__name__)
     err = context.error
     if isinstance(err, Conflict):
-        logging.getLogger(__name__).error(
+        log.error(
             "Telegram Conflict: уже идёт getUpdates с этим TELEGRAM_BOT_TOKEN. "
             "Остановите второй инстанс (локальный python, второй сервис на Render/Railway, старый деплой)."
         )
         return
-    logging.getLogger(__name__).exception("Необработанная ошибка в обработчике", exc_info=err)
+    log.error("Необработанная ошибка в обработчике: %s", err, exc_info=err)
 
 
 ILLUCARDS_BASE = _illucards_site_base_url()
@@ -4801,11 +4814,6 @@ async def post_init(application: Application) -> None:
     if me.username:
         print(f"https://t.me/{me.username}")
     try:
-        await application.bot.delete_webhook(drop_pending_updates=False)
-        log.info("Telegram: webhook снят (если был); дальше только polling")
-    except Exception:
-        log.exception("Telegram: не удалось вызвать delete_webhook")
-    try:
         _ensure_login_http_api_task(application)
     except Exception:
         log.exception("HTTP API входа на сайт не запущен")
@@ -4937,7 +4945,9 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, on_payment_proof_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Краткие сбои Telegram / наложение деплоев: повторить bootstrap (delete_webhook и т.д.).
+    poll_bootstrap_retries = _env_int("TELEGRAM_POLLING_BOOTSTRAP_RETRIES", 35)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=poll_bootstrap_retries)
 
 
 if __name__ == "__main__":
