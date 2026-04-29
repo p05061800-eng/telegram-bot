@@ -3,10 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <!-- Если страница открыта не с того же хоста, что и API бота, задайте полный URL (без слэша в конце): -->
-  <meta name="login-api-base" content="" />
+  <!-- Подставляется ботом при отдаче /login; на другом хосте задайте LOGIN_API_PUBLIC_URL на сервере или content вручную. -->
+  <meta name="login-api-base" content="__LOGIN_API_BASE__" />
   <!-- Куда перенаправлять после успешного входа -->
-  <meta name="post-login-redirect" content="https://illucards.by/catalog" />
+  <meta name="post-login-redirect" content="__POST_LOGIN_REDIRECT__" />
   <title>Вход — IlluCards</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 420px; margin: 2rem auto; padding: 0 1rem; }

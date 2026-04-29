@@ -719,6 +719,25 @@ def _illucards_site_base_url() -> str:
     ).strip().rstrip("/")
 
 
+def _login_api_base_meta(request: web.Request) -> str:
+    """Публичный URL API входа для meta login-api-base (CORS + verify на том же процессе, что выдал код)."""
+    explicit = (os.getenv("LOGIN_API_PUBLIC_URL") or "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "https").strip()
+    if "," in proto:
+        proto = proto.split(",", 1)[0].strip()
+    host = (
+        (request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or "")
+        .strip()
+    )
+    if "," in host:
+        host = host.split(",", 1)[0].strip()
+    if not host:
+        return ""
+    return f"{proto}://{host}".rstrip("/")
+
+
 async def _http_login_page(request: web.Request) -> web.Response:
     base = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(base, "web", "login.html")
@@ -733,7 +752,13 @@ async def _http_login_page(request: web.Request) -> web.Response:
             charset="utf-8",
         )
     bot_username = str(request.app.get("bot_username") or "").strip()
+    api_base = _login_api_base_meta(request)
+    post_login = (os.getenv("POST_LOGIN_REDIRECT") or "").strip()
+    if not post_login:
+        post_login = f"{_illucards_site_base_url()}/catalog"
     html = html.replace("__BOT_USERNAME__", bot_username)
+    html = html.replace("__LOGIN_API_BASE__", api_base)
+    html = html.replace("__POST_LOGIN_REDIRECT__", post_login)
     return web.Response(text=html, content_type="text/html", charset="utf-8")
 
 
@@ -757,11 +782,17 @@ async def _run_login_http_api(bot) -> None:
     app.router.add_post("/api/telegram-auth", _http_telegram_auth)
     runner = web.AppRunner(app)
     await runner.setup()
-    host = (os.getenv("LOGIN_API_HOST") or "127.0.0.1").strip()
+    # Railway / Render / Heroku задают PORT — слушаем его на всех интерфейсах, иначе с сайта не достучаться.
+    raw_port = (os.getenv("PORT") or os.getenv("LOGIN_API_PORT") or "8765").strip()
     try:
-        port = int(os.getenv("LOGIN_API_PORT", "8765"))
+        port = int(raw_port)
     except ValueError:
         port = 8765
+    host_raw = (os.getenv("LOGIN_API_HOST") or "").strip()
+    if host_raw:
+        host = host_raw
+    else:
+        host = "0.0.0.0" if os.getenv("PORT") else "127.0.0.1"
     site = web.TCPSite(runner, host=host, port=port)
     await site.start()
     log.info("Вход на сайт: HTTP %s:%s (/, /login, /api/send-code, /api/verify-code)", host, port)
@@ -4516,6 +4547,35 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await msg.reply_text(MSG_UNKNOWN_TEXT, reply_markup=REPLY_KB)
 
+
+def _ensure_login_http_api_task(application: Application) -> None:
+    """Держим HTTP API входа живым (может быть отменён при сбоях polling)."""
+    if os.getenv("LOGIN_API_DISABLE", "").strip() == "1":
+        return
+    log = logging.getLogger(__name__)
+    task = application.bot_data.get("login_http_api_task")
+    if isinstance(task, asyncio.Task) and not task.done():
+        return
+    if isinstance(task, asyncio.Task) and task.done():
+        try:
+            err = task.exception()
+        except asyncio.CancelledError:
+            err = "cancelled"
+        except Exception:
+            err = "unknown"
+        log.warning("HTTP API входа был остановлен (%s), перезапуск", err)
+    application.bot_data["login_http_api_task"] = asyncio.create_task(
+        _run_login_http_api(application.bot)
+    )
+    log.info("HTTP API входа запущен в фоне")
+
+
+async def login_http_api_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    if app:
+        _ensure_login_http_api_task(app)
+
+
 async def post_init(application: Application) -> None:
     log = logging.getLogger(__name__)
     log.info(
@@ -4547,16 +4607,21 @@ async def post_init(application: Application) -> None:
             first=30,
             name="crypto_auto_check",
         )
+        application.job_queue.run_repeating(
+            login_http_api_watchdog_job,
+            interval=20,
+            first=5,
+            name="login_http_api_watchdog",
+        )
         log.info("Крипто mock-проверка: каждые 30 с")
     print("Бот запущен!")
     me = await application.bot.get_me()
     if me.username:
         print(f"https://t.me/{me.username}")
-    if os.getenv("LOGIN_API_DISABLE", "").strip() != "1":
-        try:
-            asyncio.create_task(_run_login_http_api(application.bot))
-        except Exception:
-            log.exception("HTTP API входа на сайт не запущен")
+    try:
+        _ensure_login_http_api_task(application)
+    except Exception:
+        log.exception("HTTP API входа на сайт не запущен")
 
 
 def main() -> None:
