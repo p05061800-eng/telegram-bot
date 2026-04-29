@@ -730,10 +730,11 @@ async def _http_verify_code(request: web.Request) -> web.Response:
     if bot and uid and preview:
         SITE_LOGIN_PENDING_ORDER[uid] = preview
         try:
-            asyncio.create_task(_send_site_login_cart_order_message(bot, uid, preview))
-        except RuntimeError:
+            # await, а не create_task: иначе клиент может сразу уйти с страницы и задача не успевает.
+            await _send_site_login_cart_order_message(bot, uid, preview)
+        except Exception:
             logging.getLogger(__name__).exception(
-                "verify-code: не удалось запланировать отправку корзины user_id=%s",
+                "verify-code → не удалось отправить корзину в Telegram user_id=%s",
                 uid,
             )
     return _login_json_response(
