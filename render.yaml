@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: illucards-telegram-bot
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: LOGIN_API_DISABLE
+        value: "0"
+      - key: LOGIN_API_PUBLIC_URL
+        sync: false
+      - key: POST_LOGIN_REDIRECT
+        value: "https://illucards.by/catalog"
