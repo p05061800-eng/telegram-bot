@@ -135,6 +135,8 @@ async def _send_customer_plain(bot, user_id: int, text: str) -> bool:
 
 # Корзина и оформленные заказы в памяти процесса (ключ — Telegram user_id)
 USER_CART: dict = {}
+# После входа на сайт по коду: текст черновика до «Подтвердить / Отмена» (user_data может быть пуст)
+SITE_LOGIN_PENDING_ORDER: Dict[int, str] = {}
 USER_FAVORITES: dict = {}
 USER_ORDERS: dict = {}
 # Глобальный реестр заказов по порядковому id (память процесса)
@@ -718,6 +720,22 @@ async def _http_verify_code(request: web.Request) -> web.Response:
         )
     uid = int(entry.get("user_id") or 0)
     LOGIN_CODES.pop(code, None)
+    raw_cart = data.get("cart")
+    if isinstance(raw_cart, list) and raw_cart:
+        lines = _normalize_sync_cart_items(raw_cart)
+        _cart_set_items_uid(uid, lines)
+    del_cc = str(data.get("deliveryCountry") or data.get("delivery") or "BY").strip()
+    bot = request.app.get("bot")
+    preview = _format_login_site_cart_pending_text(uid, del_cc) if uid else ""
+    if bot and uid and preview:
+        SITE_LOGIN_PENDING_ORDER[uid] = preview
+        try:
+            asyncio.create_task(_send_site_login_cart_order_message(bot, uid, preview))
+        except RuntimeError:
+            logging.getLogger(__name__).exception(
+                "verify-code: не удалось запланировать отправку корзины user_id=%s",
+                uid,
+            )
     return _login_json_response(
         {
             "success": True,
@@ -763,10 +781,13 @@ def _normalize_sync_cart_items(raw_items: object) -> List[dict]:
     for x in raw_items:
         if not isinstance(x, dict):
             continue
-        name = str(x.get("name") or "—").strip() or "—"
+        name = str(x.get("name") or x.get("title") or "—").strip() or "—"
         ref = str(x.get("ref") or x.get("id") or name).strip()[:120]
         try:
-            price = int(float(x.get("price") or 0))
+            if x.get("priceByn") is not None:
+                price = int(float(x.get("priceByn") or 0))
+            else:
+                price = int(float(x.get("price") or 0))
         except (TypeError, ValueError):
             price = 0
         try:
@@ -1748,6 +1769,73 @@ def _format_cart_message(lines: List[dict]) -> str:
     if len(s) > 3900:
         s = s[:3890] + "…"
     return s
+
+
+def _format_login_site_cart_pending_text(uid: int, delivery_cc: str) -> str:
+    """Текст черновика заказа из корзины на сайте (после verify-code), для админа и кнопок в TG."""
+    lines = _cart_get_lines_uid(uid)
+    if not lines:
+        return ""
+    _, d_label, d_amt, d_cur = _delivery_option_for_site_code(delivery_cc)
+    goods, _ = _cart_totals(lines)
+    out: List[str] = []
+    for x in lines:
+        name = (x.get("name") or "—")[:200]
+        if len((x.get("name") or "")) > 200:
+            name = name.rstrip() + "…"
+        p = int(x.get("price") or 0)
+        q = int(x.get("qty") or 1)
+        if q <= 1:
+            out.append(f"• {name} — {p} BYN")
+        else:
+            out.append(f"• {name} — {p * q} BYN (×{q})")
+    out.append("")
+    out.append(f"🚚 Доставка: {d_label} (+{d_amt} {d_cur})")
+    if str(d_cur).upper() == "BYN":
+        out.append(f"💰 Итого: {goods + d_amt} BYN")
+    else:
+        out.append(f"💰 Товары: {goods} BYN; доставка: {d_amt} {d_cur}")
+    s = "\n".join(out)
+    if len(s) > 3500:
+        s = s[:3490] + "…"
+    return s
+
+
+async def _send_site_login_cart_order_message(bot, uid: int, preview_inner: str) -> None:
+    """Сообщение в Telegram после успешного входа на сайт по коду."""
+    log = logging.getLogger(__name__)
+    if not preview_inner.strip():
+        return
+    intro = (
+        "✅ Вход на сайт подтверждён.\n\n"
+        "Ниже — ваш заказ из корзины на сайте. Нажмите «Подтвердить заказ» — "
+        "увидит администратор. «Отмена» — без отправки."
+    )
+    body = f"{intro}\n\n{preview_inner.strip()}"
+    if len(body) > 4090:
+        body = body[:4082] + "…"
+    try:
+        await bot.send_message(
+            chat_id=int(uid),
+            text=body,
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Подтвердить заказ",
+                            callback_data="confirm_order",
+                        ),
+                        InlineKeyboardButton(
+                            "Отмена",
+                            callback_data="cancel_order",
+                        ),
+                    ],
+                ],
+            ),
+        )
+    except Exception:
+        log.exception("verify-code → не удалось отправить корзину user_id=%s", uid)
 
 
 def _format_user_orders_message(user_id: int) -> str:
@@ -2926,11 +3014,14 @@ async def on_deep_link_confirm_order(
     if (q.data or "").strip() != "confirm_order":
         return
     ud = context.user_data
+    u = q.from_user
+    uid_cb = int(u.id) if u else 0
     order_text = (ud.get("pending_order") or "").strip()
+    if not order_text and uid_cb:
+        order_text = (SITE_LOGIN_PENDING_ORDER.get(uid_cb) or "").strip()
     if not order_text:
         await _answer_order_callback_stale(q)
         return
-    u = q.from_user
     uname = f"@{u.username}" if u and u.username else "—"
     uid = u.id if u else "—"
     admin_body = "\n".join(["📦", "", order_text, "", f"👤 {uname} · {uid}"])
@@ -2961,6 +3052,8 @@ async def on_deep_link_confirm_order(
                 pass
             return
     ud.pop("pending_order", None)
+    if uid_cb:
+        SITE_LOGIN_PENDING_ORDER.pop(uid_cb, None)
     await q.answer()
     try:
         await q.message.edit_reply_markup(reply_markup=None)
@@ -2977,10 +3070,16 @@ async def on_deep_link_cancel_order(
     if (q.data or "").strip() != "cancel_order":
         return
     ud = context.user_data
-    if not (ud.get("pending_order") or "").strip():
+    u = q.from_user
+    uid_cb = int(u.id) if u else 0
+    has_ud = bool((ud.get("pending_order") or "").strip())
+    has_site = bool(uid_cb and (SITE_LOGIN_PENDING_ORDER.get(uid_cb) or "").strip())
+    if not has_ud and not has_site:
         await _answer_order_callback_stale(q)
         return
     ud.pop("pending_order", None)
+    if uid_cb:
+        SITE_LOGIN_PENDING_ORDER.pop(uid_cb, None)
     await q.answer()
     try:
         await q.message.edit_text(MSG_ORDER_PREVIEW_CANCELLED, reply_markup=None)
