@@ -509,6 +509,23 @@ PAY_ADMIN_REJECTED_CLIENT = "Чек не подошёл — пришлите, п
 # /start order_<id> или /start order-<id> (регистр не важен)
 _RE_START_ORDER_ARG = re.compile(r"^order[_-](.+)$", re.IGNORECASE)
 
+# Не слать подряд несколько одинаковых reply на «устаревший» callback (одни и те же кнопки).
+_LAST_CALLBACK_FALLBACK_CHAT: Dict[int, float] = {}
+
+
+def _message_shows_card_media(m: Optional[Message]) -> bool:
+    """Сообщение с картой для Tinder: фото, анимация или документ-картинка."""
+    if not m:
+        return False
+    if m.photo:
+        return True
+    if m.animation:
+        return True
+    d = m.document
+    if d and (d.mime_type or "").lower().startswith("image/"):
+        return True
+    return False
+
 
 async def _notify_callback_issue(
     q: Optional[CallbackQuery], context: ContextTypes.DEFAULT_TYPE
@@ -519,6 +536,12 @@ async def _notify_callback_issue(
         await q.answer()
     except Exception:
         pass
+    chat_id = int(q.message.chat_id) if q.message else 0
+    now = time.time()
+    if chat_id and now - _LAST_CALLBACK_FALLBACK_CHAT.get(chat_id, 0) < 45.0:
+        return
+    if chat_id:
+        _LAST_CALLBACK_FALLBACK_CHAT[chat_id] = now
     if q.message:
         try:
             await q.message.reply_text(FALLBACK_USER_TEXT)
@@ -3757,22 +3780,38 @@ async def on_tinder_swipe(
     if not m:
         return
     op = m.group(1)
-    if not q.message.photo and op != "f":
-        await _notify_callback_issue(q, context)
+    if not _message_shows_card_media(q.message) and op != "f":
+        try:
+            await q.answer(
+                "Сообщение без картинки — откройте каталог снова из меню внизу.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
         return
     ud = context.user_data
     _tinder_cancel_autoplay(ud)
     gixs: List[int] = list(ud.get("tinder_gidxs") or [])
     products: List[dict] = list(context.application.bot_data.get("products") or [])
     if not gixs or not products:
-        await _notify_callback_issue(q, context)
+        try:
+            await q.answer(
+                "Просмотр каталога сброшен (например, после обновления бота). "
+                "Нажмите «📦 Каталог» внизу и зайдите в раздел снова.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
         return
     n = len(gixs)
     if n == 0:
         return
     if op == "f":
-        if not q.message.photo:
-            await _notify_callback_issue(q, context)
+        if not _message_shows_card_media(q.message):
+            try:
+                await q.answer("Откройте каталог заново из меню.", show_alert=True)
+            except Exception:
+                pass
             return
         new_paused = not bool(ud.get("tinder_autoplay_paused", False))
         ud["tinder_autoplay_paused"] = new_paused
