@@ -1398,9 +1398,69 @@ async def fetch_home_page_promotions() -> Optional[List[dict]]:
     return _normalize_home_promotions_list(data)
 
 
+async def _fetch_home_promotions_scrape_fallback() -> Optional[List[dict]]:
+    """Если нет API JSON: взять rel=preload as=image из <head> главной (как на illucards.by)."""
+    if HOME_PROMOTIONS_SCRAPE_DISABLE:
+        return None
+    base = _illucards_site_base_url().strip()
+    if not base:
+        return None
+    log = logging.getLogger(__name__)
+    try:
+        to = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=to) as session:
+            async with session.get(
+                f"{base}/",
+                headers={"Accept": "text/html", "User-Agent": "IlluCardsBot/1.0"},
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                html = await resp.text()
+    except Exception:
+        log.debug("Акции: scrape главной — ошибка сети", exc_info=True)
+        return None
+    low = html.lower()
+    he = low.find("</head>")
+    chunk = html[:he] if he > 0 else html[:120000]
+    out: List[dict] = []
+    seen: set = set()
+    for m in re.finditer(r"<link[^>]+>", chunk, re.I):
+        tag = m.group(0)
+        tl = tag.lower()
+        if "preload" not in tl or "image" not in tl:
+            continue
+        hm = re.search(r'href\s*=\s*"([^"]+)"', tag, re.I) or re.search(
+            r"href\s*=\s*'([^']+)'", tag, re.I
+        )
+        if not hm:
+            continue
+        raw_h = hm.group(1).strip()
+        if not raw_h or raw_h in seen:
+            continue
+        if "/uploads/" not in raw_h and not raw_h.endswith((".webp", ".png", ".jpg", ".jpeg")):
+            continue
+        seen.add(raw_h)
+        img = _resolve_site_media_url(raw_h)
+        if not img:
+            continue
+        out.append({"image": img, "link": f"{base}/", "title": "", "order": len(out)})
+        if len(out) >= 8:
+            break
+    if not out:
+        return None
+    log.info("Акции: из HTML главной взято %d баннеров (preload)", len(out))
+    return out
+
+
 async def refresh_home_page_promotions_cache(application: Application) -> int:
     items = await fetch_home_page_promotions()
     if items is None:
+        if not HOME_PAGE_PROMOTIONS:
+            primed = await _fetch_home_promotions_scrape_fallback()
+            if primed:
+                apply_home_page_promotions(primed)
+                application.bot_data["home_promotions"] = list(HOME_PAGE_PROMOTIONS)
+                return len(primed)
         return len(HOME_PAGE_PROMOTIONS)
     apply_home_page_promotions(items)
     application.bot_data["home_promotions"] = list(HOME_PAGE_PROMOTIONS)
@@ -1557,6 +1617,10 @@ ILLUCARDS_BASE = _illucards_site_base_url()
 CARDS_JSON_URL = os.getenv("CARDS_JSON_URL", f"{ILLUCARDS_BASE}/api/products")
 # Публичный JSON витрины: [{ "image", "link?", "order?" }]; если пусто — только push с сайта POST /api/sync/promotions
 HOME_PROMOTIONS_JSON_URL = (os.getenv("HOME_PROMOTIONS_JSON_URL") or "").strip()
+# Если нет JSON URL и кэш пуст — один раз подтянуть preload-картинки из <head> главной (слайдер).
+HOME_PROMOTIONS_SCRAPE_DISABLE = str(
+    os.getenv("HOME_PROMOTIONS_SCRAPE_DISABLE") or ""
+).strip().lower() in ("1", "true", "yes", "on")
 SYNC_EVERY_SEC = _env_int("ILLUCARDS_SYNC_EVERY_SEC", 900)
 ORDER_DEEP_LINK_API_URL = os.getenv(
     "ORDER_DEEP_LINK_API_URL",

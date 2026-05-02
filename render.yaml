@@ -25,6 +25,7 @@ services:
         sync: false
       - key: POST_LOGIN_REDIRECT
         value: "https://www.illucards.by/account"
-      # Опционально: публичный JSON баннеров главной (иначе только POST /api/sync/promotions с сайта на бот).
+      # Опционально: публичный JSON баннеров главной (иначе POST /api/sync/promotions или scrape <head> главной).
       # - key: HOME_PROMOTIONS_JSON_URL
       #   sync: false
+      # Отключить подстановку баннеров из HTML главной: HOME_PROMOTIONS_SCRAPE_DISABLE=1
