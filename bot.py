@@ -183,6 +183,9 @@ USER_FAVORITES: dict = {}
 # Баннеры витрины с сайта (POST /api/sync/promotions с сайта или GET HOME_PROMOTIONS_JSON_URL)
 HOME_PAGE_PROMOTIONS: List[dict] = []
 USER_ORDERS: dict = {}
+# Бонусы с сайта: в POST /api/sync/cart, /api/sync/state и verify-code JSON передавайте
+# bonusPoints или bonusBalance, при начислении — bonusEarned / pointsEarned (см. _parse_site_loyalty_snapshot).
+USER_SITE_LOYALTY: Dict[int, dict] = {}
 # Глобальный реестр заказов по порядковому id (память процесса)
 # ORDERS[id] = { user_id, username, items, total, delivery, status, created_at, admin_* }
 # Переписка «адрес после оплаты»: user_states[uid]["postpaid_thread_oid"] = order_id →
@@ -841,6 +844,8 @@ async def _http_verify_code(request: web.Request) -> web.Response:
             )
         if "orders" in data:
             _user_orders_merge_site(uid, _normalize_sync_orders(data.get("orders")))
+        note_vc = _apply_site_loyalty_from_sync(uid, data)
+        _schedule_loyalty_notify(bot, uid, note_vc)
     preview = (
         _format_login_site_cart_pending_text(uid, del_cc, products) if uid else ""
     )
@@ -854,13 +859,18 @@ async def _http_verify_code(request: web.Request) -> web.Response:
                 "verify-code → не удалось отправить корзину в Telegram user_id=%s",
                 uid,
             )
-    return _login_json_response(
-        {
-            "success": True,
-            "user_id": uid,
-            "username": f"@{key}" if key else "",
-        },
-    )
+    resp_vc: Dict[str, object] = {
+        "success": True,
+        "user_id": uid,
+        "username": f"@{key}" if key else "",
+    }
+    lb_vc = USER_SITE_LOYALTY.get(uid, {}).get("balance") if uid else None
+    if lb_vc is not None:
+        try:
+            resp_vc["bonus_balance"] = int(lb_vc)
+        except (TypeError, ValueError):
+            pass
+    return _login_json_response(resp_vc)
 
 
 def _sync_auth_ok(request: web.Request, data: dict) -> bool:
@@ -890,6 +900,199 @@ def _resolve_sync_uid(data: dict) -> int:
         return int(USERNAME_TO_USER_ID.get(key) or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _coerce_loyalty_int(val: object) -> Optional[int]:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        if isinstance(val, str):
+            s = val.replace("\xa0", " ").replace(" ", "").replace(",", ".").strip()
+            if not s:
+                return None
+            v = float(s)
+        else:
+            v = float(val)
+        if v != v:
+            return None
+        return int(round(v))
+    except (TypeError, ValueError):
+        return None
+
+
+_LOYALTY_NEST_KEYS = (
+    "user",
+    "profile",
+    "account",
+    "loyalty",
+    "wallet",
+    "customer",
+    "me",
+    "member",
+    "auth",
+    "session",
+    "order",
+    "lastOrder",
+    "checkout",
+    "cart",
+)
+
+
+def _loyalty_find_int(data: dict, keys: Tuple[str, ...], depth: int) -> Optional[int]:
+    if not isinstance(data, dict) or depth < 0:
+        return None
+    for k in keys:
+        if k in data:
+            v = _coerce_loyalty_int(data.get(k))
+            if v is not None:
+                return v
+    for nest in _LOYALTY_NEST_KEYS:
+        sub = data.get(nest)
+        if isinstance(sub, dict):
+            v = _loyalty_find_int(sub, keys, depth - 1)
+            if v is not None:
+                return v
+    return None
+
+
+def _parse_site_loyalty_snapshot(data: dict) -> dict:
+    """Сайт может слать бонусы в sync/login JSON — поддерживаем несколько имён полей."""
+    if not isinstance(data, dict):
+        return {}
+    bal_k = (
+        "bonusBalance",
+        "bonus_balance",
+        "loyaltyBalance",
+        "loyalty_balance",
+        "bonusPoints",
+        "bonus_points",
+        "loyaltyPoints",
+        "loyalty_points",
+        "pointsBalance",
+        "walletBalance",
+        "userBonus",
+        "bonusesTotal",
+        "bonusWallet",
+        "cashbackBalance",
+    )
+    earned_k = (
+        "bonusEarned",
+        "bonus_earned",
+        "pointsEarned",
+        "loyaltyEarned",
+        "earnedBonus",
+        "bonusesAdded",
+        "orderBonusEarned",
+        "cashbackEarned",
+        "bonusEarnedThisOrder",
+        "pointsEarnedThisOrder",
+        "creditEarned",
+    )
+    msg = ""
+    for k in ("bonusMessage", "loyaltyMessage", "bonusNotice", "loyalty_note"):
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            msg = v.strip()[:500]
+            break
+    if not msg:
+        for nest in _LOYALTY_NEST_KEYS:
+            sub = data.get(nest)
+            if not isinstance(sub, dict):
+                continue
+            for k in ("bonusMessage", "loyaltyMessage", "bonusNotice"):
+                v = sub.get(k)
+                if isinstance(v, str) and v.strip():
+                    msg = v.strip()[:500]
+                    break
+            if msg:
+                break
+    return {
+        "balance": _loyalty_find_int(data, bal_k, 2),
+        "earned": _loyalty_find_int(data, earned_k, 2),
+        "message": msg,
+    }
+
+
+def _apply_site_loyalty_from_sync(uid: int, data: dict) -> Optional[str]:
+    """
+    Обновляет USER_SITE_LOYALTY. Возвращает текст для уведомления в Telegram,
+    если в payload есть положительное начисление (bonusEarned и т.п.).
+    """
+    if not uid:
+        return None
+    snap = _parse_site_loyalty_snapshot(data)
+    earned_i = snap.get("earned")
+    bal_i = snap.get("balance")
+    msg = str(snap.get("message") or "").strip()
+    prev = USER_SITE_LOYALTY.get(int(uid))
+    if not isinstance(prev, dict):
+        prev = {}
+    prev_bal = prev.get("balance")
+    try:
+        prev_bal_i = int(prev_bal) if prev_bal is not None else None
+    except (TypeError, ValueError):
+        prev_bal_i = None
+    notify: Optional[str] = None
+    if earned_i is not None and int(earned_i) > 0:
+        parts = [f"⭐ Начислено бонусов: +{int(earned_i)}"]
+        if bal_i is not None:
+            parts.append(f"На счёте: {int(bal_i)} бонусов.")
+        elif prev_bal_i is not None:
+            parts.append(f"На счёте: {int(prev_bal_i) + int(earned_i)} бонусов (оценка).")
+        if msg:
+            parts.append(msg)
+        notify = "\n".join(parts)
+    new_bal = bal_i if bal_i is not None else prev_bal_i
+    if new_bal is None and prev_bal_i is not None and earned_i is not None and earned_i > 0:
+        new_bal = int(prev_bal_i) + int(earned_i)
+    hint = msg or str(prev.get("hint") or "").strip()[:400]
+    USER_SITE_LOYALTY[int(uid)] = {
+        "balance": new_bal,
+        "hint": hint,
+        "updated": time.time(),
+        "last_earned": int(earned_i) if earned_i is not None and earned_i > 0 else prev.get("last_earned"),
+    }
+    return notify
+
+
+def _loyalty_cart_footer_lines(uid: int) -> List[str]:
+    rec = USER_SITE_LOYALTY.get(int(uid))
+    if not isinstance(rec, dict):
+        return []
+    out: List[str] = []
+    bal = rec.get("balance")
+    if bal is not None:
+        try:
+            out.append(f"⭐ Бонусный счёт: {int(bal)}")
+        except (TypeError, ValueError):
+            pass
+    hint = str(rec.get("hint") or "").strip()
+    if hint and len(hint) < 300:
+        out.append(hint)
+    return out
+
+
+async def _notify_loyalty_earned(bot, uid: int, text: str) -> None:
+    if not bot or not uid or not (text or "").strip():
+        return
+    log = logging.getLogger(__name__)
+    try:
+        await bot.send_message(
+            int(uid),
+            str(text).strip()[:3900],
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        log.exception("loyalty notify → uid=%s", uid)
+
+
+def _schedule_loyalty_notify(bot, uid: int, text: Optional[str]) -> None:
+    if not bot or not uid or not text:
+        return
+    try:
+        asyncio.get_running_loop().create_task(_notify_loyalty_earned(bot, int(uid), text))
+    except RuntimeError:
+        pass
 
 
 def _normalize_sync_cart_items(
@@ -1225,8 +1428,18 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
     _cart_set_items_uid(uid, lines)
     _cart_apply_site_pricing_hints(uid, data)
     _apply_optional_favorites_from_site_payload(uid, data, products)
+    note_loy = _apply_site_loyalty_from_sync(uid, data)
+    bot_loy = request.app.get("bot")
+    _schedule_loyalty_notify(bot_loy, uid, note_loy)
     users_touch(uid, "cart_sync")
-    return _login_json_response({"success": True, "user_id": uid, "items": len(lines)})
+    body_loy: Dict[str, object] = {"success": True, "user_id": uid, "items": len(lines)}
+    lb_loy = USER_SITE_LOYALTY.get(uid, {}).get("balance")
+    if lb_loy is not None:
+        try:
+            body_loy["bonus_balance"] = int(lb_loy)
+        except (TypeError, ValueError):
+            pass
+    return _login_json_response(body_loy)
 
 
 async def _http_sync_favorites(request: web.Request) -> web.Response:
@@ -1293,6 +1506,9 @@ async def _http_sync_state(request: web.Request) -> web.Response:
         hp_items = _normalize_home_promotions_list(raw_hp if raw_hp is not None else [])
         apply_home_page_promotions(hp_items)
         hp_n = len(HOME_PAGE_PROMOTIONS)
+    note_st = _apply_site_loyalty_from_sync(uid, data)
+    bot_st = request.app.get("bot")
+    _schedule_loyalty_notify(bot_st, uid, note_st)
     users_touch(uid, "sync")
     body = {
         "success": True,
@@ -1303,6 +1519,12 @@ async def _http_sync_state(request: web.Request) -> web.Response:
     }
     if hp_n >= 0:
         body["home_promotions"] = hp_n
+    lb_st = USER_SITE_LOYALTY.get(uid, {}).get("balance")
+    if lb_st is not None:
+        try:
+            body["bonus_balance"] = int(lb_st)
+        except (TypeError, ValueError):
+            pass
     return _login_json_response(body)
 
 
@@ -2720,6 +2942,11 @@ def _format_payment_receipt_text(order_id: int, o: dict) -> str:
             "🙏 Спасибо за покупку!",
         ]
     )
+    cust_rc = int(o.get("user_id") or 0)
+    foot_rc = _loyalty_cart_footer_lines(cust_rc)
+    if foot_rc:
+        lines.append("")
+        lines.extend(foot_rc)
     body = "\n".join(lines)
     if len(body) > 4090:
         body = body[:4086] + "…"
@@ -3052,6 +3279,10 @@ def _format_cart_message(
         out += ["", f"💰 Итого (как на сайте, с доставкой): {site_gt} {cur}"]
     else:
         out += ["", f"💰 Итого: {total} {cur}"]
+    foot_loy = _loyalty_cart_footer_lines(cart_uid)
+    if foot_loy:
+        out.append("")
+        out.extend(foot_loy)
     s = "\n".join(out)
     if len(s) > 3900:
         s = s[:3890] + "…"
@@ -3107,6 +3338,10 @@ def _format_login_site_cart_pending_text(
     else:
         out.append(f"🚚 Доставка: {d_label} (+{d_amt} {d_cur})")
         out.append(f"💰 Товары: {goods} {g_cur}; доставка: {d_amt} {d_cur}")
+    foot_pv = _loyalty_cart_footer_lines(uid)
+    if foot_pv:
+        out.append("")
+        out.extend(foot_pv)
     s = "\n".join(out)
     if len(s) > 3500:
         s = s[:3490] + "…"
