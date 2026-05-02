@@ -2484,7 +2484,7 @@ def _format_admin_order_detail_text(order_id: int, o: dict) -> str:
     d = o.get("delivery") if isinstance(o.get("delivery"), dict) else None
     line_cur = _order_line_currency_from_delivery(d)
     items_block = _format_order_items_for_admin(list(o.get("items") or []), line_cur)
-    tot = int(o.get("total") or 0)
+    tot = _order_resolved_grand_total(o)
     st = str(o.get("status") or "new")
     st_ru = _order_status_label_ru(st)
     dline = _format_delivery_block(d)
@@ -2657,10 +2657,7 @@ def _payment_total_label(o: dict) -> str:
     d = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
     cur = str(d.get("currency") or "BYN")
     cc = str(d.get("country") or "").strip().lower()
-    try:
-        stored = int(o.get("total") or 0)
-    except (TypeError, ValueError):
-        stored = 0
+    stored = _order_resolved_grand_total(o)
     g_cur = _goods_currency_for_delivery_country(cc)
     if stored > 0:
         if cc == "by" and cur == "BYN":
@@ -2700,7 +2697,6 @@ def _format_payment_receipt_text(order_id: int, o: dict) -> str:
         cc = str(d.get("country") or "").strip().lower()
         opt = DELIVERY_OPTIONS.get(cc)
         dline = f"🚚 {opt[0]}" if opt else ""
-    tot = int(o.get("total") or 0)
     lines: List[str] = [
         "📄 Чек:",
         "",
@@ -2715,7 +2711,7 @@ def _format_payment_receipt_text(order_id: int, o: dict) -> str:
     else:
         lines.append("🚚 Доставка: —")
     lines.append("")
-    lines.append(f"💰 Сумма: {tot} {line_cur}")
+    lines.append(f"💰 Сумма: {_order_resolved_grand_total(o)} {line_cur}")
     lines.extend(
         [
             "",
@@ -2978,6 +2974,36 @@ def _cart_totals(lines: List[dict]) -> Tuple[int, int]:
     return t, n
 
 
+def _order_computed_grand_total(o: dict) -> int:
+    """Итог по строкам заказа + сумма доставки (без доверия к полю total из внешнего JSON)."""
+    goods, _ = _cart_totals(list(o.get("items") or []))
+    d = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
+    try:
+        d_amt = int(d.get("amount") or 0)
+    except (TypeError, ValueError):
+        d_amt = 0
+    return max(0, int(goods) + int(d_amt))
+
+
+def _order_resolved_grand_total(o: dict) -> int:
+    """Итог для отображения и ORDERS: при явном расхождении с позициями — исправляем o['total']."""
+    comp = _order_computed_grand_total(o)
+    try:
+        stored = int(o.get("total") or 0)
+    except (TypeError, ValueError):
+        stored = 0
+    if comp <= 0:
+        return max(0, stored)
+    if stored <= 0:
+        o["total"] = int(comp)
+        return int(comp)
+    tol = max(100, max(comp, stored) // 15)
+    if abs(stored - comp) > tol:
+        o["total"] = int(comp)
+        return int(comp)
+    return int(stored)
+
+
 def _format_cart_message(
     lines: List[dict],
     user_data: Optional[dict] = None,
@@ -3224,7 +3250,7 @@ def _format_mine_orders_text_and_kb(
     ]
     rows: List[List[InlineKeyboardButton]] = []
     for oid, o in reg[:25]:
-        tot = int(o.get("total") or 0)
+        tot = _order_resolved_grand_total(o)
         st = str(o.get("status") or "new")
         badge = _user_order_status_badge(st)
         cur = _order_line_currency_from_delivery(
@@ -3264,7 +3290,7 @@ def _format_user_order_detail(order_id: object, o: dict) -> str:
     drec = o.get("delivery") if isinstance(o.get("delivery"), dict) else None
     line_cur = _order_line_currency_from_delivery(drec)
     items_block = _format_order_items_for_admin(list(o.get("items") or []), line_cur)
-    tot = int(o.get("total") or 0)
+    tot = _order_resolved_grand_total(o)
     st = str(o.get("status") or "new")
     sk = "canceled" if st == "cancelled" else st
     st_ru = _order_status_label_ru(sk)
@@ -5003,12 +5029,20 @@ async def on_deep_link_structured_submit(
         "delivery": deepcopy(drec),
         "status": "В обработке",
     }
+    baseline_dl = int(goods_total) + int(d_amt)
     try:
         external_total = int(round(float(order.get("total"))))
     except (TypeError, ValueError):
         external_total = 0
     if external_total > 0:
-        order_rec["total"] = external_total
+        if baseline_dl > 0:
+            tol_dl = max(100, baseline_dl // 25)
+            if abs(int(external_total) - int(baseline_dl)) <= tol_dl:
+                order_rec["total"] = int(external_total)
+            else:
+                order_rec["total"] = int(baseline_dl)
+        else:
+            order_rec["total"] = int(external_total)
         pay_cur_dl = (
             "BYN" if str(drec.get("country") or "").strip().lower() == "by" else "RUB"
         )
@@ -5088,7 +5122,7 @@ def _kb_admin_orders_list() -> Optional[InlineKeyboardMarkup]:
     rows: List[List[InlineKeyboardButton]] = []
     for oid in sorted(ORDERS.keys(), key=lambda k: int(k)):
         o = ORDERS[oid]
-        tot = int(o.get("total") or 0)
+        tot = _order_resolved_grand_total(o)
         cur_l = _order_line_currency_from_delivery(
             o.get("delivery") if isinstance(o.get("delivery"), dict) else None
         )
@@ -5126,10 +5160,7 @@ def _format_admin_stats() -> str:
             ts = 0.0
         if ts > 0 and datetime.fromtimestamp(ts).date() == today_local:
             today_count += 1
-        try:
-            tot = int(o.get("total") or 0)
-        except (TypeError, ValueError):
-            tot = 0
+        tot = _order_resolved_grand_total(o)
         if raw_st not in ("canceled", "cancelled"):
             d_st = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
             if str(d_st.get("country") or "").strip().lower() == "by":
@@ -5221,7 +5252,7 @@ async def on_admin_panel_action(
             body_lines: List[str] = ["📦 Заказы", "", "Выберите заказ 👇", ""]
             for oid in sorted(ORDERS.keys(), key=int):
                 o = ORDERS[oid]
-                tot = int(o.get("total") or 0)
+                tot = _order_resolved_grand_total(o)
                 cur_o = _order_line_currency_from_delivery(
                     o.get("delivery") if isinstance(o.get("delivery"), dict) else None
                 )
@@ -5403,6 +5434,11 @@ async def on_order_status_buttons(
         await _refresh_admin_order_message(context, oid)
         return
     o["status"] = want
+    if want == "accepted" and st_norm != want:
+        cuid = int(o.get("user_id") or 0)
+        if cuid:
+            _cart_clear_uid(cuid)
+            _cart_clear_site_pricing_hints(cuid)
     if want in ("done", "canceled"):
         cuid = int(o.get("user_id") or 0)
         if cuid:
@@ -6247,7 +6283,7 @@ async def on_checkout_nav_back(
         o.pop("payment_pending_method", None)
         ud.pop("payment_pending_method", None)
         _clear_crypto_auto_watch(o, uid)
-        tot = int(o.get("total") or 0)
+        tot = _order_resolved_grand_total(o)
         d = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
         pay_cur = _order_line_currency_from_delivery(d)
         try:
@@ -6448,6 +6484,10 @@ async def on_send_order_to_admin(
     goods_total, _ = _cart_totals(list(lines))
     site_gt = _cart_get_site_grand_total(uid, pay_cur)
     inc = _cart_site_delivery_included(uid)
+    if inc:
+        baseline_total = int(goods_total)
+    else:
+        baseline_total = int(goods_total) + int(d_amt)
     order_rec = {
         "id": "0",
         "items": deepcopy(list(lines)),
@@ -6456,7 +6496,13 @@ async def on_send_order_to_admin(
         "delivery": drec,
         "status": "В обработке",
     }
-    if site_gt and site_gt > 0:
+    if site_gt and site_gt > 0 and baseline_total > 0:
+        tol = max(100, baseline_total // 25)
+        if abs(int(site_gt) - int(baseline_total)) <= tol:
+            order_rec["total"] = int(site_gt)
+        else:
+            order_rec["total"] = int(baseline_total)
+    elif site_gt and site_gt > 0:
         order_rec["total"] = int(site_gt)
     elif inc:
         order_rec["total"] = int(goods_total)
