@@ -1,4 +1,6 @@
-# UptimeRobot: HTTP(S) → https://<имя-сервиса>.onrender.com/health
+# Health: Render шлёт HEAD / на PORT — отвечаем 200 на / и на /health (UptimeRobot тоже может дергать /health).
+# Прод: ILLUCARDS_SITE_ORIGIN = https://www.illucards.by (как на Vercel).
+# ILLUCARDS_ORDER_UPDATE_SECRET — тот же секрет, что в Vercel; иначе GET /api/order/{id} и POST /api/order/update дадут 401.
 services:
   - type: web
     name: illucards-telegram-bot
@@ -8,6 +10,10 @@ services:
     autoDeploy: true
     envVars:
       - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ILLUCARDS_SITE_ORIGIN
+        sync: false
+      - key: ILLUCARDS_ORDER_UPDATE_SECRET
         sync: false
       - key: UPSTASH_REDIS_REST_URL
         sync: false
@@ -19,3 +25,6 @@ services:
         sync: false
       - key: POST_LOGIN_REDIRECT
         value: "https://www.illucards.by/account"
+      # Опционально: публичный JSON баннеров главной (иначе только POST /api/sync/promotions с сайта на бот).
+      # - key: HOME_PROMOTIONS_JSON_URL
+      #   sync: false

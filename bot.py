@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
 import aiohttp
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from aiohttp import web
 from telegram import (
     CallbackQuery,
@@ -85,9 +85,16 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _start_flask_health_server() -> None:
-    """Минимальный HTTP-сервер для Render healthcheck (GET /health)."""
+    """Минимальный HTTP-сервер для Render: проверка по / (HEAD/GET) и /health."""
     log = logging.getLogger(__name__)
     app = Flask("health_server")
+
+    @app.route("/", methods=("GET", "HEAD"))
+    def root() -> tuple:
+        # Render по умолчанию шлёт HEAD / на PORT — без маршрута был 404 в логах.
+        if request.method == "HEAD":
+            return "", 200
+        return jsonify({"ok": True}), 200
 
     @app.get("/health")
     def health() -> tuple:
@@ -173,7 +180,7 @@ USER_CART: dict = {}
 # После входа на сайт по коду: текст черновика до «Подтвердить / Отмена» (user_data может быть пуст)
 SITE_LOGIN_PENDING_ORDER: Dict[int, str] = {}
 USER_FAVORITES: dict = {}
-# Баннеры «Акции на главной» с сайта (синк push или GET HOME_PROMOTIONS_JSON_URL)
+# Баннеры витрины с сайта (POST /api/sync/promotions с сайта или GET HOME_PROMOTIONS_JSON_URL)
 HOME_PAGE_PROMOTIONS: List[dict] = []
 USER_ORDERS: dict = {}
 # Глобальный реестр заказов по порядковому id (память процесса)
@@ -396,7 +403,12 @@ MSG_CATALOG_EMPTY_SECTION = (
     "В этом разделе сейчас нет карточек. Загляните в другой раздел или в акции."
 )
 MSG_VIEWER_FAIL = "Не удалось открыть просмотр карточек. Попробуйте снова из каталога."
-MSG_NO_HOT_PRICE_CARDS = "Сейчас в разделе «Горячая цена» нет карточек. Загляните позже 👀"
+MSG_NO_VITRINA_PROMOS = (
+    "Сейчас в боте нет баннеров акций с главной сайта (слайдер под категориями).\n\n"
+    "Бот подгружает их с API сайта и из POST /api/sync/promotions. "
+    "Зайдите на сайт или попробуйте позже. Если JSON по другому URL — задайте "
+    "HOME_PROMOTIONS_JSON_URL на хостинге 👀"
+)
 MSG_PROMO_PARTICIPATION = "Для участия в акции пришлите нам видео с уже имеющимися карточками."
 MSG_ADD_TO_CART_STALE = "Эта карточка устарела в текущем сообщении. Откройте каталог заново и добавьте ещё раз."
 MSG_BUY_HINT = "Можно написать: купить <категория> <номер> или купить <название карточки>."
@@ -764,7 +776,7 @@ async def _http_verify_code(request: web.Request) -> web.Response:
     raw_cart = data.get("cart")
     lines: List[dict] = []
     if isinstance(raw_cart, list) and raw_cart:
-        lines = _normalize_sync_cart_items(raw_cart)
+        lines = _normalize_sync_cart_items(raw_cart, bot_code)
     bot = request.app.get("bot")
     products: List[dict] = []
     try:
@@ -772,15 +784,19 @@ async def _http_verify_code(request: web.Request) -> web.Response:
     except Exception:
         products = []
     if products and lines:
-        _reprice_lines_for_delivery(lines, products, bot_code)
+        _reconcile_cart_lines_to_catalog(products, lines)
     if lines:
         _cart_set_items_uid(uid, lines)
     if uid:
         _cart_apply_site_pricing_hints(uid, data)
         if isinstance(data.get("favorites"), list):
-            USER_FAVORITES[uid] = _normalize_sync_favorites(data.get("favorites"))
+            USER_FAVORITES[uid] = _normalize_sync_favorites_with_catalog(
+                data.get("favorites"), products
+            )
         elif isinstance(data.get("favoriteItems"), list):
-            USER_FAVORITES[uid] = _normalize_sync_favorites(data.get("favoriteItems"))
+            USER_FAVORITES[uid] = _normalize_sync_favorites_with_catalog(
+                data.get("favoriteItems"), products
+            )
         if "orders" in data:
             _user_orders_merge_site(uid, _normalize_sync_orders(data.get("orders")))
     preview = (
@@ -834,22 +850,49 @@ def _resolve_sync_uid(data: dict) -> int:
         return 0
 
 
-def _normalize_sync_cart_items(raw_items: object) -> List[dict]:
+def _normalize_sync_cart_items(
+    raw_items: object, delivery_bot_code: Optional[str] = None
+) -> List[dict]:
     out: List[dict] = []
     if not isinstance(raw_items, list):
         return out
+    cc = str(delivery_bot_code or "by").strip().lower()
+    if cc not in DELIVERY_OPTIONS:
+        cc = "by"
+    prefer_rub = cc != "by"
     for x in raw_items:
         if not isinstance(x, dict):
             continue
         name = str(x.get("name") or x.get("title") or "—").strip() or "—"
         ref = str(x.get("ref") or x.get("id") or name).strip()[:120]
         try:
-            if x.get("priceByn") is not None:
-                price = int(float(x.get("priceByn") or 0))
-            elif x.get("priceRub") is not None:
-                price = int(float(x.get("priceRub") or 0))
+            if prefer_rub:
+                # Для RU/UA/OT сайт часто шлёт цену в RUB в поле price без priceRub;
+                # priceByn не брать раньше price — иначе в корзине окажутся «белорусские» цифры с подписью RUB.
+                price = 0
+                if x.get("priceRub") is not None:
+                    price = int(float(x.get("priceRub") or 0))
+                if price <= 0:
+                    for k in ("unitPriceRub", "unit_price_rub", "salePriceRub"):
+                        if x.get(k) is not None:
+                            price = int(float(x.get(k) or 0))
+                            if price > 0:
+                                break
+                if price <= 0:
+                    for k in ("price", "unitPrice", "unit_price"):
+                        if x.get(k) is not None:
+                            price = int(float(x.get(k) or 0))
+                            if price > 0:
+                                break
+                if price <= 0 and x.get("priceByn") is not None:
+                    price = int(float(x.get("priceByn") or 0))
             else:
-                price = int(float(x.get("price") or 0))
+                if x.get("priceByn") is not None:
+                    price = int(float(x.get("priceByn") or 0))
+                elif x.get("priceRub") is not None:
+                    price = int(float(x.get("priceRub") or 0))
+                else:
+                    price = int(float(x.get("price") or 0))
         except (TypeError, ValueError):
             price = 0
         try:
@@ -857,7 +900,17 @@ def _normalize_sync_cart_items(raw_items: object) -> List[dict]:
         except (TypeError, ValueError):
             qty = 1
         qty = max(1, min(qty, 999))
-        out.append({"ref": ref, "name": name[:200], "price": max(0, price), "qty": qty})
+        lc = _goods_currency_for_delivery_country(cc)
+        out.append(
+            {
+                "ref": ref,
+                "name": name[:200],
+                "price": max(0, price),
+                "qty": qty,
+                "from_site": True,
+                "line_currency": lc,
+            }
+        )
     return out
 
 
@@ -876,6 +929,140 @@ def _normalize_sync_favorites(raw_items: object) -> List[str]:
         seen.add(ref)
         refs.append(ref)
     return refs
+
+
+def _favorites_list_from_sync_favorites_endpoint(
+    data: dict, products: Optional[List[dict]] = None
+) -> List[str]:
+    """Тело POST /api/sync/favorites: списки избранного с сайта → ref каталога (по id или названию)."""
+    for key in (
+        "items",
+        "favorites",
+        "favoriteItems",
+        "favorite_list",
+        "favoriteList",
+        "wishlist",
+        "wishList",
+        "likedProducts",
+    ):
+        raw = data.get(key)
+        if isinstance(raw, list):
+            return _normalize_sync_favorites_with_catalog(raw, products)
+    return []
+
+
+def _apply_optional_favorites_from_site_payload(
+    uid: int, data: dict, products: Optional[List[dict]] = None
+) -> bool:
+    """Если в JSON явно передан список favorites или favoriteItems — обновить избранное. Иначе не трогаем."""
+    if not uid:
+        return False
+    for key in (
+        "favorites",
+        "favoriteItems",
+        "favorite_list",
+        "favoriteList",
+        "wishlist",
+        "wishList",
+        "likedProducts",
+    ):
+        if key in data and isinstance(data.get(key), list):
+            USER_FAVORITES[uid] = _normalize_sync_favorites_with_catalog(
+                data[key], products
+            )
+            return True
+    return False
+
+
+def _catalog_name_key(raw: object) -> str:
+    s = re.sub(r"\s+", " ", str(raw or "").strip()).casefold()
+    return s
+
+
+def _find_product_by_catalog_name(
+    products: List[dict], raw_name: str
+) -> Optional[dict]:
+    key = _catalog_name_key(raw_name)
+    if not key:
+        return None
+    for p in products:
+        pn = _catalog_name_key(p.get("name"))
+        if pn and pn == key:
+            return p
+    return None
+
+
+def _resolve_favorite_sync_entry_to_ref(
+    entry: object, products: List[dict]
+) -> Optional[str]:
+    """Сопоставить элемент избранного с сайта с карточкой каталога (id/ref или название)."""
+    if not products:
+        return None
+    if isinstance(entry, str):
+        s = str(entry).strip()
+        if not s:
+            return None
+        p = _product_from_callback(s, products)
+        if p:
+            return _product_ref_for_callback(p, _global_product_index(products, p))
+        p = _find_product_by_catalog_name(products, s)
+        if p:
+            return _product_ref_for_callback(p, _global_product_index(products, p))
+        return None
+    if isinstance(entry, dict):
+        for key in ("ref", "id", "productId", "externalId", "product_id"):
+            if key not in entry:
+                continue
+            s = str(entry.get(key) or "").strip()
+            if not s:
+                continue
+            p = _product_from_callback(s, products)
+            if p:
+                return _product_ref_for_callback(p, _global_product_index(products, p))
+        for nk in ("name", "title", "label", "productName"):
+            if nk not in entry:
+                continue
+            p = _find_product_by_catalog_name(products, str(entry.get(nk) or ""))
+            if p:
+                return _product_ref_for_callback(p, _global_product_index(products, p))
+        return None
+    return None
+
+
+def _normalize_sync_favorites_with_catalog(
+    raw_items: object, products: Optional[List[dict]]
+) -> List[str]:
+    if not isinstance(raw_items, list):
+        return []
+    if not products:
+        return _normalize_sync_favorites(raw_items)
+    seen: set = set()
+    out: List[str] = []
+    for x in raw_items:
+        r = _resolve_favorite_sync_entry_to_ref(x, products)
+        if r and r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def _reconcile_cart_lines_to_catalog(products: List[dict], lines: List[dict]) -> None:
+    """Подставить ref/имя строк корзины с сайта к id карточек каталога (в т.ч. по названию)."""
+    if not products or not lines:
+        return
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        ref = str(line.get("ref") or "").strip()
+        name = str(line.get("name") or "").strip()
+        p = _product_from_callback(ref, products) if ref else None
+        if not p and name:
+            p = _find_product_by_catalog_name(products, name)
+        if not p and ref:
+            p = _find_product_by_catalog_name(products, ref)
+        if p:
+            line["ref"] = _product_ref_for_callback(p, _global_product_index(products, p))
+            line["name"] = str(p.get("name") or name or "—")[:200]
 
 
 def _normalize_sync_delivery(raw: object) -> dict:
@@ -905,8 +1092,22 @@ def _normalize_sync_site_order(raw: object) -> Optional[dict]:
     ).strip()
     if not ext:
         return None
-    lines = _normalize_sync_cart_items(raw.get("items") or raw.get("lines") or [])
     drec = _normalize_sync_delivery(raw.get("delivery") or raw.get("shipping") or {})
+    dc_raw = ""
+    if isinstance(raw.get("delivery"), dict):
+        dc_raw = str(
+            raw.get("delivery", {}).get("country")
+            or raw.get("delivery", {}).get("code")
+            or ""
+        ).strip()
+    if not dc_raw:
+        dc_raw = str(
+            raw.get("deliveryCountry") or raw.get("delivery_country") or "BY"
+        ).strip()
+    order_bot_code, _, _, _ = _delivery_option_for_site_code(dc_raw or "BY")
+    lines = _normalize_sync_cart_items(
+        raw.get("items") or raw.get("lines") or [], order_bot_code
+    )
     try:
         total_goods, _ = _cart_totals(lines)
     except Exception:
@@ -969,18 +1170,19 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
     uid = _resolve_sync_uid(data)
     if not uid:
         return _login_json_response({"success": False, "error": "Пользователь не найден"}, status=404)
-    lines = _normalize_sync_cart_items(data.get("items"))
     del_raw = data.get("deliveryCountry") or data.get("delivery_country")
     bot_code, _, _, _ = _delivery_option_for_site_code(str(del_raw or "BY"))
+    lines = _normalize_sync_cart_items(data.get("items"), bot_code)
     _remember_user_delivery_country(uid, bot_code)
     try:
         products = await load_products()
     except Exception:
         products = []
     if products and lines:
-        _reprice_lines_for_delivery(lines, products, bot_code)
+        _reconcile_cart_lines_to_catalog(products, lines)
     _cart_set_items_uid(uid, lines)
     _cart_apply_site_pricing_hints(uid, data)
+    _apply_optional_favorites_from_site_payload(uid, data, products)
     users_touch(uid, "cart_sync")
     return _login_json_response({"success": True, "user_id": uid, "items": len(lines)})
 
@@ -997,9 +1199,16 @@ async def _http_sync_favorites(request: web.Request) -> web.Response:
     uid = _resolve_sync_uid(data)
     if not uid:
         return _login_json_response({"success": False, "error": "Пользователь не найден"}, status=404)
-    refs = _normalize_sync_favorites(data.get("items"))
+    try:
+        products = await load_products()
+    except Exception:
+        products = []
+    refs = _favorites_list_from_sync_favorites_endpoint(data, products)
     USER_FAVORITES[uid] = refs
     users_touch(uid, "favorites_sync")
+    logging.getLogger(__name__).info(
+        "sync/favorites: user_id=%s позиций=%s", uid, len(refs)
+    )
     return _login_json_response({"success": True, "user_id": uid, "items": len(refs)})
 
 
@@ -1015,20 +1224,20 @@ async def _http_sync_state(request: web.Request) -> web.Response:
     uid = _resolve_sync_uid(data)
     if not uid:
         return _login_json_response({"success": False, "error": "Пользователь не найден"}, status=404)
-    lines = _normalize_sync_cart_items(data.get("cart"))
     del_raw = data.get("deliveryCountry") or data.get("delivery_country")
     bot_code, _, _, _ = _delivery_option_for_site_code(str(del_raw or "BY"))
+    lines = _normalize_sync_cart_items(data.get("cart"), bot_code)
     _remember_user_delivery_country(uid, bot_code)
     try:
         products = await load_products()
     except Exception:
         products = []
     if products and lines:
-        _reprice_lines_for_delivery(lines, products, bot_code)
-    refs = _normalize_sync_favorites(data.get("favorites"))
+        _reconcile_cart_lines_to_catalog(products, lines)
+    _apply_optional_favorites_from_site_payload(uid, data, products)
     _cart_set_items_uid(uid, lines)
     _cart_apply_site_pricing_hints(uid, data)
-    USER_FAVORITES[uid] = refs
+    fav_n = len(USER_FAVORITES.get(uid) or [])
     n_site_orders = 0
     if "orders" in data:
         site_orders = _normalize_sync_orders(data.get("orders"))
@@ -1047,7 +1256,7 @@ async def _http_sync_state(request: web.Request) -> web.Response:
         "success": True,
         "user_id": uid,
         "cart_items": len(lines),
-        "favorite_items": len(refs),
+        "favorite_items": fav_n,
         "orders": n_site_orders,
     }
     if hp_n >= 0:
@@ -1056,8 +1265,10 @@ async def _http_sync_state(request: web.Request) -> web.Response:
 
 
 def _illucards_site_base_url() -> str:
+    """Базовый URL прод-сайта: ILLUCARDS_SITE_ORIGIN (как на Vercel), затем ILLUCARDS_SITE_URL."""
     return (
-        os.getenv("ILLUCARDS_SITE_URL")
+        os.getenv("ILLUCARDS_SITE_ORIGIN")
+        or os.getenv("ILLUCARDS_SITE_URL")
         or os.getenv("NEXT_PUBLIC_SITE_URL")
         or "https://www.illucards.by"
     ).strip().rstrip("/")
@@ -1100,18 +1311,29 @@ def _normalize_home_promotions_list(raw: object) -> List[dict]:
     for i, x in enumerate(raw):
         if not isinstance(x, dict):
             continue
-        img = _resolve_site_media_url(
-            str(
-                x.get("image")
-                or x.get("imageUrl")
-                or x.get("src")
-                or x.get("photo")
-                or ""
-            ).strip()
+        img_raw = (
+            x.get("image")
+            or x.get("imageUrl")
+            or x.get("image_url")
+            or x.get("src")
+            or x.get("photo")
+            or x.get("banner")
+            or x.get("bannerUrl")
+            or x.get("banner_url")
+            or x.get("thumbnail")
+            or x.get("thumbnailUrl")
+            or x.get("picture")
+            or x.get("frontImage")
+            or ""
         )
-        if not img:
-            continue
+        if not str(img_raw or "").strip() and isinstance(x.get("media"), dict):
+            m = x.get("media")
+            img_raw = m.get("url") or m.get("src") or m.get("image") or ""
+        img = _resolve_site_media_url(str(img_raw or "").strip())
         link = str(x.get("link") or x.get("url") or x.get("href") or "").strip()
+        title = str(x.get("title") or x.get("name") or x.get("label") or "").strip()
+        if not img and not link:
+            continue
         try:
             ord_v = int(
                 x.get("order")
@@ -1120,7 +1342,7 @@ def _normalize_home_promotions_list(raw: object) -> List[dict]:
             )
         except (TypeError, ValueError):
             ord_v = i
-        tmp.append((ord_v, {"image": img, "link": link}))
+        tmp.append((ord_v, {"image": img, "link": link, "title": title}))
     tmp.sort(key=lambda t: t[0])
     return [t[1] for t in tmp]
 
@@ -1152,10 +1374,15 @@ def _home_promo_kb(i: int, n: int, link: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def fetch_home_page_promotions() -> List[dict]:
-    url = HOME_PROMOTIONS_JSON_URL
+async def fetch_home_page_promotions() -> Optional[List[dict]]:
+    """Загрузка баннеров по HOME_PROMOTIONS_JSON_URL.
+
+    None — URL не задан или HTTP/сеть: **не затираем** кэш (в т.ч. после POST /api/sync/promotions).
+    [] — явно пустой ответ 200. Список — новые данные.
+    """
+    url = (HOME_PROMOTIONS_JSON_URL or "").strip()
     if not url:
-        return []
+        return None
     log = logging.getLogger(__name__)
     try:
         to = aiohttp.ClientTimeout(total=25)
@@ -1163,16 +1390,18 @@ async def fetch_home_page_promotions() -> List[dict]:
             async with session.get(url, headers={"Accept": "application/json"}) as resp:
                 if resp.status != 200:
                     log.info("HOME_PROMOTIONS_JSON_URL: HTTP %s", resp.status)
-                    return []
+                    return None
                 data = await resp.json()
     except Exception:
         log.exception("HOME_PROMOTIONS_JSON_URL: ошибка загрузки")
-        return []
+        return None
     return _normalize_home_promotions_list(data)
 
 
 async def refresh_home_page_promotions_cache(application: Application) -> int:
     items = await fetch_home_page_promotions()
+    if items is None:
+        return len(HOME_PAGE_PROMOTIONS)
     apply_home_page_promotions(items)
     application.bot_data["home_promotions"] = list(HOME_PAGE_PROMOTIONS)
     return len(items)
@@ -1315,8 +1544,10 @@ async def on_ptb_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
     err = context.error
     if isinstance(err, Conflict):
         log.error(
-            "Telegram Conflict: уже идёт getUpdates с этим TELEGRAM_BOT_TOKEN. "
-            "Остановите второй инстанс (локальный python, второй сервис на Render/Railway, старый деплой)."
+            "Telegram 409 Conflict: одновременно идёт getUpdates с этим токеном, либо раньше "
+            "был включён webhook. При старте бот вызывает delete_webhook; если ошибка "
+            "повторяется — подождите 1–2 мин после деплоя, проверьте второй сервис/воркер "
+            "на Render с тем же TELEGRAM_BOT_TOKEN, локальный запуск бота или Cursor-терминал."
         )
         return
     log.error("Необработанная ошибка в обработчике: %s", err, exc_info=err)
@@ -1324,10 +1555,8 @@ async def on_ptb_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
 
 ILLUCARDS_BASE = _illucards_site_base_url()
 CARDS_JSON_URL = os.getenv("CARDS_JSON_URL", f"{ILLUCARDS_BASE}/api/products")
-# Публичный JSON со слайдером главной: [{ "image", "link?", "order?" }]; если пусто — только POST /api/sync/promotions
+# Публичный JSON витрины: [{ "image", "link?", "order?" }]; если пусто — только push с сайта POST /api/sync/promotions
 HOME_PROMOTIONS_JSON_URL = (os.getenv("HOME_PROMOTIONS_JSON_URL") or "").strip()
-
-PROMO_PHOTO = "https://picsum.photos/seed/promo/400/300"
 SYNC_EVERY_SEC = _env_int("ILLUCARDS_SYNC_EVERY_SEC", 900)
 ORDER_DEEP_LINK_API_URL = os.getenv(
     "ORDER_DEEP_LINK_API_URL",
@@ -1338,6 +1567,8 @@ ORDER_STATUS_UPDATE_API_URL = os.getenv(
     f"{ILLUCARDS_BASE}/api/order/update",
 ).strip()
 ORDER_STATUS_UPDATE_SECRET = os.getenv("ILLUCARDS_ORDER_UPDATE_SECRET", "").strip()
+# Тот же секрет, что на сайте (Vercel): GET /api/order/{id} и POST /api/order/update — Bearer.
+# Если на проде включена проверка без заголовка — 401 и заказ по ссылке не подтянется.
 # Tinder-режим каталога: одна карта на экран, смена через editMessageMedia
 TINDER_NO_IMAGE = "https://picsum.photos/seed/illu-noimg/400/550"
 
@@ -1490,6 +1721,46 @@ def _goods_price_region_from_user_data(user_data: Optional[dict]) -> str:
     return c if c in DELIVERY_OPTIONS else "by"
 
 
+def _cart_price_region_for_user(uid: int, user_data: Optional[dict]) -> str:
+    """Регион цен для корзины: оформление в боте → синк с сайта → валюта каталога."""
+    ud = user_data or {}
+    c = str(ud.get("delivery_country") or "").strip().lower()
+    if c in DELIVERY_OPTIONS:
+        return c
+    try:
+        u = int(uid or 0)
+    except (TypeError, ValueError):
+        u = 0
+    if u:
+        c2 = str(USER_PREF_DELIVERY_COUNTRY.get(u) or "").strip().lower()
+        if c2 in DELIVERY_OPTIONS:
+            return c2
+    return _goods_price_region_from_user_data(ud)
+
+
+def _checkout_start_reprice_region(ud: dict, uid: int) -> str:
+    """Регион цен при «Оформить» / сбросе на выбор страны — как в корзине."""
+    cc = _cart_price_region_for_user(uid, ud)
+    return cc if cc in DELIVERY_OPTIONS else "by"
+
+
+def _infer_site_grand_total_currency(data: dict) -> str:
+    """Валюта итога с сайта (если не указана — из страны доставки в том же JSON)."""
+    if not isinstance(data, dict):
+        return "BYN"
+    s = str(
+        data.get("cartGrandTotalCurrency")
+        or data.get("totalCurrency")
+        or data.get("grandTotalCurrency")
+        or ""
+    ).strip().upper()
+    if s in ("BYN", "RUB"):
+        return s
+    raw = data.get("deliveryCountry") or data.get("delivery_country") or "BY"
+    bot_code, _, _, _ = _delivery_option_for_site_code(str(raw))
+    return _goods_currency_for_delivery_country(bot_code)
+
+
 def _product_unit_price_for_delivery(p: dict, delivery_country_code: str) -> int:
     """Цена единицы товара по стране доставки (из priceByn / priceRub в cards.json)."""
     cc = str(delivery_country_code or "").strip().lower()
@@ -1512,11 +1783,19 @@ def _reprice_lines_for_delivery(
     lines: List[dict],
     products: List[dict],
     delivery_country_code: str,
+    *,
+    respect_site_lines: bool = True,
 ) -> None:
-    """Обновить line[\"price\"] из каталога по ref и стране доставки."""
+    """Обновить line[\"price\"] из каталога по ref и стране доставки.
+
+    Строки с from_site (пришли с сайта) не трогаем, пока пользователь сам не сменит
+    валюту в каталоге бота (ccur) — там respect_site_lines=False.
+    """
     if not lines or not products:
         return
     for line in lines:
+        if respect_site_lines and line.get("from_site"):
+            continue
         ref = str(line.get("ref") or "").strip()
         if not ref:
             continue
@@ -1818,11 +2097,15 @@ def _reprice_uid_cart(
     user_data: Optional[dict],
     products: List[dict],
     delivery_country_code: str,
+    *,
+    respect_site_lines: bool = True,
 ) -> None:
     if not user_id or not products:
         return
     lines = _cart_get_lines_uid(user_id, user_data)
-    _reprice_lines_for_delivery(lines, products, delivery_country_code)
+    _reprice_lines_for_delivery(
+        lines, products, delivery_country_code, respect_site_lines=respect_site_lines
+    )
     _cart_set_items_uid(user_id, lines)
 
 
@@ -1909,6 +2192,28 @@ def _parse_site_cart_grand_total(data: dict) -> Optional[int]:
     return None
 
 
+def _parse_site_cart_grand_total_smart(data: dict) -> Optional[int]:
+    """Итог с сайта: приоритет полей *Rub / *Byn по стране доставки в JSON, иначе общие ключи."""
+    if not isinstance(data, dict):
+        return None
+    inferred = _infer_site_grand_total_currency(data)
+    if inferred == "RUB":
+        for key in ("cartGrandTotalRub", "grandTotalRub", "totalRub", "cartTotalRub"):
+            if key not in data:
+                continue
+            v = _coerce_card_price_int(data.get(key))
+            if v > 0:
+                return v
+    else:
+        for key in ("cartGrandTotalByn", "grandTotalByn", "totalByn", "cartTotalByn"):
+            if key not in data:
+                continue
+            v = _coerce_card_price_int(data.get(key))
+            if v > 0:
+                return v
+    return _parse_site_cart_grand_total(data)
+
+
 def _parse_site_delivery_included_in_total(data: dict) -> bool:
     if not isinstance(data, dict):
         return False
@@ -1935,11 +2240,13 @@ def _cart_apply_site_pricing_hints(uid: int, data: dict) -> None:
         return
     _ensure_user_cart(uid)
     b = USER_CART[int(uid)]
-    gt = _parse_site_cart_grand_total(data)
+    gt = _parse_site_cart_grand_total_smart(data)
     if gt and gt > 0:
         b["site_cart_grand_total"] = int(gt)
+        b["site_cart_grand_currency"] = _infer_site_grand_total_currency(data)
     else:
         b.pop("site_cart_grand_total", None)
+        b.pop("site_cart_grand_currency", None)
     if _parse_site_delivery_included_in_total(data):
         b["site_delivery_included"] = True
     else:
@@ -1953,15 +2260,24 @@ def _cart_clear_site_pricing_hints(uid: int) -> None:
     if not isinstance(b, dict):
         return
     b.pop("site_cart_grand_total", None)
+    b.pop("site_cart_grand_currency", None)
     b.pop("site_delivery_included", None)
 
 
-def _cart_get_site_grand_total(uid: int) -> Optional[int]:
+def _cart_get_site_grand_total(
+    uid: int, display_currency: Optional[str] = None
+) -> Optional[int]:
     b = USER_CART.get(int(uid))
     if not isinstance(b, dict):
         return None
     v = _coerce_card_price_int(b.get("site_cart_grand_total"))
-    return v if v > 0 else None
+    if v <= 0:
+        return None
+    want = str(display_currency or "").strip().upper()
+    stored = str(b.get("site_cart_grand_currency") or "").strip().upper()
+    if want and stored and want != stored:
+        return None
+    return v
 
 
 def _cart_site_delivery_included(uid: int) -> bool:
@@ -2419,11 +2735,22 @@ def _format_cart_message(
             "Вы ещё не добавили ни одной карточки\n"
             "Перейдите в каталог 👇"
         )
-    cur = _goods_currency_for_delivery_country(
-        _goods_price_region_from_user_data(user_data or {})
+    default_cur = _goods_currency_for_delivery_country(
+        _cart_price_region_for_user(cart_uid, user_data or {})
     )
+    site_labels = {
+        str(x.get("line_currency") or "").strip().upper()
+        for x in lines
+        if x.get("from_site") and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
+    }
+    if site_labels and all(x.get("from_site") for x in lines) and len(site_labels) == 1:
+        cur = site_labels.pop()
+    else:
+        cur = default_cur
     total, _ = _cart_totals(lines)
-    site_gt = _cart_get_site_grand_total(cart_uid) if cart_uid else None
+    site_gt = (
+        _cart_get_site_grand_total(cart_uid, cur) if cart_uid else None
+    )
     out: List[str] = [
         "🛒 Ваша корзина:",
         "",
@@ -2434,10 +2761,12 @@ def _format_cart_message(
             name = name.rstrip() + "…"
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
+        lc = str(x.get("line_currency") or "").strip().upper()
+        line_cur = lc if lc in ("BYN", "RUB") else cur
         if q <= 1:
-            out.append(f"• {name} — {p} {cur}")
+            out.append(f"• {name} — {p} {line_cur}")
         else:
-            out.append(f"• {name} — {p * q} {cur} (×{q})")
+            out.append(f"• {name} — {p * q} {line_cur} (×{q})")
     if site_gt and site_gt > 0:
         out += ["", f"💰 Итого (как на сайте, с доставкой): {site_gt} {cur}"]
     else:
@@ -2456,10 +2785,16 @@ def _format_login_site_cart_pending_text(
     if not lines:
         return ""
     bot_code, d_label, d_amt, d_cur = _delivery_option_for_site_code(delivery_cc)
-    if products:
-        _reprice_lines_for_delivery(lines, products, bot_code)
     goods, _ = _cart_totals(lines)
-    g_cur = _goods_currency_for_delivery_country(bot_code)
+    site_labels = {
+        str(x.get("line_currency") or "").strip().upper()
+        for x in lines
+        if x.get("from_site") and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
+    }
+    if site_labels and all(x.get("from_site") for x in lines) and len(site_labels) == 1:
+        g_cur = site_labels.pop()
+    else:
+        g_cur = _goods_currency_for_delivery_country(bot_code)
     out: List[str] = []
     for x in lines:
         name = (x.get("name") or "—")[:200]
@@ -2467,12 +2802,14 @@ def _format_login_site_cart_pending_text(
             name = name.rstrip() + "…"
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
+        lc = str(x.get("line_currency") or "").strip().upper()
+        xcur = lc if lc in ("BYN", "RUB") else g_cur
         if q <= 1:
-            out.append(f"• {name} — {p} {g_cur}")
+            out.append(f"• {name} — {p} {xcur}")
         else:
-            out.append(f"• {name} — {p * q} {g_cur} (×{q})")
+            out.append(f"• {name} — {p * q} {xcur} (×{q})")
     out.append("")
-    site_gt = _cart_get_site_grand_total(uid)
+    site_gt = _cart_get_site_grand_total(uid, g_cur)
     inc = _cart_site_delivery_included(uid)
     if inc and not site_gt:
         out.append(f"🚚 Доставка: {d_label} (уже в сумме на сайте)")
@@ -2725,8 +3062,22 @@ def _kb_cart(lines: List[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _format_checkout_preview_for_user(lines: List[dict]) -> str:
+def _format_checkout_preview_for_user(
+    lines: List[dict], user_data: Optional[dict] = None, *, cart_uid: int = 0
+) -> str:
     total, _ = _cart_totals(lines)
+    default_cur = _goods_currency_for_delivery_country(
+        _cart_price_region_for_user(cart_uid, user_data or {})
+    )
+    site_labels = {
+        str(x.get("line_currency") or "").strip().upper()
+        for x in lines
+        if x.get("from_site") and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
+    }
+    if site_labels and all(x.get("from_site") for x in lines) and len(site_labels) == 1:
+        cur = site_labels.pop()
+    else:
+        cur = default_cur
     out: List[str] = ["🛒", ""]
     for x in lines:
         name = (x.get("name") or "—")[:200]
@@ -2734,8 +3085,10 @@ def _format_checkout_preview_for_user(lines: List[dict]) -> str:
             name = name.rstrip() + "…"
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
-        out.append(f"• {name} — {p} BYN × {q}")
-    out += ["", f"💰 {total} BYN"]
+        lc = str(x.get("line_currency") or "").strip().upper()
+        line_cur = lc if lc in ("BYN", "RUB") else cur
+        out.append(f"• {name} — {p} {line_cur} × {q}")
+    out += ["", f"💰 {total} {cur}"]
     return "\n".join(out)
 
 
@@ -2766,8 +3119,18 @@ def _format_order_preview_with_delivery(
         return ""
     dlabel, damount, dcur = opt[0], opt[1], opt[2]
     goods_total, _ = _cart_totals(lines)
-    g_cur = _goods_currency_for_delivery_country(code)
-    site_gt = _cart_get_site_grand_total(checkout_uid) if checkout_uid else None
+    site_labels = {
+        str(x.get("line_currency") or "").strip().upper()
+        for x in lines
+        if x.get("from_site") and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
+    }
+    if site_labels and all(x.get("from_site") for x in lines) and len(site_labels) == 1:
+        g_cur = site_labels.pop()
+    else:
+        g_cur = _goods_currency_for_delivery_country(code)
+    site_gt = (
+        _cart_get_site_grand_total(checkout_uid, g_cur) if checkout_uid else None
+    )
     inc = _cart_site_delivery_included(checkout_uid) if checkout_uid else False
     out: List[str] = [
         "📦 Ваш заказ:",
@@ -2780,7 +3143,9 @@ def _format_order_preview_with_delivery(
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
         sub = p * q
-        out.append(f"• {name} — {sub} {g_cur}")
+        lc = str(x.get("line_currency") or "").strip().upper()
+        xcur = lc if lc in ("BYN", "RUB") else g_cur
+        out.append(f"• {name} — {sub} {xcur}")
     out.append("")
     if inc and not site_gt:
         out.append(f"🚚 Доставка: {dlabel} (уже в сумме на сайте)")
@@ -3374,7 +3739,7 @@ async def on_tinder_swipe(
         ref = _product_ref_for_callback(p_cur, gix_cur)
         uid_t = q.from_user.id if q.from_user else 0
         if op == "c":
-            reg_t = _goods_price_region_from_user_data(ud)
+            reg_t = _cart_price_region_for_user(uid_t, ud)
             px_t = _product_unit_price_for_delivery(p_cur, reg_t)
             _cart_add_line_uid(
                 uid_t,
@@ -3406,7 +3771,7 @@ async def on_tinder_swipe(
         lines = _cart_get_lines_uid(uid_t, ud)
         tot, _ = _cart_totals(lines)
         cur_t = _goods_currency_for_delivery_country(
-            _goods_price_region_from_user_data(ud)
+            _cart_price_region_for_user(uid_t, ud)
         )
         short = f"{len(lines)} поз. · {tot} {cur_t}"
         await q.answer(f"💚 Корзина: {short}", show_alert=False)
@@ -3434,12 +3799,11 @@ async def illucards_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             log.warning("Illucards: пустой ответ, кэш не сбрасываю")
     except Exception:
         log.exception("Illucards: ошибка фоновой синхронизации")
-    if HOME_PROMOTIONS_JSON_URL:
-        try:
-            nhp = await refresh_home_page_promotions_cache(app)
-            log.info("Illucards: акции главной, баннеров: %d", nhp)
-        except Exception:
-            log.exception("Illucards: ошибка загрузки акций главной")
+    try:
+        nhp = await refresh_home_page_promotions_cache(app)
+        log.info("Illucards: акции главной, баннеров: %d", nhp)
+    except Exception:
+        log.exception("Illucards: ошибка загрузки акций главной")
 
 
 async def crypto_auto_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3530,14 +3894,224 @@ def _parse_order_id_from_start_args(args: List[str]) -> Optional[str]:
     return None
 
 
-def _normalize_deep_link_order(raw: dict, external_id: str) -> Optional[dict]:
+def _deep_link_candidate_dicts(raw: dict) -> List[dict]:
+    """Корень и вложенные объекты, где сайт может хранить delivery / items."""
+    if not isinstance(raw, dict):
+        return []
+    out: List[dict] = [raw]
+    for k in ("order", "data", "result", "payload"):
+        v = raw.get(k)
+        if isinstance(v, dict):
+            out.append(v)
+    return out
+
+
+def _deep_link_raw_grand_total(raw: dict) -> int:
+    """Итог заказа из JSON сайта (если есть), для сверки с суммой по строкам."""
+    for cand in _deep_link_candidate_dicts(raw):
+        for key in (
+            "grandTotal",
+            "grandTotalRub",
+            "grand_total",
+            "total",
+            "cartGrandTotal",
+            "orderTotal",
+            "amountDue",
+        ):
+            if cand.get(key) is None:
+                continue
+            v = _coerce_card_price_int(cand.get(key))
+            if v > 0:
+                return v
+    return 0
+
+
+def _deep_link_delivery_bot_code(raw: dict) -> str:
+    """Код доставки by|ru|ua|ot из JSON заказа с сайта (в т.ч. вложенный order/data)."""
+    cc = ""
+    for cand in _deep_link_candidate_dicts(raw):
+        d = cand.get("delivery")
+        if isinstance(d, dict):
+            cc = str(d.get("country") or d.get("code") or "").strip()
+            if cc:
+                break
+        if not cc:
+            for key in ("delivery_country", "deliveryCountry", "deliveryRegion"):
+                v = cand.get(key)
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s:
+                    cc = s
+                    break
+        if cc:
+            break
+    if not cc:
+        for cand in _deep_link_candidate_dicts(raw):
+            dv = cand.get("delivery")
+            if dv is not None and not isinstance(dv, dict):
+                cc = str(dv).strip()
+                if cc:
+                    break
+    bot_code, _, _, _ = _delivery_option_for_site_code(cc or "BY")
+    return bot_code
+
+
+def _deep_link_raw_items_list(raw: dict) -> List[object]:
+    """Список позиций заказа: items / lines / cart.items / order.items / data.*."""
+    if not isinstance(raw, dict):
+        return []
+    for cand in _deep_link_candidate_dicts(raw):
+        for key in ("items", "lines", "lineItems"):
+            v = cand.get(key)
+            if isinstance(v, list) and v:
+                return v
+        cart = cand.get("cart")
+        if isinstance(cart, dict):
+            for key in ("items", "lines", "lineItems"):
+                v = cart.get(key)
+                if isinstance(v, list) and v:
+                    return v
+    return []
+
+
+_DEEP_LINK_PRICE_OVERLAY_KEYS = frozenset(
+    {
+        "priceRub",
+        "price_rub",
+        "unitPriceRub",
+        "unit_price_rub",
+        "salePriceRub",
+        "discountedUnitPriceRub",
+        "finalUnitPriceRub",
+        "unitPrice",
+        "discountedUnitPrice",
+        "finalUnitPrice",
+        "salePrice",
+        "listPrice",
+        "unit_price",
+        "lineTotal",
+        "line_total",
+        "lineTotalRub",
+        "line_total_rub",
+        "lineTotalByn",
+        "line_total_byn",
+        "totalPrice",
+        "extendedPrice",
+        "priceByn",
+        "price_byn",
+    }
+)
+
+
+def _deep_link_flatten_line_item(it: dict) -> dict:
+    """Поля цены часто во вложенном product: там RUB, на корне строки — устаревший price (BYN)."""
+    if not isinstance(it, dict):
+        return {}
+    base = dict(it)
+    for key in ("product", "variant", "sku", "merchandise", "card", "lineItem"):
+        inner = it.get(key)
+        if isinstance(inner, dict):
+            for k, v in inner.items():
+                if k in _DEEP_LINK_PRICE_OVERLAY_KEYS:
+                    base[k] = v
+                elif k not in base or base.get(k) is None or base.get(k) == "":
+                    base[k] = v
+        elif isinstance(inner, list) and inner and isinstance(inner[0], dict):
+            for k, v in inner[0].items():
+                if k in _DEEP_LINK_PRICE_OVERLAY_KEYS:
+                    base[k] = v
+                elif k not in base or base.get(k) is None:
+                    base[k] = v
+    return base
+
+
+def _deep_link_item_unit_price(it: dict, region_bot: str, qty: int) -> int:
+    """Цена строки заказа с сайта в валюте региона (RUB для RU, BYN для BY).
+
+    Сайт часто шлёт camelCase unitPrice/lineTotal в валюте корзины без суффикса Rub/Byn;
+    цены могут лежать во вложенном product — см. _deep_link_flatten_line_item.
+    Для RU поле price на корне часто BYN из каталога, поэтому его берём только после явных RUB-полей.
+    """
+    q = max(1, int(qty))
+    use_rub = str(region_bot or "by").strip().lower() != "by"
+    src = _deep_link_flatten_line_item(it)
+
+    def pick(keys: tuple) -> int:
+        for k in keys:
+            if src.get(k) is None:
+                continue
+            v = _coerce_card_price_int(src.get(k))
+            if v > 0:
+                return v
+        return 0
+
+    def pick_line(keys: tuple) -> int:
+        for k in keys:
+            if src.get(k) is None:
+                continue
+            try:
+                v = int(round(float(src.get(k)) / q))
+                if v > 0:
+                    return v
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        return 0
+
+    if use_rub:
+        v = pick(
+            (
+                "priceRub",
+                "price_rub",
+                "unitPriceRub",
+                "unit_price_rub",
+                "salePriceRub",
+                "discountedUnitPriceRub",
+                "finalUnitPriceRub",
+            )
+        )
+        if v:
+            return v
+        v = pick_line(("lineTotalRub", "line_total_rub"))
+        if v:
+            return v
+        v = pick(
+            (
+                "unitPrice",
+                "discountedUnitPrice",
+                "finalUnitPrice",
+                "salePrice",
+                "listPrice",
+                "unit_price",
+                "price",
+            )
+        )
+        if v:
+            return v
+        v = pick_line(("lineTotal", "line_total", "totalPrice", "extendedPrice"))
+        if v:
+            return v
+        return 0
+    v = pick(("priceByn", "price_byn"))
+    if v:
+        return v
+    v = pick_line(("lineTotalByn", "line_total_byn"))
+    if v:
+        return v
+    return pick(("price", "unitPrice", "unit_price"))
+
+
+def _normalize_deep_link_order(
+    raw: dict,
+    external_id: str,
+    products: Optional[List[dict]] = None,
+) -> Optional[dict]:
     if not isinstance(raw, dict):
         return None
-    raw_items = raw.get("items")
-    if not isinstance(raw_items, list):
-        raw_items = raw.get("lines")
-    if not isinstance(raw_items, list):
+    raw_items = _deep_link_raw_items_list(raw)
+    if not raw_items:
         return None
+    region_bot = _deep_link_delivery_bot_code(raw)
     items_out: List[dict] = []
     for it in raw_items:
         if not isinstance(it, dict):
@@ -3553,26 +4127,29 @@ def _normalize_deep_link_order(raw: dict, external_id: str) -> Optional[dict]:
         except (TypeError, ValueError):
             qty = 1
         qty = max(1, qty)
-        raw_price = (
-            it.get("price")
-            if it.get("price") is not None
-            else it.get("unit_price")
-            if it.get("unit_price") is not None
-            else it.get("priceByn")
+        price = _deep_link_item_unit_price(it, region_bot, qty)
+        ref = str(
+            it.get("ref")
+            or it.get("id")
+            or it.get("productId")
+            or it.get("product_id")
+            or name
+        )[:120]
+        lc = _goods_currency_for_delivery_country(region_bot)
+        items_out.append(
+            {
+                "name": name,
+                "price": price,
+                "qty": qty,
+                "ref": ref,
+                "from_site": True,
+                "line_currency": lc,
+            }
         )
-        try:
-            price = int(raw_price if raw_price is not None else 0)
-        except (TypeError, ValueError):
-            price = 0
-        if price <= 0 and it.get("lineTotalByn") is not None:
-            try:
-                price = int(round(float(it.get("lineTotalByn")) / qty))
-            except (TypeError, ValueError, ZeroDivisionError):
-                price = 0
-        ref = str(it.get("ref") or it.get("id") or name)[:120]
-        items_out.append({"name": name, "price": price, "qty": qty, "ref": ref})
     if not items_out:
         return None
+    if products:
+        _reconcile_cart_lines_to_catalog(products, items_out)
     d = raw.get("delivery")
     if isinstance(d, dict) and (d.get("label") or d.get("name")):
         label = str(d.get("label") or d.get("name") or "").strip()
@@ -3608,19 +4185,21 @@ def _normalize_deep_link_order(raw: dict, external_id: str) -> Optional[dict]:
         currency = str(raw.get("delivery_currency") or "BYN").strip() or "BYN"
         country = str(raw.get("delivery_country") or "").strip()
     if not label:
-        opt = DELIVERY_OPTIONS.get("by", ("🇧🇾 Беларусь", 6, "BYN"))
+        opt = DELIVERY_OPTIONS.get(region_bot, DELIVERY_OPTIONS["by"])
         label, amount, currency = opt[0], int(opt[1]), str(opt[2])
-        country = country or "by"
+    if region_bot != "by":
+        _, _, currency = DELIVERY_OPTIONS.get(region_bot, DELIVERY_OPTIONS["ru"])
     return {
         "items": items_out,
         "delivery": {
-            "country": country,
+            "country": region_bot,
             "label": label,
             "amount": int(amount),
             "currency": currency,
         },
         "external_id": str(raw.get("id") or external_id),
         "total": raw.get("total"),
+        "site_grand_total_hint": _deep_link_raw_grand_total(raw),
     }
 
 
@@ -3629,7 +4208,7 @@ def _order_record_to_deep_link_shape(rec: dict, fallback_id: str) -> Optional[di
     if not items:
         return None
     composed = {"items": items, "delivery": rec.get("delivery") or {}}
-    return _normalize_deep_link_order(composed, str(rec.get("id") or fallback_id))
+    return _normalize_deep_link_order(composed, str(rec.get("id") or fallback_id), None)
 
 
 def _find_user_order_snapshot_normalized(order_id: str) -> Optional[dict]:
@@ -3645,23 +4224,36 @@ def _fetch_order_from_shared_memory(order_id: str) -> Optional[dict]:
     if raw is None:
         return None
     if isinstance(raw, dict):
-        return _normalize_deep_link_order(deepcopy(raw), str(order_id))
+        return _normalize_deep_link_order(deepcopy(raw), str(order_id), None)
     return None
 
 
-async def _fetch_order_from_deep_link_api(order_id: str) -> Optional[dict]:
+async def _fetch_order_from_deep_link_api(
+    order_id: str, products: Optional[List[dict]] = None
+) -> Optional[dict]:
     template = ORDER_DEEP_LINK_API_URL
     if not template or "{id}" not in template:
         return None
     safe_id = urllib.parse.quote(str(order_id), safe="")
     url = template.replace("{id}", safe_id)
     log = logging.getLogger(__name__)
+    headers: dict = {}
+    if ORDER_STATUS_UPDATE_SECRET:
+        headers["Authorization"] = f"Bearer {ORDER_STATUS_UPDATE_SECRET}"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                url, timeout=aiohttp.ClientTimeout(total=12)
+                url,
+                timeout=aiohttp.ClientTimeout(total=12),
+                headers=headers or None,
             ) as resp:
                 if resp.status != 200:
+                    if resp.status == 401:
+                        log.warning(
+                            "ORDER_DEEP_LINK_API_URL: HTTP 401 для заказа %s — "
+                            "проверьте ILLUCARDS_ORDER_UPDATE_SECRET (тот же Bearer, что на сайте).",
+                            order_id,
+                        )
                     return None
                 data = await resp.json()
     except Exception:
@@ -3669,17 +4261,45 @@ async def _fetch_order_from_deep_link_api(order_id: str) -> Optional[dict]:
         return None
     if not isinstance(data, dict):
         return None
-    return _normalize_deep_link_order(data, str(order_id))
+    if products is None:
+        try:
+            products = await load_products() or []
+        except Exception:
+            products = []
+    return _normalize_deep_link_order(data, str(order_id), products)
+
+
+def _deep_link_apply_catalog_prices(order: dict, products: List[dict]) -> None:
+    """Сопоставить позиции заказа с каталогом (ref/название), цены с сайта не меняем."""
+    if not isinstance(order, dict) or not products:
+        return
+    raw_items = order.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        return
+    region_bot = str((order.get("delivery") or {}).get("country") or "by").strip().lower()
+    if region_bot not in DELIVERY_OPTIONS:
+        region_bot = "by"
+    _reconcile_cart_lines_to_catalog(products, raw_items)
 
 
 async def _fetch_order_for_deep_link(order_id: str) -> Optional[dict]:
+    products: List[dict] = []
+    try:
+        products = await load_products() or []
+    except Exception:
+        products = []
     o = _fetch_order_from_shared_memory(order_id)
     if o:
+        if products:
+            _deep_link_apply_catalog_prices(o, products)
         return o
-    o = await _fetch_order_from_deep_link_api(order_id)
+    o = await _fetch_order_from_deep_link_api(order_id, products)
     if o:
         return o
-    return _find_user_order_snapshot_normalized(order_id)
+    o = _find_user_order_snapshot_normalized(order_id)
+    if o and products:
+        _deep_link_apply_catalog_prices(o, products)
+    return o
 
 
 def _site_status_from_bot_status(status: str) -> Optional[str]:
@@ -3725,10 +4345,17 @@ def _format_user_deep_link_order_message(order: dict) -> str:
     d = order.get("delivery") or {}
     label = str(d.get("label") or "—")
     amount = int(d.get("amount") or 0)
-    cur = str(d.get("currency") or "BYN")
     country = str(d.get("country") or "")
     goods_total, _ = _cart_totals(lines)
-    g_cur = _goods_currency_for_delivery_country(country)
+    site_labels = {
+        str(x.get("line_currency") or "").strip().upper()
+        for x in lines
+        if x.get("from_site") and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
+    }
+    if site_labels and all(x.get("from_site") for x in lines) and len(site_labels) == 1:
+        g_cur = site_labels.pop()
+    else:
+        g_cur = _goods_currency_for_delivery_country(country)
     out: List[str] = [
         "📦 Ваш заказ",
         "",
@@ -3740,14 +4367,21 @@ def _format_user_deep_link_order_message(order: dict) -> str:
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
         sub = p * q
-        out.append(f"• {name} — {sub} {g_cur}")
+        lc = str(x.get("line_currency") or "").strip().upper()
+        xcur = lc if lc in ("BYN", "RUB") else g_cur
+        out.append(f"• {name} — {sub} {xcur}")
     out.append("")
     out.append(f"🚚 Доставка: {label}")
     out.append("")
-    if country == "by" and cur == "BYN":
-        out.append(f"💰 Итого: {goods_total + amount} BYN")
+    hint = _coerce_card_price_int(order.get("site_grand_total_hint") or 0)
+    computed = goods_total + amount
+    total_show = computed
+    if hint > 0 and abs(hint - computed) >= max(50, int(amount or 0) // 2 or 50):
+        total_show = hint
+    if g_cur == "BYN":
+        out.append(f"💰 Итого: {total_show} BYN")
     else:
-        out.append(f"💰 Итого: {goods_total + amount} RUB")
+        out.append(f"💰 Итого: {total_show} RUB")
     s = "\n".join(out)
     if len(s) > 4000:
         s = s[:3990] + "…"
@@ -3775,10 +4409,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             order = await _fetch_order_for_deep_link(oid)
             if not order:
                 await msg.reply_text(
-                    "Не удалось подтянуть заказ по ссылке (возможно, ссылка устарела или "
-                    "заказ ещё не передан в бот).\n\n"
-                    "Откройте корзину на сайте ещё раз или напишите в «Связь». "
-                    "Ссылка в Telegram должна быть вида: order_НОМЕР_ЗАКАЗА",
+                    "Не удалось связаться с сайтом или подтянуть заказ по ссылке.\n\n"
+                    "Если на сайте включена защита API секретом, в боте должен быть тот же "
+                    "ILLUCARDS_ORDER_UPDATE_SECRET, что в Vercel, и верный URL сайта "
+                    "(ILLUCARDS_SITE_ORIGIN).\n\n"
+                    "Откройте корзину на сайте снова или напишите в «Связь». "
+                    "Ссылка: order_НОМЕР_ЗАКАЗА",
                     reply_markup=REPLY_KB,
                 )
                 await _send_start_intro_with_site_button(msg, uid, context.user_data)
@@ -3954,8 +4590,12 @@ async def on_deep_link_confirm_order(
             "amount": int(damount),
             "currency": dcur,
         }
+        pay_cur = "BYN" if cc == "by" and dcur == "BYN" else "RUB"
+        products_dl = await _get_products(context)
+        if products_dl and lines:
+            _reprice_lines_for_delivery(lines, products_dl, cc)
         goods_total, _ = _cart_totals(list(lines))
-        site_gt = _cart_get_site_grand_total(uid_cb)
+        site_gt = _cart_get_site_grand_total(uid_cb, pay_cur)
         total_from_text: Optional[int] = None
         total_text = _extract_total_from_order_text(order_text)
         if total_text:
@@ -3972,7 +4612,6 @@ async def on_deep_link_confirm_order(
             total = int(site_gt)
         else:
             total = int(goods_total)
-        pay_cur = "BYN" if cc == "by" and dcur == "BYN" else "RUB"
         oid = await _notify_admin_new_order(
             context, u, list(lines), int(total), deepcopy(drec)
         )
@@ -4560,18 +5199,43 @@ async def send_tinder_mode(
 async def _deliver_home_promotions_if_any(
     message: Message, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
-    """Если с сайта пришли баннеры главной — показать их вместо Tinder по isSale."""
+    """Баннеры витрины (слайдер под категориями на сайте), пришедшие через синк или JSON URL."""
     promos = home_promotions_for_ui()
     if not promos:
         return False
     n = len(promos)
-    item = promos[0]
-    img = str(item.get("image") or "").strip()
-    if not img:
+    for idx in range(n):
+        item = promos[idx]
+        img = str(item.get("image") or "").strip()
+        if not img:
+            continue
+        title = str(item.get("title") or "").strip()
+        cap = f"🔥 Акции с витрины сайта — {idx + 1}/{n}"
+        if title:
+            cap = f"{title}\n\n{cap}"
+        kb = _home_promo_kb(idx, n, str(item.get("link") or ""))
+        await message.reply_photo(
+            photo=img,
+            caption=cap[:1024],
+            reply_markup=kb,
+        )
+        if message.from_user:
+            users_touch(message.from_user.id, "promo_home")
+        return True
+    rows: List[List[InlineKeyboardButton]] = []
+    for idx, item in enumerate(promos[:8]):
+        u = _promo_click_absolute_url(str(item.get("link") or ""))
+        if not u:
+            continue
+        lab = str(item.get("title") or f"Акция {idx + 1}")[:64]
+        rows.append([InlineKeyboardButton(lab, url=u)])
+    if not rows:
         return False
-    cap = f"🔥 Акции на главной (как на сайте) — 1/{n}"
-    kb = _home_promo_kb(0, n, str(item.get("link") or ""))
-    await message.reply_photo(photo=img, caption=cap, reply_markup=kb)
+    cap = (
+        "🔥 Акции с витрины сайта\n\n"
+        "Картинок в данных нет — откройте ссылку на сайте 👇"
+    )
+    await message.reply_text(cap, reply_markup=InlineKeyboardMarkup(rows))
     if message.from_user:
         users_touch(message.from_user.id, "promo_home")
     return True
@@ -4604,7 +5268,7 @@ async def on_home_promo_nav(
     if not img:
         await q.answer()
         return
-    cap = f"🔥 Акции на главной — {idx + 1}/{n}"
+    cap = f"🔥 Акции с витрины сайта — {idx + 1}/{n}"
     kb = _home_promo_kb(idx, n, str(item.get("link") or ""))
     media = InputMediaPhoto(media=img, caption=cap)
     try:
@@ -4618,33 +5282,29 @@ async def on_home_promo_nav(
     await q.answer()
 
 
+async def _refresh_vitrina_promos_then_try_deliver(
+    message: Message, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """Обновить кэш баннеров (JSON с сайта по умолчанию или env) и показать витрину."""
+    app = context.application
+    try:
+        await refresh_home_page_promotions_cache(app)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Акции витрины: ошибка refresh_home_page_promotions_cache"
+        )
+    return await _deliver_home_promotions_if_any(message, context)
+
+
 async def send_popular_deck(
     update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """🔥 Популярное — только карточки со скидкой (isSale)."""
+    """🔥 Акции — только витрина сайта (слайдер под категориями), не «горячая цена»."""
     msg = update.effective_message
     if not msg:
         return
-    if await _deliver_home_promotions_if_any(msg, context):
+    if await _refresh_vitrina_promos_then_try_deliver(msg, context):
         return
-    products = await load_products()
-    if products:
-        context.application.bot_data["products"] = products
-        context.application.bot_data["illucards_synced_at"] = time.time()
-    else:
-        products = await _get_products(context)
-    if not products:
-        await msg.reply_text(MSG_CATALOG_LOAD_FAIL)
-        return
-    cats = _category_names(products)
-    in_scope, _, _ = _filter_wizard(products, cats, "all", "sale")
-    if not in_scope:
-        await msg.reply_text(MSG_NO_HOT_PRICE_CARDS)
-        return
-    ok = await _tinder_start_deck(
-        context, int(msg.chat_id), in_scope, products, "all"
-    )
-    if not ok:
-        await msg.reply_text(MSG_VIEWER_FAIL)
+    await msg.reply_text(MSG_NO_VITRINA_PROMOS)
 
 
 async def send_favorites_deck(
@@ -4667,8 +5327,7 @@ async def send_favorites_deck(
     if not refs:
         await msg.reply_text(
             "💚 В избранном пока пусто.\n\n"
-            "Добавьте карточки в режиме просмотра (♥) или зайдите на сайт — "
-            "избранное подтянется после входа и синхронизации."
+            "Добавьте карточки из каталога здесь (♥) или на сайте."
         )
         return
     in_scope: List[dict] = []
@@ -4710,10 +5369,8 @@ async def send_random_card(
 
 
 async def send_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if not msg:
-        return
-    await msg.reply_photo(photo=PROMO_PHOTO, caption="🎁")
+    """Команда /promo — то же, что кнопка «🔥 Акции»: только витрина сайта."""
+    await send_popular_deck(update, context)
 
 
 async def _get_products(context: ContextTypes.DEFAULT_TYPE) -> List[dict]:
@@ -4768,39 +5425,34 @@ async def on_catalog_currency_pick(
     ud["catalog_currency_country"] = code
     _remember_user_delivery_country(int(q.from_user.id) if q.from_user else 0, code)
     ud["preferred_delivery_country"] = code
+    uid_cc = int(q.from_user.id) if q.from_user else 0
+    if uid_cc:
+        products = await _get_products(context)
+        if products:
+            lines_cc = _cart_get_lines_uid(uid_cc, ud)
+            for ln in lines_cc:
+                ln.pop("from_site", None)
+                ln.pop("line_currency", None)
+            _reprice_lines_for_delivery(
+                lines_cc, products, code, respect_site_lines=False
+            )
+            _cart_set_items_uid(uid_cc, lines_cc)
     await q.answer("Цены обновлены")
     await _edit_to_categories(q, context)
 
 
 async def on_popular_inline(
     update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """🔥 Акции из inline-кнопки (корзина / навигация)."""
+    """🔥 Акции из inline-кнопки — только витрина сайта (слайдер под категориями)."""
     q = update.callback_query
     if not q or not q.from_user or not q.data or not q.message:
         return
     if (q.data or "").strip() != "pop:0":
         return
     await q.answer()
-    if await _deliver_home_promotions_if_any(q.message, context):
+    if await _refresh_vitrina_promos_then_try_deliver(q.message, context):
         return
-    products = await load_products()
-    if products:
-        context.application.bot_data["products"] = products
-        context.application.bot_data["illucards_synced_at"] = time.time()
-    else:
-        products = await _get_products(context)
-    if not products:
-        await q.message.reply_text(
-            "😔 Сейчас не удалось загрузить каталог\n\nПопробуйте чуть позже 🙏"
-        )
-        return
-    cats = _category_names(products)
-    in_scope, _, _ = _filter_wizard(products, cats, "all", "sale")
-    if not in_scope:
-        await q.message.reply_text(MSG_NO_HOT_PRICE_CARDS)
-        return
-    await _tinder_start(q, context, in_scope, products, "all")
-    await q.message.reply_text(MSG_PROMO_PARTICIPATION)
+    await q.message.reply_text(MSG_NO_VITRINA_PROMOS)
 
 
 async def on_pick_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4946,7 +5598,7 @@ async def _edit_cart_message(q: CallbackQuery, context: ContextTypes.DEFAULT_TYP
             context.application.bot_data["products"] = products
     if products:
         _reprice_lines_for_delivery(
-            lines, products, _goods_price_region_from_user_data(ud)
+            lines, products, _cart_price_region_for_user(uid, ud)
         )
         _cart_set_items_uid(uid, lines)
     t = _format_cart_message(lines, ud, cart_uid=uid)
@@ -4990,7 +5642,7 @@ async def on_add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     _ensure_user_cart(uid, context.user_data)
     gix = _global_product_index(products, product)
     r = _product_ref_for_callback(product, gix)
-    reg = _goods_price_region_from_user_data(context.user_data)
+    reg = _cart_price_region_for_user(uid, context.user_data)
     px = _product_unit_price_for_delivery(product, reg)
     _cart_add_line_uid(
         uid,
@@ -5060,7 +5712,7 @@ async def on_cart_increment(
         return
     gix = _global_product_index(products, product)
     r = _product_ref_for_callback(product, gix)
-    reg_ic = _goods_price_region_from_user_data(context.user_data)
+    reg_ic = _cart_price_region_for_user(uid, context.user_data)
     px_ic = _product_unit_price_for_delivery(product, reg_ic)
     _cart_add_line_uid(
         uid,
@@ -5168,7 +5820,7 @@ async def on_checkout_nav_back(
         products = await _get_products(context)
         if products:
             _reprice_lines_for_delivery(
-                lines, products, _goods_price_region_from_user_data(ud)
+                lines, products, _cart_price_region_for_user(uid, ud)
             )
             _cart_set_items_uid(uid, lines)
         try:
@@ -5217,7 +5869,11 @@ async def on_checkout_nav_back(
         ud.pop("delivery_currency", None)
         products = await _get_products(context)
         if products and ud.get("order_checkout"):
-            _reprice_lines_for_delivery(ud["order_checkout"], products, "by")
+            _reprice_lines_for_delivery(
+                ud["order_checkout"],
+                products,
+                _checkout_start_reprice_region(ud, uid),
+            )
         try:
             await q.answer()
         except Exception:
@@ -5369,7 +6025,11 @@ async def on_checkout_ask_username(
         if products:
             context.application.bot_data["products"] = products
     if products:
-        _reprice_lines_for_delivery(ud["order_checkout"], products, "by")
+        _reprice_lines_for_delivery(
+            ud["order_checkout"],
+            products,
+            _checkout_start_reprice_region(ud, uid),
+        )
     users_touch(uid, "checkout")
     await q.answer()
     await q.message.reply_text(
@@ -5501,8 +6161,21 @@ async def on_send_order_to_admin(
         "amount": ud.get("delivery_amount"),
         "currency": ud.get("delivery_currency"),
     }
+    del_code = str(ud.get("delivery_country") or "by")
+    if del_code not in DELIVERY_OPTIONS:
+        del_code = "by"
+    products_cf = await _get_products(context)
+    if products_cf and lines:
+        _reprice_lines_for_delivery(lines, products_cf, del_code)
+    try:
+        d_amt = int(drec.get("amount") or 0)
+    except (TypeError, ValueError):
+        d_amt = 0
+    pay_cur = (
+        "BYN" if drec.get("country") == "by" and drec.get("currency") == "BYN" else "RUB"
+    )
     goods_total, _ = _cart_totals(list(lines))
-    site_gt = _cart_get_site_grand_total(uid)
+    site_gt = _cart_get_site_grand_total(uid, pay_cur)
     inc = _cart_site_delivery_included(uid)
     order_rec = {
         "id": "0",
@@ -5512,26 +6185,14 @@ async def on_send_order_to_admin(
         "delivery": drec,
         "status": "В обработке",
     }
-    try:
-        d_amt = int(drec.get("amount") or 0)
-    except (TypeError, ValueError):
-        d_amt = 0
     if site_gt and site_gt > 0:
         order_rec["total"] = int(site_gt)
-        pay_cur = (
-            "BYN" if drec.get("country") == "by" and drec.get("currency") == "BYN" else "RUB"
-        )
     elif inc:
         order_rec["total"] = int(goods_total)
-        pay_cur = (
-            "BYN" if drec.get("country") == "by" and drec.get("currency") == "BYN" else "RUB"
-        )
     elif drec.get("country") == "by" and drec.get("currency") == "BYN":
         order_rec["total"] = int(goods_total) + d_amt
-        pay_cur = "BYN"
     else:
         order_rec["total"] = int(goods_total) + d_amt
-        pay_cur = "RUB"
     oid = await _notify_admin_new_order(
         context, u, list(lines), int(order_rec["total"]), deepcopy(drec)
     )
@@ -6052,7 +6713,7 @@ async def _handle_buy_quick_text(msg: Message, context: ContextTypes.DEFAULT_TYP
             if 1 <= idx <= len(items):
                 p = items[idx - 1]
                 ref = _product_ref_for_callback(p, _global_product_index(products, p))
-                reg_b = _goods_price_region_from_user_data(context.user_data)
+                reg_b = _cart_price_region_for_user(uid, context.user_data)
                 px_b = _product_unit_price_for_delivery(p, reg_b)
                 _cart_add_line_uid(
                     uid, context.user_data, ref, p, p.get("name") or "—", px_b
@@ -6082,7 +6743,7 @@ async def _handle_buy_quick_text(msg: Message, context: ContextTypes.DEFAULT_TYP
     cat = str(p.get("category", "Без категории") or "Без категории")
     no = _product_category_number(products, p)
     ref = _product_ref_for_callback(p, _global_product_index(products, p))
-    reg = _goods_price_region_from_user_data(context.user_data)
+    reg = _cart_price_region_for_user(uid, context.user_data)
     px = _product_unit_price_for_delivery(p, reg)
     _cart_add_line_uid(uid, context.user_data, ref, p, p.get("name") or "—", px)
     users_touch(uid, "cart")
@@ -6111,7 +6772,7 @@ async def on_view_cart_callback(
             context.application.bot_data["products"] = products
     if products:
         _reprice_lines_for_delivery(
-            lines, products, _goods_price_region_from_user_data(ud)
+            lines, products, _cart_price_region_for_user(uid, ud)
         )
         _cart_set_items_uid(uid, lines)
     t = _format_cart_message(lines, ud, cart_uid=uid)
@@ -6290,7 +6951,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 context.application.bot_data["products"] = products
         if products:
             _reprice_lines_for_delivery(
-                cl, products, _goods_price_region_from_user_data(user_data)
+                cl, products, _cart_price_region_for_user(uid, user_data)
             )
             _cart_set_items_uid(uid, cl)
         t = _format_cart_message(cl, user_data, cart_uid=uid)
@@ -6360,6 +7021,12 @@ async def login_http_api_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def post_init(application: Application) -> None:
     log = logging.getLogger(__name__)
+    # Иначе Telegram отдаёт 409, если у бота остался webhook (getUpdates + webhook несовместимы).
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=False)
+        log.info("Telegram: webhook снят перед long polling")
+    except Exception:
+        log.exception("Telegram: не удалось выполнить delete_webhook")
     log.info(
         "Уведомления о заказах: target=%s, mention=%s",
         ORDER_NOTIFY_TARGET,
@@ -6374,12 +7041,11 @@ async def post_init(application: Application) -> None:
     except Exception:
         log.exception("Illucards: ошибка стартовой загрузки")
         application.bot_data["products"] = application.bot_data.get("products") or []
-    if HOME_PROMOTIONS_JSON_URL:
-        try:
-            nhp = await refresh_home_page_promotions_cache(application)
-            log.info("Акции главной (старт): %d баннеров", nhp)
-        except Exception:
-            log.exception("HOME_PROMOTIONS_JSON_URL: ошибка стартовой загрузки")
+    try:
+        nhp = await refresh_home_page_promotions_cache(application)
+        log.info("Акции главной (старт): %d баннеров", nhp)
+    except Exception:
+        log.exception("Акции главной: ошибка стартовой загрузки")
     if application.job_queue and SYNC_EVERY_SEC > 0:
         application.job_queue.run_repeating(
             illucards_sync_job,
