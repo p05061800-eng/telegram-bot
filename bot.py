@@ -148,7 +148,7 @@ def is_admin(user_id):
 
 
 # Заказы и админка:
-# 1) Клиенты не получают сообщений с admin inline-кнопками (accept_/sent_/cancel_/adm:/oam: и т.д.).
+# 1) Клиенты не получают сообщений с admin inline-кнопками (accept_/sent_/cancel_/delmsg_/adm:/oam: и т.д.).
 # 2) При оформлении из корзины — только ORDERS; в ORDER_NOTIFY_TARGET карточка заказа с кнопками
 #    принять/отправить только после подтверждения оплаты по фото (_send_deferred_admin_order_panel).
 #    Первое сообщение админу по заказу — фото чека с кнопками подтвердить/отклонить оплату.
@@ -2397,6 +2397,14 @@ def _order_status_label_ru(status: str) -> str:
     return ORDER_STATUS_RU.get(s, s)
 
 
+def _norm_bot_order_status(status: str) -> str:
+    """Единый ключ статуса заказа в ORDERS (cancelled → canceled)."""
+    s = str(status or "new").strip().lower()
+    if s == "cancelled":
+        return "canceled"
+    return s
+
+
 def _format_customer_order_status_notice(order_id: int, status_key: str) -> str:
     sk = str(status_key or "new").strip()
     if sk == "cancelled":
@@ -2563,22 +2571,21 @@ async def _send_deferred_admin_order_panel(
     o["admin_message_id"] = int(m.message_id)
 
 
-def _kb_order_admin_actions(order_id: int, status: str) -> Optional[InlineKeyboardMarkup]:
+def _kb_order_admin_actions(order_id: int, _status: str) -> Optional[InlineKeyboardMarkup]:
+    """Кнопки заказа для админа: статус можно менять и удалить карточку из чата в любой момент."""
     rep = InlineKeyboardButton("💬 Ответить", callback_data=f"oam:rep:{order_id}")
     acc = InlineKeyboardButton("✅ Принять", callback_data=f"accept_{order_id}")
     shp = InlineKeyboardButton("🚚 Отправлен", callback_data=f"sent_{order_id}")
     can = InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_{order_id}")
     done_btn = InlineKeyboardButton("🏁 Завершён", callback_data=f"done_{order_id}")
-    s = str(status or "new")
-    if s == "new":
-        return InlineKeyboardMarkup([[rep, acc], [shp, can]])
-    if s == "accepted":
-        return InlineKeyboardMarkup([[shp, can], [rep]])
-    if s == "shipped":
-        return InlineKeyboardMarkup([[done_btn, can], [rep]])
-    if s in ("done", "canceled", "cancelled"):
-        return InlineKeyboardMarkup([[rep]])
-    return None
+    del_btn = InlineKeyboardButton("🗑 Удалить из чата", callback_data=f"delmsg_{order_id}")
+    return InlineKeyboardMarkup(
+        [
+            [rep, acc],
+            [shp, done_btn],
+            [can, del_btn],
+        ]
+    )
 
 
 async def _notify_admin_new_order(
@@ -2797,6 +2804,38 @@ async def _refresh_admin_order_message(
         )
     except Exception:
         log.warning("Не удалось обновить сообщение заказа #%s", order_id)
+
+
+async def _admin_delete_order_chat_message(
+    context: ContextTypes.DEFAULT_TYPE, q: CallbackQuery, order_id: int
+) -> None:
+    """Удалить сообщение с карточкой заказа; если это основное admin_message — сбросить ссылку."""
+    log = logging.getLogger(__name__)
+    o = ORDERS.get(order_id)
+    if not o or not q.message:
+        try:
+            await q.answer("Заказ не найден", show_alert=False)
+        except Exception:
+            pass
+        return
+    chat_id = int(q.message.chat_id)
+    mid = int(q.message.message_id)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+    except Exception:
+        log.info("delete_message order #%s chat=%s mid=%s", order_id, chat_id, mid)
+        try:
+            await q.answer("Не удалось удалить (нет прав или сообщение уже удалено).", show_alert=True)
+        except Exception:
+            pass
+        return
+    if int(o.get("admin_message_id") or 0) == mid and int(o.get("admin_chat_id") or 0) == chat_id:
+        o["admin_message_id"] = None
+        o["admin_chat_id"] = None
+    try:
+        await q.answer("Сообщение удалено.", show_alert=False)
+    except Exception:
+        pass
 
 
 def _cart_totals(lines: List[dict]) -> Tuple[int, int]:
@@ -5197,7 +5236,7 @@ async def on_order_status_buttons(
     q = update.callback_query
     if not q or not q.from_user or not q.data or not q.message:
         return
-    m = re.match(r"^(accept|sent|cancel|done)_(\d+)$", (q.data or "").strip())
+    m = re.match(r"^(accept|sent|cancel|done|delmsg)_(\d+)$", (q.data or "").strip())
     if not m:
         return
     if not is_admin(q.from_user.id):
@@ -5215,30 +5254,26 @@ async def on_order_status_buttons(
         except Exception:
             pass
         return
-    st = str(o.get("status") or "new")
-    terminal = ("done", "canceled", "cancelled")
-    if action == "accept":
-        if st != "new":
-            await q.answer("Уже обработан.", show_alert=False)
-            return
-        o["status"] = "accepted"
-    elif action == "sent":
-        if st not in ("new", "accepted"):
-            await q.answer("Недоступно.", show_alert=False)
-            return
-        o["status"] = "shipped"
-    elif action == "done":
-        if st != "shipped":
-            await q.answer("Недоступно.", show_alert=False)
-            return
-        o["status"] = "done"
-    elif action == "cancel":
-        if st in terminal:
-            await q.answer("Недоступно.", show_alert=False)
-            return
-        o["status"] = "canceled"
-    else:
+    if action == "delmsg":
+        await _admin_delete_order_chat_message(context, q, oid)
         return
+    want = {
+        "accept": "accepted",
+        "sent": "shipped",
+        "done": "done",
+        "cancel": "canceled",
+    }.get(action)
+    if not want:
+        return
+    st_norm = _norm_bot_order_status(str(o.get("status") or "new"))
+    if st_norm == want:
+        try:
+            await q.answer("Статус уже такой.", show_alert=False)
+        except Exception:
+            pass
+        await _refresh_admin_order_message(context, oid)
+        return
+    o["status"] = want
     await _sync_site_order_status(o)
     await q.answer(MSG_ORDER_STATUS_UPDATED, show_alert=False)
     notice = _format_customer_order_status_notice(oid, str(o.get("status") or ""))
@@ -7226,7 +7261,7 @@ def main() -> None:
     app.add_handler(
         CallbackQueryHandler(
             on_order_status_buttons,
-            pattern=re.compile(r"^(accept|sent|cancel|done)_\d+$"),
+            pattern=re.compile(r"^(accept|sent|cancel|done|delmsg)_\d+$"),
         )
     )
     app.add_handler(
