@@ -185,6 +185,8 @@ HOME_PAGE_PROMOTIONS: List[dict] = []
 USER_ORDERS: dict = {}
 # Глобальный реестр заказов по порядковому id (память процесса)
 # ORDERS[id] = { user_id, username, items, total, delivery, status, created_at, admin_* }
+# Переписка «адрес после оплаты»: user_states[uid]["postpaid_thread_oid"] = order_id →
+# текст/фото уходит админу reply к карточке заказа (admin_message_id), пока заказ не done/canceled.
 ORDERS: dict = {}
 ORDER_COUNTER = 1
 # /start order_<id> — черновики заказов по ссылке (до оформления). Пополняется API/сайтом или register_shared_deep_link_order.
@@ -444,6 +446,23 @@ MSG_ORDER_STATUS_UPDATED = "Статус заказа обновлён."
 MSG_ORDER_ALREADY_PAID_TOAST = "Заказ уже отмечен как оплаченный."
 MSG_PAYMENT_CAPTION_CONFIRMED = "\n\nОплата подтверждена."
 MSG_PAYMENT_CAPTION_REJECTED = "\n\nЧек отклонён: пришлите новый скрин оплаты."
+MSG_POSTPAID_SHIPPING_BY = (
+    "Напишите адрес отделения Европочты, ФИО и номер телефона.\n\n"
+    "Можно несколькими сообщениями — всё уйдёт администратору в этот заказ."
+)
+MSG_POSTPAID_SHIPPING_RU = (
+    "Напишите адрес отделения СДЭК или Яндекс, ФИО и номер телефона.\n\n"
+    "Можно несколькими сообщениями — всё уйдёт администратору в этот заказ."
+)
+MSG_POSTPAID_SHIPPING_INTL = (
+    "Напишите ваш домашний адрес, ФИО и почтовый индекс латиницей.\n\n"
+    "Можно несколькими сообщениями — всё уйдёт администратору в этот заказ."
+)
+MSG_POSTPAID_FORWARDED_OK = "Передали администратору."
+MSG_POSTPAID_THREAD_CLOSED = (
+    "По этому заказу оформление завершено. Общие вопросы — кнопка «Связь»."
+)
+MSG_POSTPAID_THREAD_STALE = "Заказ не найден. Если нужна помощь — «Связь»."
 MSG_CALLBACK_STALE_ORDER = (
     "Кнопка от старого сообщения или сессия заказа уже неактивна. "
     "Отправьте /start или откройте ссылку с сайта ещё раз."
@@ -2738,6 +2757,116 @@ async def _send_payment_receipt(
         )
     except Exception:
         log.exception("чек order_id=%s chat_id=%s", order_id, chat_id)
+
+
+def _postpaid_shipping_prompt_for_order(o: dict) -> str:
+    """Текст запроса реквизитов доставки после подтверждения оплаты — по стране из заказа."""
+    d = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
+    cc = str(d.get("country") or "").strip().lower()
+    if cc == "by":
+        return MSG_POSTPAID_SHIPPING_BY
+    if cc == "ru":
+        return MSG_POSTPAID_SHIPPING_RU
+    return MSG_POSTPAID_SHIPPING_INTL
+
+
+def _kb_admin_postpaid_reply(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("💬 Ответить", callback_data=f"oam:rep:{order_id}")]]
+    )
+
+
+def _clear_postpaid_thread_if_matches(uid: int, order_id: int) -> None:
+    tid = _user_state_get(uid, "postpaid_thread_oid")
+    if tid is not None and int(tid) == int(order_id):
+        _user_state_pop(uid, "postpaid_thread_oid")
+
+
+async def _forward_postpaid_client_payload_to_admin(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    uid: int,
+    oid: int,
+    body_text: Optional[str],
+    msg: Message,
+    photo_file_id: Optional[str] = None,
+) -> bool:
+    """Переслать текст или фото клиента в тред карточки заказа (reply к admin_message)."""
+    log = logging.getLogger(__name__)
+    o = ORDERS.get(oid)
+    if not o or int(o.get("user_id") or 0) != int(uid):
+        _user_state_pop(uid, "postpaid_thread_oid")
+        try:
+            await msg.reply_text(MSG_POSTPAID_THREAD_STALE)
+        except Exception:
+            pass
+        return True
+    st = _norm_bot_order_status(str(o.get("status") or "new"))
+    if st in ("done", "canceled"):
+        _user_state_pop(uid, "postpaid_thread_oid")
+        try:
+            await msg.reply_text(MSG_POSTPAID_THREAD_CLOSED)
+        except Exception:
+            pass
+        return True
+    admin_cid = o.get("admin_chat_id")
+    admin_mid = o.get("admin_message_id")
+    tgt = admin_cid if admin_cid is not None else ORDER_NOTIFY_TARGET
+    kb = _kb_admin_postpaid_reply(oid)
+    uname = (msg.from_user.username or "").strip() if msg.from_user else ""
+    head = f"📍 Сообщение по заказу #{oid}\n👤 id {uid}"
+    if uname:
+        head += f" @{uname}"
+    reply_to = int(admin_mid) if admin_cid is not None and admin_mid is not None else None
+
+    async def _send_photo(use_reply: bool) -> None:
+        cap = head
+        t = (body_text or "").strip()
+        if t:
+            cap = f"{head}\n\n{t}"
+        cap = cap[:1024]
+        kw: dict = {
+            "chat_id": tgt,
+            "photo": photo_file_id,
+            "caption": cap,
+            "reply_markup": kb,
+        }
+        if use_reply and reply_to is not None:
+            kw["reply_to_message_id"] = reply_to
+        await context.bot.send_photo(**kw)
+
+    async def _send_txt(use_reply: bool) -> None:
+        body = head + "\n\n" + (body_text or "").strip()
+        body = body[:4096]
+        kw: dict = {
+            "chat_id": tgt,
+            "text": body,
+            "reply_markup": kb,
+            "disable_web_page_preview": True,
+        }
+        if use_reply and reply_to is not None:
+            kw["reply_to_message_id"] = reply_to
+        await context.bot.send_message(**kw)
+
+    try:
+        if photo_file_id:
+            await _send_photo(True)
+        else:
+            await _send_txt(True)
+        return True
+    except Exception as e:
+        log.info("postpaid forward (with reply) failed: %s", e)
+        if reply_to is None:
+            return False
+        try:
+            if photo_file_id:
+                await _send_photo(False)
+            else:
+                await _send_txt(False)
+            return True
+        except Exception:
+            log.exception("postpaid forward order_id=%s", oid)
+            return False
 
 
 def _kb_payment_admin_review(order_id: int) -> InlineKeyboardMarkup:
@@ -5274,6 +5403,10 @@ async def on_order_status_buttons(
         await _refresh_admin_order_message(context, oid)
         return
     o["status"] = want
+    if want in ("done", "canceled"):
+        cuid = int(o.get("user_id") or 0)
+        if cuid:
+            _clear_postpaid_thread_if_matches(cuid, oid)
     await _sync_site_order_status(o)
     await q.answer(MSG_ORDER_STATUS_UPDATED, show_alert=False)
     notice = _format_customer_order_status_notice(oid, str(o.get("status") or ""))
@@ -6593,13 +6726,38 @@ async def _forward_support_photo_to_admin(
 
 
 async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Фото: сначала скрин оплаты (awaiting_proof), иначе — пересылка в поддержку из «Связь»."""
+    """Фото: скрин оплаты (awaiting_proof), данные к заказу после оплаты (postpaid_thread), иначе «Связь»."""
     msg = update.effective_message
     if not msg or not msg.photo:
         return
     uid = msg.from_user.id if msg.from_user else 0
     if uid and _user_state_get(uid, "awaiting_proof") is not None:
         await on_payment_proof_photo(update, context)
+        return
+    pp_oid = _user_state_get(uid, "postpaid_thread_oid")
+    if uid and pp_oid is not None and not is_admin(uid):
+        cap = (msg.caption or "").strip() if msg.caption else ""
+        fid = msg.photo[-1].file_id if msg.photo else None
+        if not fid:
+            return
+        ok = await _forward_postpaid_client_payload_to_admin(
+            context,
+            uid=uid,
+            oid=int(pp_oid),
+            body_text=cap or None,
+            msg=msg,
+            photo_file_id=fid,
+        )
+        if ok:
+            try:
+                await msg.reply_text(MSG_POSTPAID_FORWARDED_OK)
+            except Exception:
+                pass
+        else:
+            try:
+                await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
+            except Exception:
+                pass
         return
     if uid and user_support_state.get(uid):
         ok = await _forward_support_photo_to_admin(context, msg, uid)
@@ -6709,9 +6867,14 @@ async def on_admin_confirm_payment(
         )
     except Exception:
         pass
+    # Сначала карточка заказа у админа — чтобы ответы клиента шли reply в один тред.
+    await _send_deferred_admin_order_panel(context, oid, o)
     if cust:
         await _send_payment_receipt(context.bot, cust, oid, o)
-    await _send_deferred_admin_order_panel(context, oid, o)
+        await _send_customer_plain(
+            context.bot, cust, _postpaid_shipping_prompt_for_order(o)
+        )
+        _user_state_set(cust, "postpaid_thread_oid", int(oid))
 
 
 async def on_receipt_callback(
@@ -7003,6 +7166,33 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text(MSG_ADMIN_SAY_OK)
             return
 
+    thread_oid = _user_state_get(uid, "postpaid_thread_oid")
+    if thread_oid is not None and uid and not is_admin(uid):
+        if text in REPLY_MENU_TEXTS:
+            _user_state_pop(uid, "postpaid_thread_oid")
+        elif not text.strip():
+            await msg.reply_text(MSG_EMPTY_INPUT)
+            return
+        else:
+            ok = await _forward_postpaid_client_payload_to_admin(
+                context,
+                uid=uid,
+                oid=int(thread_oid),
+                body_text=text,
+                msg=msg,
+            )
+            if ok:
+                try:
+                    await msg.reply_text(MSG_POSTPAID_FORWARDED_OK)
+                except Exception:
+                    pass
+            else:
+                try:
+                    await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
+                except Exception:
+                    pass
+            return
+
     if text == BTN_CHAT:
         if not uid:
             await msg.reply_text(FALLBACK_USER_TEXT)
@@ -7010,6 +7200,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _delete_user_temp_messages(context.bot, uid)
         _clear_checkout_delivery(user_data)
         user_data.pop("pending_order", None)
+        _user_state_pop(uid, "postpaid_thread_oid")
         user_support_state[uid] = True
         await msg.reply_text(SUPPORT_INTRO_TEXT)
         return
