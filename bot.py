@@ -8,6 +8,7 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
 import random
@@ -184,7 +185,7 @@ USER_FAVORITES: dict = {}
 HOME_PAGE_PROMOTIONS: List[dict] = []
 USER_ORDERS: dict = {}
 # Бонусы с сайта: в POST /api/sync/cart, /api/sync/state и verify-code JSON передавайте
-# bonusPoints или bonusBalance, при начислении — bonusEarned / pointsEarned (см. _parse_site_loyalty_snapshot).
+# bonusPoints / bonusBalance; при начислении — bonusEarned. Кнопка «⭐ Бонусы» и списание в превью заказа.
 USER_SITE_LOYALTY: Dict[int, dict] = {}
 # Глобальный реестр заказов по порядковому id (память процесса)
 # ORDERS[id] = { user_id, username, items, total, delivery, status, created_at, admin_* }
@@ -415,6 +416,16 @@ MSG_NO_VITRINA_PROMOS = (
     "HOME_PROMOTIONS_JSON_URL на хостинге 👀"
 )
 MSG_PROMO_PARTICIPATION = "Для участия в акции пришлите нам видео с уже имеющимися карточками."
+MSG_LOYALTY_MENU = (
+    "⭐ Бонусная программа IlluCards\n\n"
+    "Баланс приходит с сайта (вход по коду, синк корзины / состояния): поля вроде "
+    "bonusPoints, bonusBalance. В боте 1 бонус = 1 BYN или 1 RUB к сумме заказа "
+    "(та же валюта, что у выбранной доставки).\n\n"
+    "Как списать: оформите заказ из «💚 Корзина» — после выбора страны в превью заказа "
+    "появятся кнопки «Выкл» / «50%» / «Макс». К оплате — уже с учётом бонусов. "
+    "После успешной оплаты баланс в боте уменьшается; точное значение на сайте обновит ваш backend.\n\n"
+    "Если баланс не виден — войдите на сайт через Telegram-код, чтобы сайт передал бонусы в бот."
+)
 MSG_ADD_TO_CART_STALE = "Эта карточка устарела в текущем сообщении. Откройте каталог заново и добавьте ещё раз."
 MSG_BUY_HINT = "Можно написать: купить <категория> <номер> или купить <название карточки>."
 MSG_ADMIN_SAY_BAD_ID = (
@@ -486,6 +497,7 @@ BTN_MY_ORDERS = "📋 Мои заказы"
 BTN_DELIVERY = "🚚 Доставка"
 BTN_RANDOM_CARD = "🎁 Случайная карточка"
 BTN_FAVORITES = "💚 Избранное"
+BTN_BONUSES = "⭐ Бонусы"
 
 # Уведомление клиенту при входе админа в режим ответа
 ADMIN_TYPING_NOTICE = "⏳ Администратор печатает..."
@@ -1072,6 +1084,99 @@ def _loyalty_cart_footer_lines(uid: int) -> List[str]:
     return out
 
 
+def _loyalty_balance_int(uid: int) -> int:
+    rec = USER_SITE_LOYALTY.get(int(uid))
+    if not isinstance(rec, dict):
+        return 0
+    try:
+        return max(0, int(rec.get("balance") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _loyalty_apply_local_debit(uid: int, amount: int) -> None:
+    """После оплаты: уменьшить локальный баланс (сайт пришлёт актуализацию в sync)."""
+    if not uid or int(amount) <= 0:
+        return
+    rec = USER_SITE_LOYALTY.get(int(uid))
+    if not isinstance(rec, dict):
+        return
+    try:
+        bal = max(0, int(rec.get("balance") or 0))
+    except (TypeError, ValueError):
+        bal = 0
+    rec["balance"] = max(0, bal - int(amount))
+    rec["updated"] = time.time()
+
+
+def _checkout_bonus_cap(uid: int, grand_before_bonus: int) -> int:
+    return min(_loyalty_balance_int(uid), max(0, int(grand_before_bonus)))
+
+
+def _checkout_bonus_spend_effective(
+    user_data: dict, uid: int, grand_before_bonus: int
+) -> int:
+    cap = _checkout_bonus_cap(uid, grand_before_bonus)
+    try:
+        want = int(user_data.get("checkout_bonus_spend") or 0)
+    except (TypeError, ValueError):
+        want = 0
+    return max(0, min(max(0, want), cap))
+
+
+def _checkout_preview_finance(
+    user_data: dict, checkout_uid: int
+) -> Optional[dict]:
+    """Сумма до списания бонусов и валюта для превью оформления."""
+    lines: List[dict] = list(user_data.get("order_checkout") or [])
+    if not lines:
+        return None
+    code = str(user_data.get("delivery_country") or "")
+    opt = DELIVERY_OPTIONS.get(code)
+    if not opt:
+        return None
+    dlabel, damount, dcur = opt[0], opt[1], opt[2]
+    goods_total, _ = _cart_totals(lines)
+    site_labels = {
+        str(x.get("line_currency") or "").strip().upper()
+        for x in lines
+        if x.get("from_site") and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
+    }
+    if site_labels and all(x.get("from_site") for x in lines) and len(site_labels) == 1:
+        g_cur = site_labels.pop()
+    else:
+        g_cur = _goods_currency_for_delivery_country(code)
+    site_gt_raw = (
+        _cart_get_site_grand_total(checkout_uid, g_cur) if checkout_uid else None
+    )
+    inc = _cart_site_delivery_included(checkout_uid) if checkout_uid else False
+    exp_line = int(goods_total) if inc else int(goods_total) + int(damount)
+    trust_site = False
+    if checkout_uid and site_gt_raw and int(site_gt_raw) > 0:
+        sg = int(site_gt_raw)
+        if not _site_grand_covers_goods(sg, int(goods_total)):
+            trust_site = False
+        elif inc:
+            trust_site = not (exp_line > 0 and sg < exp_line - max(50, exp_line // 40))
+        else:
+            trust_site = exp_line > 0 and abs(sg - exp_line) <= max(100, exp_line // 25)
+    use_site = bool(site_gt_raw and trust_site)
+    grand_show = int(site_gt_raw) if use_site else exp_line
+    return {
+        "lines": lines,
+        "grand_show": int(grand_show),
+        "g_cur": g_cur,
+        "goods_total": int(goods_total),
+        "code": code,
+        "dlabel": dlabel,
+        "dcur": dcur,
+        "damount": int(damount),
+        "inc": bool(inc),
+        "use_site": bool(use_site),
+        "site_gt_raw": int(site_gt_raw) if site_gt_raw else None,
+    }
+
+
 async def _notify_loyalty_earned(bot, uid: int, text: str) -> None:
     if not bot or not uid or not (text or "").strip():
         return
@@ -1588,8 +1693,18 @@ def _normalize_home_promotions_list(raw: object) -> List[dict]:
             or x.get("thumbnailUrl")
             or x.get("picture")
             or x.get("frontImage")
+            or x.get("desktopImage")
+            or x.get("mobileImage")
+            or x.get("slideImage")
+            or x.get("coverImage")
             or ""
         )
+        if not str(img_raw or "").strip():
+            bg = x.get("backgroundImage") or x.get("background")
+            if isinstance(bg, str) and "url(" in bg:
+                um = re.search(r"url\(\s*['\"]?([^'\"\)]+)['\"]?\s*\)", bg)
+                if um:
+                    img_raw = um.group(1).strip()
         if not str(img_raw or "").strip() and isinstance(x.get("media"), dict):
             m = x.get("media")
             img_raw = m.get("url") or m.get("src") or m.get("image") or ""
@@ -1662,8 +1777,140 @@ async def fetch_home_page_promotions() -> Optional[List[dict]]:
     return _normalize_home_promotions_list(data)
 
 
+def _parse_next_data_json_from_html(html: str) -> Optional[dict]:
+    for q in ('id="__NEXT_DATA__"', "id='__NEXT_DATA__'"):
+        i = html.find(q)
+        if i < 0:
+            continue
+        j = html.find(">", i)
+        if j < 0:
+            continue
+        k = html.find("</script>", j)
+        if k < 0:
+            continue
+        raw = html[j + 1 : k].strip()
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _home_promotions_walk_next_payload(
+    obj: object, depth: int, max_depth: int
+) -> Optional[List[dict]]:
+    if depth > max_depth or not isinstance(obj, dict):
+        return None
+    keys = (
+        "homePromotions",
+        "promotions",
+        "promoSlides",
+        "heroSlides",
+        "mainBanners",
+        "bannerSlides",
+        "homeBanners",
+    )
+    for pk in keys:
+        if pk not in obj:
+            continue
+        cand = obj[pk]
+        if isinstance(cand, dict):
+            cand = cand.get("items") or cand.get("slides") or cand.get("data")
+        if isinstance(cand, list):
+            items = _normalize_home_promotions_list(cand)
+            if items:
+                return items
+    for v in obj.values():
+        r = _home_promotions_walk_next_payload(v, depth + 1, max_depth)
+        if r:
+            return r
+    return None
+
+
+def _home_promotions_from_next_data(payload: dict) -> Optional[List[dict]]:
+    props = payload.get("props")
+    if isinstance(props, dict):
+        pp = props.get("pageProps")
+        if isinstance(pp, dict):
+            got = _home_promotions_walk_next_payload(pp, 0, 14)
+            if got:
+                return got
+    return _home_promotions_walk_next_payload(payload, 0, 10)
+
+
+def _scrape_home_promotions_swiper_vitrina(html: str, base: str) -> Optional[List[dict]]:
+    """Слайдер витрины (swiper-slide + aspect-video) до секции каталога — как на illucards.by."""
+    prefix = html
+    for needle in ('id="collection"', "id='collection'"):
+        i = html.find(needle)
+        if i > 0:
+            prefix = html[:i]
+            break
+    pat_open = re.compile(r'<div class="swiper-slide[^"]*"[^>]*>', re.I)
+    base_root = base.rstrip("/")
+    default_link = f"{base_root}/"
+    pairs: List[Tuple[str, str]] = []
+    pos = 0
+    while True:
+        m = pat_open.search(prefix, pos)
+        if not m:
+            break
+        start = m.end()
+        m2 = pat_open.search(prefix, start)
+        end = m2.start() if m2 else start + 4500
+        chunk = prefix[start:end]
+        pos = m.end()
+        if "aspect-video" not in chunk:
+            continue
+        if "catalog-card" in chunk or "card-stack" in chunk:
+            continue
+        hm = re.search(r'<a\s[^>]*\bhref="([^"]+)"', chunk, re.I)
+        im = re.search(r'<img[^>]+src="([^"]+)"', chunk, re.I)
+        if not im:
+            continue
+        src = im.group(1).strip()
+        if "/uploads/" not in src and not re.search(
+            r"\.(webp|png|jpe?g)(\?|$)", src, re.I
+        ):
+            continue
+        href = hm.group(1).strip() if hm else ""
+        pairs.append((href, src))
+    if not pairs:
+        return None
+    seen_img: set = set()
+    out: List[dict] = []
+    for href, src in pairs:
+        img = _resolve_site_media_url(src)
+        if not img or img in seen_img:
+            continue
+        seen_img.add(img)
+        link = (href or default_link).strip()
+        if not link.startswith("http"):
+            link = _promo_click_absolute_url(link) or default_link
+        out.append({"image": img, "link": link, "title": "", "order": len(out)})
+        if len(out) >= 24:
+            break
+    return out or None
+
+
+def _preload_image_href_noise(raw_h: str) -> bool:
+    p = raw_h.lower()
+    bad = (
+        "logo",
+        "favicon",
+        "sprite",
+        "og-image",
+        "avatar",
+        "32x32",
+        "64x64",
+        "/fonts/",
+        "apple-touch",
+    )
+    return any(b in p for b in bad)
+
+
 async def _fetch_home_promotions_scrape_fallback() -> Optional[List[dict]]:
-    """Если нет API JSON: взять rel=preload as=image из <head> главной (как на illucards.by)."""
+    """Если нет API JSON: Next __NEXT_DATA__, иначе swiper витрины, иначе узкий preload <head>."""
     if HOME_PROMOTIONS_SCRAPE_DISABLE:
         return None
     base = _illucards_site_base_url().strip()
@@ -1683,6 +1930,16 @@ async def _fetch_home_promotions_scrape_fallback() -> Optional[List[dict]]:
     except Exception:
         log.debug("Акции: scrape главной — ошибка сети", exc_info=True)
         return None
+    nd = _parse_next_data_json_from_html(html)
+    if isinstance(nd, dict):
+        from_nd = _home_promotions_from_next_data(nd)
+        if from_nd:
+            log.info("Акции: из HTML главной взято %d баннеров (__NEXT_DATA__)", len(from_nd))
+            return from_nd
+    sw = _scrape_home_promotions_swiper_vitrina(html, base)
+    if sw:
+        log.info("Акции: из HTML главной взято %d баннеров (swiper витрина)", len(sw))
+        return sw
     low = html.lower()
     he = low.find("</head>")
     chunk = html[:he] if he > 0 else html[:120000]
@@ -1699,9 +1956,11 @@ async def _fetch_home_promotions_scrape_fallback() -> Optional[List[dict]]:
         if not hm:
             continue
         raw_h = hm.group(1).strip()
-        if not raw_h or raw_h in seen:
+        if not raw_h or raw_h in seen or _preload_image_href_noise(raw_h):
             continue
-        if "/uploads/" not in raw_h and not raw_h.endswith((".webp", ".png", ".jpg", ".jpeg")):
+        if "/uploads/" not in raw_h and not raw_h.endswith(
+            (".webp", ".png", ".jpg", ".jpeg")
+        ):
             continue
         seen.add(raw_h)
         img = _resolve_site_media_url(raw_h)
@@ -2132,6 +2391,37 @@ def _reprice_lines_for_delivery(
             line["price"] = _product_unit_price_for_delivery(p, delivery_country_code)
 
 
+def _sync_line_currencies_for_delivery_country(
+    lines: List[dict], delivery_country_code: str
+) -> None:
+    """Подпись валюты в строках корзины/чекаута под выбранную страну доставки."""
+    cc = str(delivery_country_code or "").strip().lower()
+    if cc not in DELIVERY_OPTIONS:
+        cc = "by"
+    cur = _goods_currency_for_delivery_country(cc)
+    for line in lines:
+        if isinstance(line, dict):
+            line["line_currency"] = cur
+
+
+def _reprice_order_checkout_for_delivery(
+    lines: List[dict],
+    products: List[dict],
+    delivery_country_code: str,
+) -> None:
+    """Черновик заказа: цены из каталога и валюта строк по стране (в т.ч. позиции с сайта)."""
+    cc = str(delivery_country_code or "").strip().lower()
+    if cc not in DELIVERY_OPTIONS:
+        cc = "by"
+    for line in lines:
+        if isinstance(line, dict):
+            line.pop("from_site", None)
+    _reprice_lines_for_delivery(
+        lines, products, cc, respect_site_lines=False
+    )
+    _sync_line_currencies_for_delivery_country(lines, cc)
+
+
 def _order_line_currency_from_delivery(d: Optional[dict]) -> str:
     if not d or not isinstance(d, dict):
         return "BYN"
@@ -2188,6 +2478,7 @@ REPLY_KB = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_POPULAR), KeyboardButton(BTN_CHAT)],
         [KeyboardButton(BTN_MY_ORDERS), KeyboardButton(BTN_DELIVERY)],
         [KeyboardButton(BTN_FAVORITES), KeyboardButton(BTN_RANDOM_CARD)],
+        [KeyboardButton(BTN_BONUSES)],
     ],
     resize_keyboard=True,
 )
@@ -2203,6 +2494,7 @@ REPLY_MENU_TEXTS = frozenset(
         BTN_DELIVERY,
         BTN_FAVORITES,
         BTN_RANDOM_CARD,
+        BTN_BONUSES,
     },
 )
 
@@ -2431,9 +2723,17 @@ def _reprice_uid_cart(
     if not user_id or not products:
         return
     lines = _cart_get_lines_uid(user_id, user_data)
+    cc = str(delivery_country_code or "").strip().lower()
+    if cc not in DELIVERY_OPTIONS:
+        cc = "by"
     _reprice_lines_for_delivery(
-        lines, products, delivery_country_code, respect_site_lines=respect_site_lines
+        lines, products, cc, respect_site_lines=respect_site_lines
     )
+    if not respect_site_lines:
+        for line in lines:
+            if isinstance(line, dict):
+                line.pop("from_site", None)
+        _sync_line_currencies_for_delivery_country(lines, cc)
     _cart_set_items_uid(user_id, lines)
 
 
@@ -2576,16 +2876,20 @@ def _cart_apply_site_pricing_hints(uid: int, data: dict) -> None:
     if gt and gt > 0:
         lines = _cart_get_lines_uid(uid)
         goods, _ = _cart_totals(lines)
-        inc = _parse_site_delivery_included_in_total(data)
-        d_amt = _cart_delivery_amount_from_sync_data(data)
-        exp = int(goods) if inc else int(goods) + int(d_amt)
-        gti = int(gt)
-        if not inc and exp > 0 and abs(gti - exp) > max(100, exp // 25):
-            gti = exp
-        elif inc and int(goods) > 0 and gti < int(goods) - max(50, int(goods) // 40):
-            gti = int(goods)
-        b["site_cart_grand_total"] = int(gti)
-        b["site_cart_grand_currency"] = _infer_site_grand_total_currency(data)
+        if int(goods) > 0 and int(gt) < int(goods):
+            b.pop("site_cart_grand_total", None)
+            b.pop("site_cart_grand_currency", None)
+        else:
+            inc = _parse_site_delivery_included_in_total(data)
+            d_amt = _cart_delivery_amount_from_sync_data(data)
+            exp = int(goods) if inc else int(goods) + int(d_amt)
+            gti = int(gt)
+            if not inc and exp > 0 and abs(gti - exp) > max(100, exp // 25):
+                gti = exp
+            elif inc and int(goods) > 0 and gti < int(goods) - max(50, int(goods) // 40):
+                gti = int(goods)
+            b["site_cart_grand_total"] = int(gti)
+            b["site_cart_grand_currency"] = _infer_site_grand_total_currency(data)
     else:
         b.pop("site_cart_grand_total", None)
         b.pop("site_cart_grand_currency", None)
@@ -2627,6 +2931,15 @@ def _cart_site_delivery_included(uid: int) -> bool:
     if not isinstance(b, dict):
         return False
     return bool(b.get("site_delivery_included"))
+
+
+def _site_grand_covers_goods(site_gt: int, goods_total: int) -> bool:
+    """Итог с сайта не должен быть меньше суммы товаров — иначе это битый JSON или другая валюта."""
+    if int(site_gt) <= 0:
+        return False
+    if int(goods_total) > 0 and int(site_gt) < int(goods_total):
+        return False
+    return True
 
 
 def _cart_delivery_amount_from_sync_data(data: dict) -> int:
@@ -2680,11 +2993,14 @@ def _cart_grand_total_for_display(
     Если число с сайта явно не сходится с позициями + доставка, показываем расчёт бота.
     """
     exp = _cart_expected_grand_with_delivery(uid, user_data, lines)
+    goods_sum, _ = _cart_totals(lines)
     if not uid:
         return int(exp), False
     site_gt = _cart_get_site_grand_total(uid, cur)
     inc = _cart_site_delivery_included(uid)
     if site_gt and int(site_gt) > 0:
+        if not _site_grand_covers_goods(int(site_gt), int(goods_sum)):
+            return int(exp), False
         if inc:
             if exp > 0 and int(site_gt) < exp - max(50, exp // 40):
                 return int(exp), False
@@ -2817,10 +3133,16 @@ def _format_admin_order_detail_text(order_id: int, o: dict) -> str:
     ]
     if dline:
         parts.extend(["", dline])
+    try:
+        b_ap = int(o.get("bonus_applied") or 0)
+    except (TypeError, ValueError):
+        b_ap = 0
+    if b_ap > 0:
+        parts.extend(["", f"⭐ Списано бонусов: {b_ap} {line_cur}"])
     parts.extend(
         [
             "",
-            f"💰 Сумма: {tot} {line_cur}",
+            f"💰 К оплате: {tot} {line_cur}",
             "",
             f"📊 Статус: {st_ru}",
             "",
@@ -3012,6 +3334,13 @@ def _format_payment_receipt_text(order_id: int, o: dict) -> str:
         lines.append(dline)
     else:
         lines.append("🚚 Доставка: —")
+    try:
+        b_ap = int(o.get("bonus_applied") or 0)
+    except (TypeError, ValueError):
+        b_ap = 0
+    if b_ap > 0:
+        lines.append("")
+        lines.append(f"⭐ Списано бонусов: {b_ap} {line_cur}")
     lines.append("")
     lines.append(f"💰 Сумма: {_order_resolved_grand_total(o)} {line_cur}")
     lines.extend(
@@ -3282,14 +3611,21 @@ def _cart_totals(lines: List[dict]) -> Tuple[int, int]:
 
 
 def _order_computed_grand_total(o: dict) -> int:
-    """Итог по строкам заказа + сумма доставки (без доверия к полю total из внешнего JSON)."""
+    """Итог по строкам заказа + сумма доставки минус списанные бонусы."""
     goods, _ = _cart_totals(list(o.get("items") or []))
     d = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
     try:
         d_amt = int(d.get("amount") or 0)
     except (TypeError, ValueError):
         d_amt = 0
-    return max(0, int(goods) + int(d_amt))
+    raw = max(0, int(goods) + int(d_amt))
+    try:
+        b_ap = max(0, int(o.get("bonus_applied") or 0))
+    except (TypeError, ValueError):
+        b_ap = 0
+    if b_ap > raw:
+        b_ap = raw
+    return max(0, raw - b_ap)
 
 
 def _order_resolved_grand_total(o: dict) -> int:
@@ -3406,7 +3742,9 @@ def _format_login_site_cart_pending_text(
     trust_site = False
     if site_gt_raw and int(site_gt_raw) > 0:
         sg = int(site_gt_raw)
-        if inc:
+        if not _site_grand_covers_goods(sg, int(goods)):
+            trust_site = False
+        elif inc:
             trust_site = not (exp_line > 0 and sg < exp_line - max(50, exp_line // 40))
         else:
             trust_site = exp_line > 0 and abs(sg - exp_line) <= max(100, exp_line // 25)
@@ -3630,8 +3968,15 @@ def _format_user_order_detail(order_id: object, o: dict) -> str:
         "📦 Состав:",
         items_block,
         "",
-        f"💰 Итого: {tot} {line_cur}",
     ]
+    try:
+        b_ap = int(o.get("bonus_applied") or 0)
+    except (TypeError, ValueError):
+        b_ap = 0
+    if b_ap > 0:
+        parts.append(f"⭐ Списано бонусов: {b_ap} {line_cur}")
+        parts.append("")
+    parts.append(f"💰 Итого: {tot} {line_cur}")
     if dline:
         parts.extend(["", dline])
     body = "\n".join(parts)
@@ -3716,38 +4061,22 @@ def _kb_delivery_country() -> InlineKeyboardMarkup:
 def _format_order_preview_with_delivery(
     user_data: dict, checkout_uid: int = 0
 ) -> str:
-    lines: List[dict] = list(user_data.get("order_checkout") or [])
-    if not lines:
+    fin = _checkout_preview_finance(user_data, checkout_uid)
+    if not fin:
         return ""
-    code = str(user_data.get("delivery_country") or "")
-    opt = DELIVERY_OPTIONS.get(code)
-    if not opt:
-        return ""
-    dlabel, damount, dcur = opt[0], opt[1], opt[2]
-    goods_total, _ = _cart_totals(lines)
-    site_labels = {
-        str(x.get("line_currency") or "").strip().upper()
-        for x in lines
-        if x.get("from_site") and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
-    }
-    if site_labels and all(x.get("from_site") for x in lines) and len(site_labels) == 1:
-        g_cur = site_labels.pop()
-    else:
-        g_cur = _goods_currency_for_delivery_country(code)
-    site_gt_raw = (
-        _cart_get_site_grand_total(checkout_uid, g_cur) if checkout_uid else None
-    )
-    inc = _cart_site_delivery_included(checkout_uid) if checkout_uid else False
-    exp_line = int(goods_total) if inc else int(goods_total) + int(damount)
-    trust_site = False
-    if checkout_uid and site_gt_raw and int(site_gt_raw) > 0:
-        sg = int(site_gt_raw)
-        if inc:
-            trust_site = not (exp_line > 0 and sg < exp_line - max(50, exp_line // 40))
-        else:
-            trust_site = exp_line > 0 and abs(sg - exp_line) <= max(100, exp_line // 25)
-    use_site = bool(site_gt_raw and trust_site)
-    grand_show = int(site_gt_raw) if use_site else exp_line
+    lines = fin["lines"]
+    g_cur = str(fin["g_cur"])
+    code = str(fin["code"])
+    dlabel = str(fin["dlabel"])
+    dcur = str(fin["dcur"])
+    inc = bool(fin["inc"])
+    use_site = bool(fin["use_site"])
+    site_gt_raw = fin.get("site_gt_raw")
+    grand_show = int(fin["grand_show"])
+    spend = 0
+    if checkout_uid:
+        spend = _checkout_bonus_spend_effective(user_data, checkout_uid, grand_show)
+    grand_final = max(0, int(grand_show) - int(spend))
     out: List[str] = [
         "📦 Ваш заказ:",
         "",
@@ -3766,18 +4095,27 @@ def _format_order_preview_with_delivery(
     if inc and not site_gt_raw:
         out.append(f"🚚 Доставка: {dlabel} (уже в сумме на сайте)")
         out.append("")
-        out.append(f"💰 Итого: {grand_show} {g_cur}")
+        if spend > 0:
+            out.append(f"⭐ Списание бонусов: −{spend} {g_cur}")
+            out.append("")
+        out.append(f"💰 Итого: {grand_final} {g_cur}")
     elif use_site:
         out.append(f"🚚 Доставка: {dlabel}")
         out.append("")
-        out.append(f"💰 Итого: {grand_show} {g_cur} (как на сайте)")
+        if spend > 0:
+            out.append(f"⭐ Списание бонусов: −{spend} {g_cur}")
+            out.append("")
+        out.append(f"💰 Итого: {grand_final} {g_cur} (как на сайте)")
     else:
         out.append(f"🚚 Доставка: {dlabel}")
         out.append("")
+        if spend > 0:
+            out.append(f"⭐ Списание бонусов: −{spend} {g_cur}")
+            out.append("")
         if code == "by" and dcur == "BYN":
-            out.append(f"💰 Итого: {grand_show} BYN")
+            out.append(f"💰 Итого: {grand_final} BYN")
         else:
-            out.append(f"💰 Итого: {grand_show} RUB")
+            out.append(f"💰 Итого: {grand_final} RUB")
     s = "\n".join(out)
     if len(s) > 4000:
         s = s[:3990] + "…"
@@ -3791,6 +4129,7 @@ def _clear_checkout_delivery(user_data: dict) -> None:
         "delivery_label",
         "delivery_amount",
         "delivery_currency",
+        "checkout_bonus_spend",
     ):
         user_data.pop(k, None)
 
@@ -3848,17 +4187,25 @@ def _kb_delivery_country_with_back() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _kb_order_preview_actions() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def _kb_order_preview_actions(uid: int, user_data: dict) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("✅ Подтвердить заказ", callback_data="ta:0")],
         [
-            [InlineKeyboardButton("✅ Подтвердить заказ", callback_data="ta:0")],
+            InlineKeyboardButton(
+                "◀️ Изменить страну", callback_data="chk:preview_to_country"
+            )
+        ],
+    ]
+    fin = _checkout_preview_finance(user_data, uid)
+    if fin and uid and _checkout_bonus_cap(uid, int(fin["grand_show"])) > 0:
+        rows.append(
             [
-                InlineKeyboardButton(
-                    "◀️ Изменить страну", callback_data="chk:preview_to_country"
-                )
-            ],
-        ]
-    )
+                InlineKeyboardButton("⭐ Выкл", callback_data="bo:s:0"),
+                InlineKeyboardButton("⭐ 50%", callback_data="bo:s:h"),
+                InlineKeyboardButton("⭐ Макс", callback_data="bo:s:m"),
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def _kb_payment_methods_with_back() -> InlineKeyboardMarkup:
@@ -5228,6 +5575,8 @@ async def on_deep_link_confirm_order(
             _reprice_lines_for_delivery(lines, products_dl, cc)
         goods_total, _ = _cart_totals(list(lines))
         site_gt = _cart_get_site_grand_total(uid_cb, pay_cur)
+        if site_gt and not _site_grand_covers_goods(int(site_gt), int(goods_total)):
+            site_gt = None
         total_from_text: Optional[int] = None
         total_text = _extract_total_from_order_text(order_text)
         if total_text:
@@ -6511,7 +6860,7 @@ async def on_checkout_nav_back(
         ud.pop("delivery_currency", None)
         products = await _get_products(context)
         if products and ud.get("order_checkout"):
-            _reprice_lines_for_delivery(
+            _reprice_order_checkout_for_delivery(
                 ud["order_checkout"],
                 products,
                 _checkout_start_reprice_region(ud, uid),
@@ -6555,7 +6904,7 @@ async def on_checkout_nav_back(
             cc = str(ud.get("delivery_country") or "by")
             if cc not in DELIVERY_OPTIONS:
                 cc = "by"
-            _reprice_lines_for_delivery(oc, products, cc)
+            _reprice_order_checkout_for_delivery(oc, products, cc)
         preview = _format_order_preview_with_delivery(ud, uid)
         if not preview:
             try:
@@ -6573,7 +6922,7 @@ async def on_checkout_nav_back(
             pass
         await q.message.reply_text(
             preview,
-            reply_markup=_kb_order_preview_actions(),
+            reply_markup=_kb_order_preview_actions(uid, ud),
         )
         return
     if action == "pay_to_methods":
@@ -6657,6 +7006,7 @@ async def on_checkout_ask_username(
         return
     ud = context.user_data
     ud["order_checkout"] = deepcopy(lines)
+    ud["checkout_bonus_spend"] = 0
     ud.pop("delivery_country", None)
     ud.pop("delivery_label", None)
     ud.pop("delivery_amount", None)
@@ -6667,7 +7017,7 @@ async def on_checkout_ask_username(
         if products:
             context.application.bot_data["products"] = products
     if products:
-        _reprice_lines_for_delivery(
+        _reprice_order_checkout_for_delivery(
             ud["order_checkout"],
             products,
             _checkout_start_reprice_region(ud, uid),
@@ -6716,10 +7066,10 @@ async def on_delivery_country_pick(
         if products:
             context.application.bot_data["products"] = products
     if products and lines:
-        _reprice_lines_for_delivery(lines, products, code)
+        _reprice_order_checkout_for_delivery(lines, products, code)
         ud["order_checkout"] = lines
     if uid_pick and products:
-        _reprice_uid_cart(uid_pick, ud, products, code)
+        _reprice_uid_cart(uid_pick, ud, products, code, respect_site_lines=False)
     preview = _format_order_preview_with_delivery(ud, uid_pick)
     if not preview:
         await _notify_callback_issue(q, context)
@@ -6727,8 +7077,61 @@ async def on_delivery_country_pick(
     await q.answer()
     await q.message.reply_text(
         preview,
-        reply_markup=_kb_order_preview_actions(),
+        reply_markup=_kb_order_preview_actions(uid_pick, ud),
     )
+
+
+async def on_bonus_spend_pick(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """bo:s:0|h|m — списание бонусов к оплате в превью заказа."""
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    m = re.match(r"^bo:s:(0|h|m)$", (q.data or "").strip())
+    if not m:
+        return
+    mode = m.group(1)
+    uid = q.from_user.id
+    ud = context.user_data
+    fin = _checkout_preview_finance(ud, uid)
+    if not fin:
+        try:
+            await q.answer("Сначала выберите страну доставки.", show_alert=True)
+        except Exception:
+            pass
+        return
+    cap = _checkout_bonus_cap(uid, int(fin["grand_show"]))
+    if mode == "0":
+        ud["checkout_bonus_spend"] = 0
+    elif mode == "h":
+        ud["checkout_bonus_spend"] = max(0, cap // 2)
+    else:
+        ud["checkout_bonus_spend"] = int(cap)
+    preview = _format_order_preview_with_delivery(ud, uid)
+    if not preview:
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    try:
+        await q.message.edit_text(
+            preview,
+            reply_markup=_kb_order_preview_actions(uid, ud),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        try:
+            await q.message.reply_text(
+                preview,
+                reply_markup=_kb_order_preview_actions(uid, ud),
+            )
+        except Exception:
+            pass
 
 
 async def on_send_order_to_admin(
@@ -6808,7 +7211,7 @@ async def on_send_order_to_admin(
         del_code = "by"
     products_cf = await _get_products(context)
     if products_cf and lines:
-        _reprice_lines_for_delivery(lines, products_cf, del_code)
+        _reprice_order_checkout_for_delivery(lines, products_cf, del_code)
     try:
         d_amt = int(drec.get("amount") or 0)
     except (TypeError, ValueError):
@@ -6818,35 +7221,44 @@ async def on_send_order_to_admin(
     )
     goods_total, _ = _cart_totals(list(lines))
     site_gt = _cart_get_site_grand_total(uid, pay_cur)
+    if site_gt and not _site_grand_covers_goods(int(site_gt), int(goods_total)):
+        site_gt = None
     inc = _cart_site_delivery_included(uid)
     if inc:
         baseline_total = int(goods_total)
     else:
         baseline_total = int(goods_total) + int(d_amt)
-    order_rec = {
-        "id": "0",
-        "items": deepcopy(list(lines)),
-        "total": int(goods_total),
-        "total_goods": int(goods_total),
-        "delivery": drec,
-        "status": "В обработке",
-    }
+    base_tot = int(goods_total)
     if site_gt and site_gt > 0 and baseline_total > 0:
         tol = max(100, baseline_total // 25)
         if abs(int(site_gt) - int(baseline_total)) <= tol:
-            order_rec["total"] = int(site_gt)
+            base_tot = int(site_gt)
         else:
-            order_rec["total"] = int(baseline_total)
+            base_tot = int(baseline_total)
     elif site_gt and site_gt > 0:
-        order_rec["total"] = int(site_gt)
+        base_tot = int(site_gt)
     elif inc:
-        order_rec["total"] = int(goods_total)
+        base_tot = int(goods_total)
     elif drec.get("country") == "by" and drec.get("currency") == "BYN":
-        order_rec["total"] = int(goods_total) + d_amt
+        base_tot = int(goods_total) + d_amt
     else:
-        order_rec["total"] = int(goods_total) + d_amt
+        base_tot = int(goods_total) + d_amt
+    fin_bo = _checkout_preview_finance(ud, uid)
+    gref = int(fin_bo["grand_show"]) if fin_bo else int(base_tot)
+    spend_raw = _checkout_bonus_spend_effective(ud, uid, gref)
+    spend = min(int(spend_raw), max(0, int(base_tot)))
+    pay_total = max(0, int(base_tot) - int(spend))
+    order_rec = {
+        "id": "0",
+        "items": deepcopy(list(lines)),
+        "total": int(pay_total),
+        "total_goods": int(goods_total),
+        "delivery": drec,
+        "status": "В обработке",
+        "bonus_applied": int(spend),
+    }
     oid = await _notify_admin_new_order(
-        context, u, list(lines), int(order_rec["total"]), deepcopy(drec)
+        context, u, list(lines), int(pay_total), deepcopy(drec)
     )
     if oid is None:
         await _notify_callback_issue(q, context)
@@ -6855,6 +7267,8 @@ async def on_send_order_to_admin(
     USER_ORDERS.setdefault(uid, []).append(order_rec)
     ORDERS[int(oid)]["clear_cart_on_paid"] = True
     ORDERS[int(oid)]["total_goods"] = int(goods_total)
+    if int(spend) > 0:
+        ORDERS[int(oid)]["bonus_applied"] = int(spend)
     ud["awaiting_payment_order_id"] = int(oid)
     ud.pop("payment_pending_method", None)
     _clear_checkout_delivery(ud)
@@ -7227,7 +7641,13 @@ async def on_admin_confirm_payment(
         return
     o["paid"] = True
     o["paid_at"] = time.time()
+    try:
+        b_sp = int(o.get("bonus_applied") or 0)
+    except (TypeError, ValueError):
+        b_sp = 0
     cust = int(o.get("user_id") or 0)
+    if b_sp > 0 and cust:
+        _loyalty_apply_local_debit(cust, b_sp)
     clear_cart = bool(o.pop("clear_cart_on_paid", False))
     if clear_cart and cust:
         _cart_clear_uid(cust)
@@ -7698,6 +8118,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await send_random_card(update, context)
         return
 
+    if text == BTN_BONUSES:
+        bal = _loyalty_balance_int(uid)
+        bal_line = (
+            f"Текущий баланс: {bal} бонусов.\n\n"
+            if bal > 0
+            else "Баланс пока не получен с сайта (0) — войдите на illucards.by через код в Telegram.\n\n"
+        )
+        await msg.reply_text(
+            (bal_line + MSG_LOYALTY_MENU).strip()[:4090],
+            reply_markup=REPLY_KB,
+            disable_web_page_preview=True,
+        )
+        return
+
     await msg.reply_text(MSG_UNKNOWN_TEXT, reply_markup=REPLY_KB)
 
 
@@ -7901,6 +8335,11 @@ def main() -> None:
         CallbackQueryHandler(
             on_receipt_callback,
             pattern=re.compile(r"^rcpt_(orders|support)$"),
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_bonus_spend_pick, pattern=re.compile(r"^bo:s:(0|h|m)$")
         )
     )
     app.add_handler(CallbackQueryHandler(on_send_order_to_admin, pattern=re.compile(r"^ta:0$")))
