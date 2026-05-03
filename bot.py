@@ -2511,10 +2511,14 @@ def _parse_site_cart_grand_total(data: dict) -> Optional[int]:
     """Итог корзины с сайта (уже с доставкой), если передан в JSON синка/verify."""
     if not isinstance(data, dict):
         return None
-    for key in ("cartGrandTotal", "cartTotal", "grandTotal", "orderTotal", "total"):
+    for key in ("cartGrandTotal", "cartTotal", "grandTotal", "orderTotal"):
         if key not in data:
             continue
         v = _coerce_card_price_int(data.get(key))
+        if v > 0:
+            return v
+    if "total" in data:
+        v = _coerce_card_price_int(data.get("total"))
         if v > 0:
             return v
     return None
@@ -2570,7 +2574,17 @@ def _cart_apply_site_pricing_hints(uid: int, data: dict) -> None:
     b = USER_CART[int(uid)]
     gt = _parse_site_cart_grand_total_smart(data)
     if gt and gt > 0:
-        b["site_cart_grand_total"] = int(gt)
+        lines = _cart_get_lines_uid(uid)
+        goods, _ = _cart_totals(lines)
+        inc = _parse_site_delivery_included_in_total(data)
+        d_amt = _cart_delivery_amount_from_sync_data(data)
+        exp = int(goods) if inc else int(goods) + int(d_amt)
+        gti = int(gt)
+        if not inc and exp > 0 and abs(gti - exp) > max(100, exp // 25):
+            gti = exp
+        elif inc and int(goods) > 0 and gti < int(goods) - max(50, int(goods) // 40):
+            gti = int(goods)
+        b["site_cart_grand_total"] = int(gti)
         b["site_cart_grand_currency"] = _infer_site_grand_total_currency(data)
     else:
         b.pop("site_cart_grand_total", None)
@@ -2613,6 +2627,72 @@ def _cart_site_delivery_included(uid: int) -> bool:
     if not isinstance(b, dict):
         return False
     return bool(b.get("site_delivery_included"))
+
+
+def _cart_delivery_amount_from_sync_data(data: dict) -> int:
+    """Сумма доставки из JSON синка (или по стране), для сверки с итогом с сайта."""
+    if not isinstance(data, dict):
+        return 0
+    drec = data.get("delivery") or data.get("shipping")
+    if isinstance(drec, dict):
+        try:
+            a = int(drec.get("amount") or 0)
+            if a > 0:
+                return a
+        except (TypeError, ValueError):
+            pass
+    del_raw = str(
+        data.get("deliveryCountry") or data.get("delivery_country") or ""
+    ).strip()
+    _, _, amt, _ = _delivery_option_for_site_code(del_raw or "BY")
+    return int(amt)
+
+
+def _cart_expected_grand_with_delivery(
+    uid: int, user_data: Optional[dict], lines: List[dict]
+) -> int:
+    """Ожидаемый итог: сумма строк + доставка (или только товары, если доставка уже в сумме на сайте)."""
+    goods, _ = _cart_totals(lines)
+    inc = _cart_site_delivery_included(uid)
+    ud = user_data or {}
+    try:
+        d_amt = int(ud.get("delivery_amount") or -1)
+    except (TypeError, ValueError):
+        d_amt = -1
+    if d_amt < 0:
+        code = str(ud.get("delivery_country") or "").strip().lower()
+        if code not in DELIVERY_OPTIONS:
+            code = _cart_price_region_for_user(uid, ud)
+        _, _, d_amt, _ = DELIVERY_OPTIONS.get(code, DELIVERY_OPTIONS["by"])
+    if inc:
+        return max(0, int(goods))
+    return max(0, int(goods) + int(d_amt))
+
+
+def _cart_grand_total_for_display(
+    uid: int,
+    user_data: Optional[dict],
+    lines: List[dict],
+    cur: str,
+) -> Tuple[int, bool]:
+    """
+    Итог для текста «💚 Корзина». Второй элемент True — показываем как «с сайта».
+    Если число с сайта явно не сходится с позициями + доставка, показываем расчёт бота.
+    """
+    exp = _cart_expected_grand_with_delivery(uid, user_data, lines)
+    if not uid:
+        return int(exp), False
+    site_gt = _cart_get_site_grand_total(uid, cur)
+    inc = _cart_site_delivery_included(uid)
+    if site_gt and int(site_gt) > 0:
+        if inc:
+            if exp > 0 and int(site_gt) < exp - max(50, exp // 40):
+                return int(exp), False
+            return int(site_gt), True
+        if exp > 0 and abs(int(site_gt) - int(exp)) > max(100, exp // 25):
+            return int(exp), False
+        return int(site_gt), True
+    return int(exp), False
 
 
 ORDER_STATUS_RU: dict = {
@@ -3255,9 +3335,8 @@ def _format_cart_message(
         cur = site_labels.pop()
     else:
         cur = default_cur
-    total, _ = _cart_totals(lines)
-    site_gt = (
-        _cart_get_site_grand_total(cart_uid, cur) if cart_uid else None
+    shown_grand, from_site_hint = _cart_grand_total_for_display(
+        cart_uid, user_data, lines, cur
     )
     out: List[str] = [
         "🛒 Ваша корзина:",
@@ -3275,10 +3354,10 @@ def _format_cart_message(
             out.append(f"• {name} — {p} {line_cur}")
         else:
             out.append(f"• {name} — {p * q} {line_cur} (×{q})")
-    if site_gt and site_gt > 0:
-        out += ["", f"💰 Итого (как на сайте, с доставкой): {site_gt} {cur}"]
+    if from_site_hint:
+        out += ["", f"💰 Итого (как на сайте, с доставкой): {shown_grand} {cur}"]
     else:
-        out += ["", f"💰 Итого: {total} {cur}"]
+        out += ["", f"💰 Итого: {shown_grand} {cur}"]
     foot_loy = _loyalty_cart_footer_lines(cart_uid)
     if foot_loy:
         out.append("")
@@ -3321,23 +3400,34 @@ def _format_login_site_cart_pending_text(
         else:
             out.append(f"• {name} — {p * q} {xcur} (×{q})")
     out.append("")
-    site_gt = _cart_get_site_grand_total(uid, g_cur)
+    site_gt_raw = _cart_get_site_grand_total(uid, g_cur)
     inc = _cart_site_delivery_included(uid)
-    if inc and not site_gt:
+    exp_line = int(goods) if inc else int(goods) + int(d_amt)
+    trust_site = False
+    if site_gt_raw and int(site_gt_raw) > 0:
+        sg = int(site_gt_raw)
+        if inc:
+            trust_site = not (exp_line > 0 and sg < exp_line - max(50, exp_line // 40))
+        else:
+            trust_site = exp_line > 0 and abs(sg - exp_line) <= max(100, exp_line // 25)
+    use_site = bool(site_gt_raw and trust_site)
+    grand_show = int(site_gt_raw) if use_site else exp_line
+    if inc and not site_gt_raw:
         out.append(f"🚚 Доставка: {d_label} (уже в сумме на сайте)")
-        out.append(f"💰 Итого: {goods} {g_cur}")
-    elif site_gt and site_gt > 0:
+        out.append(f"💰 Итого: {grand_show} {g_cur}")
+    elif use_site:
         out.append(f"🚚 Доставка: {d_label} (+{d_amt} {d_cur})")
-        out.append(f"💰 Итого: {site_gt} {g_cur} (как на сайте)")
+        out.append(f"💰 Итого: {grand_show} {g_cur} (как на сайте)")
     elif str(d_cur).upper() == "BYN" and g_cur == "BYN":
         out.append(f"🚚 Доставка: {d_label} (+{d_amt} {d_cur})")
-        out.append(f"💰 Итого: {goods + d_amt} BYN")
+        out.append(f"💰 Итого: {grand_show} BYN")
     elif str(d_cur).upper() == "RUB" and g_cur == "RUB":
         out.append(f"🚚 Доставка: {d_label} (+{d_amt} {d_cur})")
-        out.append(f"💰 Итого: {goods + d_amt} RUB")
+        out.append(f"💰 Итого: {grand_show} RUB")
     else:
         out.append(f"🚚 Доставка: {d_label} (+{d_amt} {d_cur})")
         out.append(f"💰 Товары: {goods} {g_cur}; доставка: {d_amt} {d_cur}")
+        out.append(f"💰 Итого: {grand_show} {g_cur}")
     foot_pv = _loyalty_cart_footer_lines(uid)
     if foot_pv:
         out.append("")
@@ -3644,10 +3734,20 @@ def _format_order_preview_with_delivery(
         g_cur = site_labels.pop()
     else:
         g_cur = _goods_currency_for_delivery_country(code)
-    site_gt = (
+    site_gt_raw = (
         _cart_get_site_grand_total(checkout_uid, g_cur) if checkout_uid else None
     )
     inc = _cart_site_delivery_included(checkout_uid) if checkout_uid else False
+    exp_line = int(goods_total) if inc else int(goods_total) + int(damount)
+    trust_site = False
+    if checkout_uid and site_gt_raw and int(site_gt_raw) > 0:
+        sg = int(site_gt_raw)
+        if inc:
+            trust_site = not (exp_line > 0 and sg < exp_line - max(50, exp_line // 40))
+        else:
+            trust_site = exp_line > 0 and abs(sg - exp_line) <= max(100, exp_line // 25)
+    use_site = bool(site_gt_raw and trust_site)
+    grand_show = int(site_gt_raw) if use_site else exp_line
     out: List[str] = [
         "📦 Ваш заказ:",
         "",
@@ -3663,21 +3763,21 @@ def _format_order_preview_with_delivery(
         xcur = lc if lc in ("BYN", "RUB") else g_cur
         out.append(f"• {name} — {sub} {xcur}")
     out.append("")
-    if inc and not site_gt:
+    if inc and not site_gt_raw:
         out.append(f"🚚 Доставка: {dlabel} (уже в сумме на сайте)")
         out.append("")
-        out.append(f"💰 Итого: {goods_total} {g_cur}")
-    elif site_gt and site_gt > 0:
+        out.append(f"💰 Итого: {grand_show} {g_cur}")
+    elif use_site:
         out.append(f"🚚 Доставка: {dlabel}")
         out.append("")
-        out.append(f"💰 Итого: {site_gt} {g_cur} (как на сайте)")
+        out.append(f"💰 Итого: {grand_show} {g_cur} (как на сайте)")
     else:
         out.append(f"🚚 Доставка: {dlabel}")
         out.append("")
         if code == "by" and dcur == "BYN":
-            out.append(f"💰 Итого: {goods_total + damount} BYN")
+            out.append(f"💰 Итого: {grand_show} BYN")
         else:
-            out.append(f"💰 Итого: {goods_total + damount} RUB")
+            out.append(f"💰 Итого: {grand_show} RUB")
     s = "\n".join(out)
     if len(s) > 4000:
         s = s[:3990] + "…"
