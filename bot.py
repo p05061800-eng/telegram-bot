@@ -415,7 +415,12 @@ _TINDER_USER_DATA_KEYS: Tuple[str, ...] = (
 
 
 def _apply_post_deploy_session_reset(uid: int, user_data: dict) -> None:
-    """После рестарта процесса (деплой): не тянуть корзину/черновики из другого PID."""
+    """После рестарта процесса (деплой): сбросить только user_data и служебные флаги.
+
+    Не трогаем USER_CART и SITE_LOGIN_PENDING_ORDER: корзина могла только что прийти с сайта
+    через POST /api/verify-code или sync до первого нажатия пользователя — иначе «💚 Корзина»
+    пустая и «Подтвердить заказ» теряет текст черновика.
+    """
     if not uid:
         return
     _clear_checkout_delivery(user_data)
@@ -429,15 +434,8 @@ def _apply_post_deploy_session_reset(uid: int, user_data: dict) -> None:
             pass
     for k in _TINDER_USER_DATA_KEYS:
         user_data.pop(k, None)
-    try:
-        SITE_LOGIN_PENDING_ORDER.pop(int(uid), None)
-    except (TypeError, ValueError):
-        pass
     user_states.pop(int(uid), None)
     user_support_state.pop(int(uid), None)
-    _cart_clear_site_pricing_hints(int(uid))
-    USER_SITE_LOYALTY.pop(int(uid), None)
-    _cart_clear_uid(int(uid))
 
 
 FALLBACK_USER_TEXT = (
