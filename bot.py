@@ -2256,6 +2256,8 @@ ORDER_STATUS_UPDATE_API_URL = os.getenv(
     f"{ILLUCARDS_BASE}/api/order/update",
 ).strip()
 ORDER_STATUS_UPDATE_SECRET = os.getenv("ILLUCARDS_ORDER_UPDATE_SECRET", "").strip()
+# Опционально: POST на ваш URL после скрина оплаты — очистить корзину на сайте (см. _notify_site_cart_cleared_after_proof).
+ILLUCARDS_CART_CLEAR_ON_PROOF_URL = (os.getenv("ILLUCARDS_CART_CLEAR_ON_PROOF_URL") or "").strip()
 # Тот же секрет, что на сайте (Vercel): GET /api/order/{id} и POST /api/order/update — Bearer.
 # Если на проде включена проверка без заголовка — 401 и заказ по ссылке не подтянется.
 # Tinder-режим каталога: одна карта на экран, смена через editMessageMedia
@@ -5446,6 +5448,57 @@ def _site_status_from_bot_status(status: str) -> Optional[str]:
     }.get(str(status or "").strip().lower())
 
 
+def _clear_user_cart_after_payment_proof(uid: int, oid: int, o: dict) -> None:
+    """TG-корзина и подсказки цен — после присланного чека (скрина), если флаг заказа."""
+    if not uid:
+        return
+    if not o.get("clear_cart_on_paid"):
+        return
+    if o.get("_cart_cleared_on_proof"):
+        return
+    _cart_clear_uid(int(uid))
+    _cart_clear_site_pricing_hints(int(uid))
+    o["_cart_cleared_on_proof"] = True
+
+
+async def _notify_site_cart_cleared_after_proof(uid: int, oid: int, o: dict) -> None:
+    """Если задан ILLUCARDS_CART_CLEAR_ON_PROOF_URL — сообщить сайту очистить корзину пользователя."""
+    if not ILLUCARDS_CART_CLEAR_ON_PROOF_URL:
+        return
+    if not uid:
+        return
+    headers = {"Content-Type": "application/json"}
+    if ORDER_STATUS_UPDATE_SECRET:
+        headers["Authorization"] = f"Bearer {ORDER_STATUS_UPDATE_SECRET}"
+    ext = str(o.get("external_id") or "").strip()
+    payload = {
+        "telegramUserId": int(uid),
+        "botOrderId": int(oid),
+        "externalOrderId": ext or None,
+        "event": "payment_proof_submitted",
+    }
+    log = logging.getLogger(__name__)
+    try:
+        timeout = aiohttp.ClientTimeout(total=12)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                ILLUCARDS_CART_CLEAR_ON_PROOF_URL,
+                json=payload,
+                headers=headers,
+            ) as resp:
+                if resp.status >= 300:
+                    body = await resp.text()
+                    log.warning(
+                        "POST cart clear webhook: uid=%s oid=%s HTTP %s %s",
+                        uid,
+                        oid,
+                        resp.status,
+                        body[:200],
+                    )
+    except Exception:
+        log.exception("cart clear webhook failed uid=%s oid=%s", uid, oid)
+
+
 async def _sync_site_order_status(order: dict) -> None:
     external_id = str(order.get("external_id") or "").strip()
     status = _site_status_from_bot_status(str(order.get("status") or ""))
@@ -5917,7 +5970,7 @@ async def on_deep_link_structured_submit(
     ud.pop("deep_link_order_session", None)
     order_rec["id"] = str(oid)
     USER_ORDERS.setdefault(u.id, []).append(order_rec)
-    ORDERS[int(oid)]["clear_cart_on_paid"] = False
+    ORDERS[int(oid)]["clear_cart_on_paid"] = True
     ORDERS[int(oid)]["total_goods"] = int(goods_total)
     if order_rec.get("external_id"):
         ORDERS[int(oid)]["external_id"] = str(order_rec["external_id"])
@@ -6288,11 +6341,6 @@ async def on_order_status_buttons(
         await _refresh_admin_order_message(context, oid)
         return
     o["status"] = want
-    if want == "accepted" and st_norm != want:
-        cuid = int(o.get("user_id") or 0)
-        if cuid:
-            _cart_clear_uid(cuid)
-            _cart_clear_site_pricing_hints(cuid)
     if want in ("done", "canceled"):
         cuid = int(o.get("user_id") or 0)
         if cuid:
@@ -7772,6 +7820,13 @@ async def on_payment_proof_photo(
         return
     o["payment_proof_submitted"] = True
     o["proof_file_id"] = file_id
+    _clear_user_cart_after_payment_proof(uid, int(oid), o)
+    try:
+        asyncio.get_running_loop().create_task(
+            _notify_site_cart_cleared_after_proof(uid, int(oid), o)
+        )
+    except RuntimeError:
+        pass
     _user_state_pop(uid, "awaiting_proof")
     await msg.reply_text(PAY_PROOF_WAIT)
 
@@ -7820,9 +7875,6 @@ async def on_admin_confirm_payment(
     cust = int(o.get("user_id") or 0)
     if b_sp > 0 and cust:
         _loyalty_apply_local_debit(cust, b_sp)
-    clear_cart = bool(o.pop("clear_cart_on_paid", False))
-    if clear_cart and cust:
-        _cart_clear_uid(cust)
     _user_state_clear_payment_states(cust)
     cud = _user_data_for(context.application, cust)
     cud.pop("awaiting_payment_order_id", None)
