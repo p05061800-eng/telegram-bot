@@ -328,9 +328,14 @@ async def track_user_activity(
     if not u:
         return
     try:
-        users_touch(int(u.id), activity_only=True)
-        _register_login_username(int(u.id), getattr(u, "username", None))
-        _sync_user_delivery_country_to_user_data(int(u.id), context.user_data)
+        uid = int(u.id)
+        epoch = context.application.bot_data.get("deploy_epoch")
+        if epoch is not None and context.user_data.get("_deploy_seen_epoch") != epoch:
+            _apply_post_deploy_session_reset(uid, context.user_data)
+            context.user_data["_deploy_seen_epoch"] = epoch
+        users_touch(uid, activity_only=True)
+        _register_login_username(uid, getattr(u, "username", None))
+        _sync_user_delivery_country_to_user_data(uid, context.user_data)
     except Exception:
         logging.getLogger(__name__).exception("USERS touch")
 
@@ -388,6 +393,51 @@ def _user_state_clear_payment_states(uid: int) -> None:
     b.pop("crypto_check", None)
     if not b:
         user_states.pop(uid, None)
+
+
+_POST_DEPLOY_USER_DATA_EPHEMERAL: Tuple[str, ...] = (
+    "pending_order",
+    "deep_link_order_session",
+    "awaiting_payment_order_id",
+    "payment_pending_method",
+    "reply_to",
+    "reply_support_user_id",
+)
+_TINDER_USER_DATA_KEYS: Tuple[str, ...] = (
+    "tinder_autoplay_task",
+    "tinder_gidxs",
+    "tinder_i",
+    "tinder_cat_tok",
+    "tinder_message_id",
+    "tinder_chat_id",
+    "tinder_autoplay_paused",
+)
+
+
+def _apply_post_deploy_session_reset(uid: int, user_data: dict) -> None:
+    """После рестарта процесса (деплой): не тянуть корзину/черновики из другого PID."""
+    if not uid:
+        return
+    _clear_checkout_delivery(user_data)
+    for k in _POST_DEPLOY_USER_DATA_EPHEMERAL:
+        user_data.pop(k, None)
+    t_task = user_data.get("tinder_autoplay_task")
+    if isinstance(t_task, asyncio.Task) and not t_task.done():
+        try:
+            t_task.cancel()
+        except Exception:
+            pass
+    for k in _TINDER_USER_DATA_KEYS:
+        user_data.pop(k, None)
+    try:
+        SITE_LOGIN_PENDING_ORDER.pop(int(uid), None)
+    except (TypeError, ValueError):
+        pass
+    user_states.pop(int(uid), None)
+    user_support_state.pop(int(uid), None)
+    _cart_clear_site_pricing_hints(int(uid))
+    USER_SITE_LOYALTY.pop(int(uid), None)
+    _cart_clear_uid(int(uid))
 
 
 FALLBACK_USER_TEXT = (
@@ -1046,11 +1096,13 @@ def _apply_site_loyalty_from_sync(uid: int, data: dict) -> Optional[str]:
         prev_bal_i = None
     notify: Optional[str] = None
     if earned_i is not None and int(earned_i) > 0:
-        parts = [f"⭐ Начислено бонусов: +{int(earned_i)}"]
+        parts = [f"⭐ Зачислено бонусов: +{int(earned_i)}."]
         if bal_i is not None:
-            parts.append(f"На счёте: {int(bal_i)} бонусов.")
+            parts.append(f"Всего на бонусном счёте: {int(bal_i)}.")
         elif prev_bal_i is not None:
-            parts.append(f"На счёте: {int(prev_bal_i) + int(earned_i)} бонусов (оценка).")
+            parts.append(
+                f"Всего на бонусном счёте: {int(prev_bal_i) + int(earned_i)} (по данным бота)."
+            )
         if msg:
             parts.append(msg)
         notify = "\n".join(parts)
@@ -1107,6 +1159,56 @@ def _loyalty_apply_local_debit(uid: int, amount: int) -> None:
         bal = 0
     rec["balance"] = max(0, bal - int(amount))
     rec["updated"] = time.time()
+
+
+_LOYALTY_PENDING_EARN_KEYS: Tuple[str, ...] = (
+    "bonusWillEarn",
+    "bonusesWillEarn",
+    "expectedBonus",
+    "orderBonusEstimate",
+    "loyaltyPointsToEarn",
+    "pointsToEarn",
+    "cashbackEstimate",
+    "bonusAccrualEstimate",
+    "orderBonusAccrual",
+)
+
+
+def _loyalty_pending_earn_from_dict(data: dict) -> Optional[int]:
+    """Явная оценка начисления из JSON заказа/сайта (если есть)."""
+    if not isinstance(data, dict):
+        return None
+    v = _loyalty_find_int(data, _LOYALTY_PENDING_EARN_KEYS, 3)
+    if v is None or int(v) <= 0:
+        return None
+    return int(v)
+
+
+def _loyalty_earn_percent_from_env() -> int:
+    """Доля суммы к оплате для оценки начисления, 0…100. 0 — только явные поля заказа; по умолчанию 5."""
+    return max(0, min(100, _env_int("ILLUCARDS_LOYALTY_EARN_PERCENT", 5)))
+
+
+def _loyalty_compute_earn_estimate(
+    pay_total: int, hint: Optional[dict] = None
+) -> Optional[int]:
+    """
+    Оценка бонусов с заказа: сначала поля сайта, иначе ILLUCARDS_LOYALTY_EARN_PERCENT от суммы к оплате.
+    Несуразно большие значения из JSON игнорируем.
+    """
+    pt = max(0, int(pay_total or 0))
+    if pt <= 0:
+        return None
+    if isinstance(hint, dict):
+        raw = _loyalty_pending_earn_from_dict(hint)
+        if raw is not None:
+            cap = max(pt * 3, 500_000)
+            if raw <= cap:
+                return raw
+    pct = _loyalty_earn_percent_from_env()
+    if pct > 0:
+        return (pt * pct) // 100
+    return None
 
 
 def _checkout_bonus_cap(uid: int, grand_before_bonus: int) -> int:
@@ -2231,6 +2333,15 @@ def _coerce_card_price_int(val: object) -> int:
         return 0
 
 
+def _cart_line_qty_coerce(raw: object) -> int:
+    """Количество в строке корзины (сайт/JSON может слать строку или float)."""
+    try:
+        q = int(float(raw))
+    except (TypeError, ValueError):
+        return 1
+    return max(1, q)
+
+
 def _is_truthy_flag(val: object) -> bool:
     if val is True:
         return True
@@ -3054,16 +3165,31 @@ def _format_customer_order_status_notice(order_id: int, status_key: str) -> str:
     return f"📦 #{order_id}"
 
 
-def _payment_intro_text(total: int, currency: str = "BYN") -> str:
+def _payment_intro_text(
+    total: int,
+    currency: str = "BYN",
+    *,
+    loyalty_earn_estimate: Optional[int] = None,
+) -> str:
     """После оформления: сумма и выбор способа оплаты (кнопки — карта / перевод / крипта)."""
     cur = str(currency or "BYN").strip().upper() or "BYN"
-    return (
+    body = (
         f"💰 Итого: {int(total)} {cur}\n\n"
         "Выберите способ оплаты:\n\n"
         "💳 Карта · 📱 Перевод · ₿ Крипта\n\n"
         f"{PAY_FLOW_STEPS}\n\n"
         "👇 Нажмите кнопку ниже"
     )
+    try:
+        est = int(loyalty_earn_estimate) if loyalty_earn_estimate is not None else 0
+    except (TypeError, ValueError):
+        est = 0
+    if est > 0:
+        body += (
+            f"\n\n⭐ Ориентировочно начислится бонусов с заказа: ~{est}. "
+            "Точное значение подтвердит сайт после оплаты."
+        )
+    return body
 
 
 def _format_delivery_block(d: Optional[dict]) -> str:
@@ -3237,6 +3363,8 @@ async def _notify_admin_new_order(
     lines: List[dict],
     total: int,
     delivery: Optional[dict] = None,
+    *,
+    loyalty_hint_dict: Optional[dict] = None,
 ) -> Optional[int]:
     """Новый заказ только в ORDERS; в ORDER_NOTIFY_TARGET карточка заказа — после оплаты (_send_deferred_admin_order_panel)."""
     global ORDER_COUNTER
@@ -3246,7 +3374,7 @@ async def _notify_admin_new_order(
     drec = deepcopy(delivery) if delivery else {}
     now = time.time()
     ORDER_COUNTER = order_id + 1
-    ORDERS[order_id] = {
+    rec: dict = {
         "user_id": uid,
         "username": uname,
         "items": deepcopy(list(lines)),
@@ -3260,6 +3388,10 @@ async def _notify_admin_new_order(
         "payment_proof_submitted": False,
         "clear_cart_on_paid": False,
     }
+    earn_est = _loyalty_compute_earn_estimate(int(total), loyalty_hint_dict)
+    if earn_est is not None and int(earn_est) > 0:
+        rec["loyalty_earn_estimate"] = int(earn_est)
+    ORDERS[order_id] = rec
     if uid:
         users_touch(uid, activity_only=True)
     return order_id
@@ -3352,10 +3484,24 @@ def _format_payment_receipt_text(order_id: int, o: dict) -> str:
         ]
     )
     cust_rc = int(o.get("user_id") or 0)
-    foot_rc = _loyalty_cart_footer_lines(cust_rc)
-    if foot_rc:
+    try:
+        earn_est = int(o.get("loyalty_earn_estimate") or 0)
+    except (TypeError, ValueError):
+        earn_est = 0
+    if earn_est > 0:
         lines.append("")
-        lines.extend(foot_rc)
+        lines.append(
+            f"⭐ Ожидаемое начисление с этого заказа: ~{earn_est} бонусов "
+            "(фактическое начисление пришлёт сайт; мы пришлём сообщение при синхронизации)."
+        )
+    bal_rc = _loyalty_balance_int(cust_rc)
+    lines.append("")
+    lines.append(f"⭐ На бонусном счёте сейчас: {bal_rc}.")
+    rec_loy = USER_SITE_LOYALTY.get(cust_rc) if cust_rc else None
+    if isinstance(rec_loy, dict):
+        hint_loy = str(rec_loy.get("hint") or "").strip()
+        if hint_loy and len(hint_loy) < 300:
+            lines.append(hint_loy)
     body = "\n".join(lines)
     if len(body) > 4090:
         body = body[:4086] + "…"
@@ -3603,8 +3749,10 @@ def _cart_totals(lines: List[dict]) -> Tuple[int, int]:
     t = 0
     n = 0
     for x in lines:
-        q = int(x.get("qty") or 1)
-        p = int(x.get("price") or 0)
+        if not isinstance(x, dict):
+            continue
+        q = _cart_line_qty_coerce(x.get("qty"))
+        p = _coerce_card_price_int(x.get("price"))
         t += p * q
         n += q
     return t, n
@@ -3665,9 +3813,13 @@ def _format_cart_message(
     site_labels = {
         str(x.get("line_currency") or "").strip().upper()
         for x in lines
-        if x.get("from_site") and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
+        if isinstance(x, dict)
+        and x.get("from_site")
+        and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
     }
-    if site_labels and all(x.get("from_site") for x in lines) and len(site_labels) == 1:
+    if site_labels and all(
+        isinstance(x, dict) and x.get("from_site") for x in lines
+    ) and len(site_labels) == 1:
         cur = site_labels.pop()
     else:
         cur = default_cur
@@ -3679,11 +3831,13 @@ def _format_cart_message(
         "",
     ]
     for x in lines:
+        if not isinstance(x, dict):
+            continue
         name = (x.get("name") or "—")[:200]
         if len((x.get("name") or "")) > 200:
             name = name.rstrip() + "…"
-        p = int(x.get("price") or 0)
-        q = int(x.get("qty") or 1)
+        p = _coerce_card_price_int(x.get("price"))
+        q = _cart_line_qty_coerce(x.get("qty"))
         lc = str(x.get("line_currency") or "").strip().upper()
         line_cur = lc if lc in ("BYN", "RUB") else cur
         if q <= 1:
@@ -5353,10 +5507,17 @@ def _format_user_deep_link_order_message(order: dict) -> str:
     out.append(f"🚚 Доставка: {label}")
     out.append("")
     hint = _coerce_card_price_int(order.get("site_grand_total_hint") or 0)
-    computed = goods_total + amount
+    computed = int(goods_total) + int(amount)
     total_show = computed
-    if hint > 0 and abs(hint - computed) >= max(50, int(amount or 0) // 2 or 50):
-        total_show = hint
+    # Подсказку с сайта берём только если она не меньше суммы товаров и близка к
+    # «товары + доставка» — иначе в JSON часто попадает чужое поле (скидка, BYN и т.д.).
+    if (
+        hint > 0
+        and _site_grand_covers_goods(hint, int(goods_total))
+        and computed > 0
+        and abs(int(hint) - int(computed)) <= max(100, int(computed) // 25)
+    ):
+        total_show = int(hint)
     if g_cur == "BYN":
         out.append(f"💰 Итого: {total_show} BYN")
     else:
@@ -5594,7 +5755,7 @@ async def on_deep_link_confirm_order(
         else:
             total = int(goods_total)
         oid = await _notify_admin_new_order(
-            context, u, list(lines), int(total), deepcopy(drec)
+            context, u, list(lines), int(total), deepcopy(drec), loyalty_hint_dict=None
         )
         if oid is None:
             await _notify_callback_issue(q, context)
@@ -5624,8 +5785,11 @@ async def on_deep_link_confirm_order(
         pass
     await q.message.reply_text(ORDER_AUTO_ACK)
     if uid_cb:
+        lo_est = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
         await q.message.reply_text(
-            _payment_intro_text(int(total), pay_cur),
+            _payment_intro_text(
+                int(total), pay_cur, loyalty_earn_estimate=lo_est
+            ),
             reply_markup=_kb_payment_methods_with_back(),
         )
         users_touch(uid_cb, "payment")
@@ -5737,7 +5901,12 @@ async def on_deep_link_structured_submit(
         order_rec["total"] = int(goods_total) + int(d_amt)
         pay_cur_dl = "RUB"
     oid = await _notify_admin_new_order(
-        context, u, list(lines), int(order_rec["total"]), deepcopy(drec)
+        context,
+        u,
+        list(lines),
+        int(order_rec["total"]),
+        deepcopy(drec),
+        loyalty_hint_dict=order,
     )
     if oid is None:
         try:
@@ -5760,8 +5929,9 @@ async def on_deep_link_structured_submit(
     except Exception:
         pass
     tot = int(order_rec["total"])
+    lo_est_dl = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
     await q.message.reply_text(
-        _payment_intro_text(tot, pay_cur_dl),
+        _payment_intro_text(tot, pay_cur_dl, loyalty_earn_estimate=lo_est_dl),
         reply_markup=_kb_payment_methods_with_back(),
     )
     users_touch(u.id, "payment")
@@ -6974,8 +7144,9 @@ async def on_checkout_nav_back(
             await q.answer()
         except Exception:
             pass
+        lo_est_pm = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
         await q.message.reply_text(
-            _payment_intro_text(tot, pay_cur),
+            _payment_intro_text(tot, pay_cur, loyalty_earn_estimate=lo_est_pm),
             reply_markup=_kb_payment_methods_with_back(),
         )
         return
@@ -7275,8 +7446,9 @@ async def on_send_order_to_admin(
     _cart_clear_site_pricing_hints(uid)
     await q.answer()
     tot = int(order_rec["total"])
+    lo_est_ta = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
     await q.message.reply_text(
-        _payment_intro_text(tot, pay_cur),
+        _payment_intro_text(tot, pay_cur, loyalty_earn_estimate=lo_est_ta),
         reply_markup=_kb_payment_methods_with_back(),
     )
     users_touch(uid, "payment")
@@ -7864,22 +8036,33 @@ async def on_view_cart_callback(
         return
     await q.answer()
     uid = q.from_user.id if q.from_user else 0
-    _ensure_user_cart(uid, context.user_data)
-    ud = context.user_data
-    lines = _cart_get_lines_uid(uid, ud)
-    products = list(context.application.bot_data.get("products") or [])
-    if not products:
-        products = await load_products() or []
+    log_vc = logging.getLogger(__name__)
+    try:
+        _ensure_user_cart(uid, context.user_data)
+        ud = context.user_data
+        lines = _cart_get_lines_uid(uid, ud)
+        products = list(context.application.bot_data.get("products") or [])
+        if not products:
+            products = await load_products() or []
+            if products:
+                context.application.bot_data["products"] = products
         if products:
-            context.application.bot_data["products"] = products
-    if products:
-        _reprice_lines_for_delivery(
-            lines, products, _cart_price_region_for_user(uid, ud)
-        )
-        _cart_set_items_uid(uid, lines)
-    t = _format_cart_message(lines, ud, cart_uid=uid)
-    kb = _kb_cart(lines)
-    await q.message.reply_text(t, reply_markup=kb)
+            _reprice_lines_for_delivery(
+                lines, products, _cart_price_region_for_user(uid, ud)
+            )
+            _cart_set_items_uid(uid, lines)
+        t = _format_cart_message(lines, ud, cart_uid=uid)
+        kb = _kb_cart(lines)
+        await q.message.reply_text(t, reply_markup=kb)
+    except Exception:
+        log_vc.exception("vc:0 корзина user_id=%s", uid)
+        try:
+            await q.message.reply_text(
+                "Не удалось показать корзину. Попробуйте кнопку «💚 Корзина» внизу или «Связь».",
+                reply_markup=REPLY_KB,
+            )
+        except Exception:
+            log_vc.exception("vc:0 fallback reply failed")
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -8071,22 +8254,34 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user_data.pop("pending_order", None)
 
     if text == BTN_CART:
-        await _delete_user_temp_messages(context.bot, uid)
-        _ensure_user_cart(uid, user_data)
-        cl = _cart_get_lines_uid(uid, user_data)
-        products = list(context.application.bot_data.get("products") or [])
-        if not products:
-            products = await load_products() or []
+        log_cart = logging.getLogger(__name__)
+        try:
+            await _delete_user_temp_messages(context.bot, uid)
+            _ensure_user_cart(uid, user_data)
+            cl = _cart_get_lines_uid(uid, user_data)
+            products = list(context.application.bot_data.get("products") or [])
+            if not products:
+                products = await load_products() or []
+                if products:
+                    context.application.bot_data["products"] = products
             if products:
-                context.application.bot_data["products"] = products
-        if products:
-            _reprice_lines_for_delivery(
-                cl, products, _cart_price_region_for_user(uid, user_data)
-            )
-            _cart_set_items_uid(uid, cl)
-        t = _format_cart_message(cl, user_data, cart_uid=uid)
-        kb = _kb_cart(cl)
-        await msg.reply_text(t, reply_markup=kb)
+                _reprice_lines_for_delivery(
+                    cl, products, _cart_price_region_for_user(uid, user_data)
+                )
+                _cart_set_items_uid(uid, cl)
+            t = _format_cart_message(cl, user_data, cart_uid=uid)
+            kb = _kb_cart(cl)
+            await msg.reply_text(t, reply_markup=kb)
+        except Exception:
+            log_cart.exception("Корзина: сбой при ответе user_id=%s", uid)
+            try:
+                await msg.reply_text(
+                    "Не удалось показать корзину (сбой данных). "
+                    "Попробуйте ещё раз или откройте каталог; если повторяется — напишите в «Связь».",
+                    reply_markup=REPLY_KB,
+                )
+            except Exception:
+                log_cart.exception("Корзина: не удалось отправить сообщение об ошибке")
         return
 
     if text == BTN_MY_ORDERS:
@@ -8165,6 +8360,17 @@ async def login_http_api_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def post_init(application: Application) -> None:
     log = logging.getLogger(__name__)
+    application.bot_data["deploy_epoch"] = time.time_ns()
+    n_sl = len(SITE_LOGIN_PENDING_ORDER)
+    n_lc = len(LOGIN_CODES)
+    SITE_LOGIN_PENDING_ORDER.clear()
+    LOGIN_CODES.clear()
+    log.info(
+        "Рестарт процесса: deploy_epoch=%s; сброшены SITE_LOGIN_PENDING_ORDER=%d, LOGIN_CODES=%d",
+        application.bot_data["deploy_epoch"],
+        n_sl,
+        n_lc,
+    )
     # Иначе Telegram отдаёт 409, если у бота остался webhook (getUpdates + webhook несовместимы).
     try:
         await application.bot.delete_webhook(drop_pending_updates=False)
