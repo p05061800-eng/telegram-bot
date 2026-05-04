@@ -2256,7 +2256,7 @@ ORDER_STATUS_UPDATE_API_URL = os.getenv(
     f"{ILLUCARDS_BASE}/api/order/update",
 ).strip()
 ORDER_STATUS_UPDATE_SECRET = os.getenv("ILLUCARDS_ORDER_UPDATE_SECRET", "").strip()
-# Опционально: POST на ваш URL после скрина оплаты — очистить корзину на сайте (см. _notify_site_cart_cleared_after_proof).
+# Опционально: POST на ваш URL после нажатия «Оплатить» (callback paid) — очистить корзину на сайте.
 ILLUCARDS_CART_CLEAR_ON_PROOF_URL = (os.getenv("ILLUCARDS_CART_CLEAR_ON_PROOF_URL") or "").strip()
 # Тот же секрет, что на сайте (Vercel): GET /api/order/{id} и POST /api/order/update — Bearer.
 # Если на проде включена проверка без заголовка — 401 и заказ по ссылке не подтянется.
@@ -5449,7 +5449,7 @@ def _site_status_from_bot_status(status: str) -> Optional[str]:
 
 
 def _clear_user_cart_after_payment_proof(uid: int, oid: int, o: dict) -> None:
-    """TG-корзина и подсказки цен — после присланного чека (скрина), если флаг заказа."""
+    """TG-корзина — после нажатия «✅ Оплатить» (callback paid), если у заказа clear_cart_on_paid."""
     if not uid:
         return
     if not o.get("clear_cart_on_paid"):
@@ -5475,7 +5475,7 @@ async def _notify_site_cart_cleared_after_proof(uid: int, oid: int, o: dict) -> 
         "telegramUserId": int(uid),
         "botOrderId": int(oid),
         "externalOrderId": ext or None,
-        "event": "payment_proof_submitted",
+        "event": "payment_pay_clicked",
     }
     log = logging.getLogger(__name__)
     try:
@@ -5827,7 +5827,6 @@ async def on_deep_link_confirm_order(
         ORDERS[int(oid)]["total_goods"] = int(goods_total)
         ud["awaiting_payment_order_id"] = int(oid)
         ud.pop("payment_pending_method", None)
-        _cart_clear_site_pricing_hints(uid_cb)
     ud.pop("pending_order", None)
     if uid_cb:
         SITE_LOGIN_PENDING_ORDER.pop(uid_cb, None)
@@ -7490,8 +7489,6 @@ async def on_send_order_to_admin(
         ORDERS[int(oid)]["bonus_applied"] = int(spend)
     ud["awaiting_payment_order_id"] = int(oid)
     ud.pop("payment_pending_method", None)
-    _clear_checkout_delivery(ud)
-    _cart_clear_site_pricing_hints(uid)
     await q.answer()
     tot = int(order_rec["total"])
     lo_est_ta = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
@@ -7640,6 +7637,15 @@ async def on_payment_paid(
         o["payment_pending_method"] = pm
     _clear_crypto_auto_watch(o, uid)
     _user_state_set(uid, "awaiting_proof", int(oid))
+    _clear_checkout_delivery(ud)
+    _cart_clear_site_pricing_hints(uid)
+    _clear_user_cart_after_payment_proof(uid, int(oid), o)
+    try:
+        asyncio.get_running_loop().create_task(
+            _notify_site_cart_cleared_after_proof(uid, int(oid), o)
+        )
+    except RuntimeError:
+        pass
     try:
         await q.answer()
     except Exception:
@@ -7820,13 +7826,6 @@ async def on_payment_proof_photo(
         return
     o["payment_proof_submitted"] = True
     o["proof_file_id"] = file_id
-    _clear_user_cart_after_payment_proof(uid, int(oid), o)
-    try:
-        asyncio.get_running_loop().create_task(
-            _notify_site_cart_cleared_after_proof(uid, int(oid), o)
-        )
-    except RuntimeError:
-        pass
     _user_state_pop(uid, "awaiting_proof")
     await msg.reply_text(PAY_PROOF_WAIT)
 
