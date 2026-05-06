@@ -181,6 +181,25 @@ USER_CART: dict = {}
 # После входа на сайт по коду: текст черновика до «Подтвердить / Отмена» (user_data может быть пуст)
 SITE_LOGIN_PENDING_ORDER: Dict[int, str] = {}
 USER_FAVORITES: dict = {}
+# Списки избранного в POST /api/sync/state, /api/sync/cart, /api/verify-code (ключ «items» сюда
+# не входит — в sync/cart «items» это корзина). Для POST /api/sync/favorites дополнительно читают «items».
+_FAVORITE_SYNC_PAYLOAD_KEYS: Tuple[str, ...] = (
+    "favorites",
+    "favoriteItems",
+    "favorite_list",
+    "favoriteList",
+    "wishlist",
+    "wishList",
+    "likedProducts",
+    "favoriteIds",
+    "favorite_ids",
+    "wishlistIds",
+    "wishlist_ids",
+    "savedFavorites",
+    "saved_favorites",
+    "heartedProducts",
+    "heartedProductIds",
+)
 # Баннеры витрины с сайта (POST /api/sync/promotions с сайта или GET HOME_PROMOTIONS_JSON_URL)
 HOME_PAGE_PROMOTIONS: List[dict] = []
 USER_ORDERS: dict = {}
@@ -894,14 +913,7 @@ async def _http_verify_code(request: web.Request) -> web.Response:
         _cart_set_items_uid(uid, lines)
     if uid:
         _cart_apply_site_pricing_hints(uid, data)
-        if isinstance(data.get("favorites"), list):
-            USER_FAVORITES[uid] = _normalize_sync_favorites_with_catalog(
-                data.get("favorites"), products
-            )
-        elif isinstance(data.get("favoriteItems"), list):
-            USER_FAVORITES[uid] = _normalize_sync_favorites_with_catalog(
-                data.get("favoriteItems"), products
-            )
+        _apply_optional_favorites_from_site_payload(uid, data, products)
         if "orders" in data:
             _user_orders_merge_site(uid, _normalize_sync_orders(data.get("orders")))
         note_vc = _apply_site_loyalty_from_sync(uid, data)
@@ -1524,16 +1536,7 @@ def _favorites_list_from_sync_favorites_endpoint(
     data: dict, products: Optional[List[dict]] = None
 ) -> List[str]:
     """Тело POST /api/sync/favorites: списки избранного с сайта → ref каталога (по id или названию)."""
-    for key in (
-        "items",
-        "favorites",
-        "favoriteItems",
-        "favorite_list",
-        "favoriteList",
-        "wishlist",
-        "wishList",
-        "likedProducts",
-    ):
+    for key in ("items",) + _FAVORITE_SYNC_PAYLOAD_KEYS:
         raw = data.get(key)
         if isinstance(raw, list):
             return _normalize_sync_favorites_with_catalog(raw, products)
@@ -1543,18 +1546,10 @@ def _favorites_list_from_sync_favorites_endpoint(
 def _apply_optional_favorites_from_site_payload(
     uid: int, data: dict, products: Optional[List[dict]] = None
 ) -> bool:
-    """Если в JSON явно передан список favorites или favoriteItems — обновить избранное. Иначе не трогаем."""
+    """Если в JSON явно передан список избранного — обновить USER_FAVORITES. Иначе не трогаем."""
     if not uid:
         return False
-    for key in (
-        "favorites",
-        "favoriteItems",
-        "favorite_list",
-        "favoriteList",
-        "wishlist",
-        "wishList",
-        "likedProducts",
-    ):
+    for key in _FAVORITE_SYNC_PAYLOAD_KEYS:
         if key in data and isinstance(data.get(key), list):
             USER_FAVORITES[uid] = _normalize_sync_favorites_with_catalog(
                 data[key], products
@@ -1581,6 +1576,23 @@ def _find_product_by_catalog_name(
     return None
 
 
+def _find_product_by_catalog_sku_slug(
+    products: List[dict], raw: str
+) -> Optional[dict]:
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    s_cf = s.casefold()
+    for p in products:
+        sk = str(p.get("sku") or "").strip()
+        sl = str(p.get("slug") or "").strip()
+        if sk and (sk == s or sk.casefold() == s_cf):
+            return p
+        if sl and (sl == s or sl.casefold() == s_cf):
+            return p
+    return None
+
+
 def _resolve_favorite_sync_entry_to_ref(
     entry: object, products: List[dict]
 ) -> Optional[str]:
@@ -1599,13 +1611,29 @@ def _resolve_favorite_sync_entry_to_ref(
             return _product_ref_for_callback(p, _global_product_index(products, p))
         return None
     if isinstance(entry, dict):
-        for key in ("ref", "id", "productId", "externalId", "product_id"):
+        for key in (
+            "ref",
+            "id",
+            "_id",
+            "productId",
+            "product_id",
+            "externalId",
+            "external_id",
+            "uuid",
+            "cardId",
+            "card_id",
+            "sku",
+            "slug",
+            "handle",
+        ):
             if key not in entry:
                 continue
             s = str(entry.get(key) or "").strip()
             if not s:
                 continue
-            p = _product_from_callback(s, products)
+            p = _product_from_callback(s, products) or _find_product_by_catalog_sku_slug(
+                products, s
+            )
             if p:
                 return _product_ref_for_callback(p, _global_product_index(products, p))
         for nk in ("name", "title", "label", "productName"):
@@ -2881,6 +2909,8 @@ async def load_products() -> List[dict]:
         if price_rub <= 0 and price_byn > 0:
             price_rub = price_byn
         is_sale = _card_is_sale_payload(item, price_byn or price_rub, legacy)
+        sku_raw = item.get("sku") or item.get("SKU") or ""
+        slug_raw = item.get("slug") or item.get("handle") or item.get("permalink") or ""
         cards.append(
             {
                 "id": item.get("id"),
@@ -2892,6 +2922,8 @@ async def load_products() -> List[dict]:
                 "rarity": (str(rar).strip() or "—"),
                 "image": image,
                 "isSale": is_sale,
+                "sku": str(sku_raw).strip(),
+                "slug": str(slug_raw).strip(),
             }
         )
     print(
@@ -2905,8 +2937,13 @@ def _product_from_callback(ref: str, products: List[dict]) -> Optional[dict]:
     if not ref or not products:
         return None
     s = str(ref).strip()
+    s_cf = s.casefold()
     for p in products:
-        if str(p.get("id", "")) == s:
+        pid = p.get("id")
+        if pid is None:
+            continue
+        ps = str(pid).strip()
+        if ps == s or ps.casefold() == s_cf:
             return p
     if s.isdecimal():
         i = int(s)
@@ -6702,7 +6739,10 @@ async def send_favorites_deck(
     if not refs:
         await msg.reply_text(
             "💚 В избранном пока пусто.\n\n"
-            "Добавьте карточки из каталога здесь (♥) или на сайте."
+            "С сайта список подгружается только если сайт отправляет его в бот при синхронизации "
+            "(те же endpoints, что и для корзины: favorites / state / вход по коду). "
+            "Обновите страницу после привязки Telegram.\n\n"
+            "Или добавьте карточки в избранное прямо в каталоге бота."
         )
         return
     in_scope: List[dict] = []
