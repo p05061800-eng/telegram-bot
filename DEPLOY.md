@@ -77,6 +77,8 @@ python3 main.py
 
 Баланс и начисления приходят из JSON синка / verify-code (поля вроде `bonusPoints`, `bonusBalance`, `bonusEarned` — см. `_parse_site_loyalty_snapshot` в `bot.py`). В боте: кнопка **«⭐ Бонусы»**, списание к оплате в превью заказа (кнопки «Выкл» / «50%» / «Макс»). Фактическое списание на стороне сайта — ваша интеграция после оплаты / sync.
 
+Для строки в оплате «⭐ Ориентировочно начислится с заказа: ~N» бот сначала берёт явное значение из payload сайта (например `bonusWillEarn`, `bonusForOrder`, `bonusToEarn`, `expectedBonus`, `orderBonusAccrual`, `loyaltyPointsToEarn`, `pointsForOrder`), и только если таких полей нет — считает fallback по `ILLUCARDS_LOYALTY_EARN_PERCENT` (по умолчанию 5%). Поэтому если на сайте ожидается 300, передавайте это число в одном из полей выше, иначе бот может показать расчётный процент (например 142).
+
 ### Акции главной
 
 Источники: `POST /api/sync/promotions`, JSON в полном sync, опционально `HOME_PROMOTIONS_JSON_URL`. Fallback — парсинг слайдера витрины (`swiper-slide` + `aspect-video` до `#collection`) на главной сайта.

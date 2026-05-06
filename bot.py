@@ -1015,6 +1015,59 @@ def _loyalty_find_int(data: dict, keys: Tuple[str, ...], depth: int) -> Optional
     return None
 
 
+_LOYALTY_PENDING_EARN_TEXT_KEYS: Tuple[str, ...] = (
+    "bonusMessage",
+    "loyaltyMessage",
+    "bonusNotice",
+    "loyalty_note",
+    "bonusInfo",
+    "bonusText",
+    "loyaltyText",
+    "bonusHint",
+    "bonus_hint",
+)
+
+
+def _loyalty_pending_earn_from_text(raw: object) -> Optional[int]:
+    """Вытащить ожидаемое начисление из текста вида «За эту покупку: 300 баллов»."""
+    if raw is None:
+        return None
+    s = str(raw).replace("\xa0", " ").strip()
+    if not s:
+        return None
+    pats = (
+        r"за\s+эту\s+покупк\w*[^0-9]{0,30}([0-9][0-9\s]{0,8})",
+        r"за\s+заказ[^0-9]{0,30}([0-9][0-9\s]{0,8})",
+        r"(?:будет\s+начисл\w*|начисл\w*)[^0-9]{0,30}([0-9][0-9\s]{0,8})",
+        r"(?:will\s+earn|earned?\s+for\s+(?:this\s+)?order)[^0-9]{0,30}([0-9][0-9\s]{0,8})",
+    )
+    for pat in pats:
+        m = re.search(pat, s, re.IGNORECASE)
+        if not m:
+            continue
+        val = _coerce_loyalty_int((m.group(1) or "").replace(" ", ""))
+        if val is not None and int(val) > 0:
+            return int(val)
+    return None
+
+
+def _loyalty_pending_earn_from_text_fields(data: dict) -> Optional[int]:
+    if not isinstance(data, dict):
+        return None
+    for k in _LOYALTY_PENDING_EARN_TEXT_KEYS:
+        if k in data:
+            v = _loyalty_pending_earn_from_text(data.get(k))
+            if v is not None:
+                return v
+    for nest in _LOYALTY_NEST_KEYS:
+        sub = data.get(nest)
+        if isinstance(sub, dict):
+            v = _loyalty_pending_earn_from_text_fields(sub)
+            if v is not None:
+                return v
+    return None
+
+
 def _parse_site_loyalty_snapshot(data: dict) -> dict:
     """Сайт может слать бонусы в sync/login JSON — поддерживаем несколько имён полей."""
     if not isinstance(data, dict):
@@ -1162,10 +1215,15 @@ def _loyalty_apply_local_debit(uid: int, amount: int) -> None:
 _LOYALTY_PENDING_EARN_KEYS: Tuple[str, ...] = (
     "bonusWillEarn",
     "bonusesWillEarn",
+    "bonusForOrder",
+    "bonusForThisOrder",
+    "bonusToEarn",
     "expectedBonus",
     "orderBonusEstimate",
+    "orderBonus",
     "loyaltyPointsToEarn",
     "pointsToEarn",
+    "pointsForOrder",
     "cashbackEstimate",
     "bonusAccrualEstimate",
     "orderBonusAccrual",
@@ -1177,9 +1235,9 @@ def _loyalty_pending_earn_from_dict(data: dict) -> Optional[int]:
     if not isinstance(data, dict):
         return None
     v = _loyalty_find_int(data, _LOYALTY_PENDING_EARN_KEYS, 3)
-    if v is None or int(v) <= 0:
-        return None
-    return int(v)
+    if v is not None and int(v) > 0:
+        return int(v)
+    return _loyalty_pending_earn_from_text_fields(data)
 
 
 def _loyalty_earn_percent_from_env() -> int:
@@ -3008,6 +3066,11 @@ def _cart_apply_site_pricing_hints(uid: int, data: dict) -> None:
         b["site_delivery_included"] = True
     else:
         b.pop("site_delivery_included", None)
+    pending = _loyalty_pending_earn_from_dict(data)
+    if pending is not None and int(pending) > 0:
+        b["site_loyalty_pending_earn"] = int(pending)
+    else:
+        b.pop("site_loyalty_pending_earn", None)
 
 
 def _cart_clear_site_pricing_hints(uid: int) -> None:
@@ -3019,6 +3082,17 @@ def _cart_clear_site_pricing_hints(uid: int) -> None:
     b.pop("site_cart_grand_total", None)
     b.pop("site_cart_grand_currency", None)
     b.pop("site_delivery_included", None)
+    b.pop("site_loyalty_pending_earn", None)
+
+
+def _cart_get_site_loyalty_pending_earn(uid: int) -> Optional[int]:
+    b = USER_CART.get(int(uid))
+    if not isinstance(b, dict):
+        return None
+    v = _coerce_card_price_int(b.get("site_loyalty_pending_earn"))
+    if v <= 0:
+        return None
+    return int(v)
 
 
 def _cart_get_site_grand_total(
@@ -5805,8 +5879,12 @@ async def on_deep_link_confirm_order(
             total = int(site_gt)
         else:
             total = int(goods_total)
+        lo_hint = None
+        pe = _cart_get_site_loyalty_pending_earn(uid_cb)
+        if pe is not None and int(pe) > 0:
+            lo_hint = {"bonusWillEarn": int(pe)}
         oid = await _notify_admin_new_order(
-            context, u, list(lines), int(total), deepcopy(drec), loyalty_hint_dict=None
+            context, u, list(lines), int(total), deepcopy(drec), loyalty_hint_dict=lo_hint
         )
         if oid is None:
             await _notify_callback_issue(q, context)
@@ -7473,8 +7551,12 @@ async def on_send_order_to_admin(
         "status": "В обработке",
         "bonus_applied": int(spend),
     }
+    lo_hint_ta = None
+    pe_ta = _cart_get_site_loyalty_pending_earn(uid)
+    if pe_ta is not None and int(pe_ta) > 0:
+        lo_hint_ta = {"bonusWillEarn": int(pe_ta)}
     oid = await _notify_admin_new_order(
-        context, u, list(lines), int(pay_total), deepcopy(drec)
+        context, u, list(lines), int(pay_total), deepcopy(drec), loyalty_hint_dict=lo_hint_ta
     )
     if oid is None:
         await _notify_callback_issue(q, context)
