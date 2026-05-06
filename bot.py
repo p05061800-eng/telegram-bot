@@ -1068,6 +1068,58 @@ def _loyalty_pending_earn_from_text_fields(data: dict) -> Optional[int]:
     return None
 
 
+_LOYALTY_ITEM_EARN_KEYS: Tuple[str, ...] = (
+    "bonusWillEarn",
+    "bonusForOrder",
+    "bonusForThisOrder",
+    "bonusToEarn",
+    "expectedBonus",
+    "orderBonusEstimate",
+    "orderBonus",
+    "bonusPoints",
+    "pointsEarned",
+    "pointsToEarn",
+    "pointsForOrder",
+    "cashbackEarned",
+    "cashbackEstimate",
+)
+
+
+def _loyalty_pending_earn_from_cart_items(raw_items: object) -> Optional[int]:
+    """Ожидаемое начисление из строк корзины, если сайт не дал top-level поле."""
+    if not isinstance(raw_items, list):
+        return None
+    total = 0
+    seen = False
+    for it in raw_items:
+        if not isinstance(it, dict):
+            continue
+        qty = _cart_line_qty_coerce(it.get("qty") or it.get("quantity") or 1)
+        per_item = None
+        line_total = None
+        for k in _LOYALTY_ITEM_EARN_KEYS:
+            if k not in it:
+                continue
+            val = _coerce_loyalty_int(it.get(k))
+            if val is None or int(val) <= 0:
+                continue
+            # lineBonus / orderBonusTotal обычно уже за всю строку, pointsToEarn чаще за штуку.
+            lk = str(k).lower()
+            if "line" in lk or "total" in lk or "order" in lk:
+                line_total = int(val)
+            else:
+                per_item = int(val)
+            seen = True
+            break
+        if line_total is not None:
+            total += int(line_total)
+        elif per_item is not None:
+            total += int(per_item) * int(qty)
+    if seen and total > 0:
+        return int(total)
+    return None
+
+
 def _parse_site_loyalty_snapshot(data: dict) -> dict:
     """Сайт может слать бонусы в sync/login JSON — поддерживаем несколько имён полей."""
     if not isinstance(data, dict):
@@ -3067,6 +3119,14 @@ def _cart_apply_site_pricing_hints(uid: int, data: dict) -> None:
     else:
         b.pop("site_delivery_included", None)
     pending = _loyalty_pending_earn_from_dict(data)
+    if pending is None:
+        pending = _loyalty_pending_earn_from_cart_items(
+            data.get("cart") if isinstance(data, dict) else None
+        )
+    if pending is None:
+        pending = _loyalty_pending_earn_from_cart_items(
+            data.get("items") if isinstance(data, dict) else None
+        )
     if pending is not None and int(pending) > 0:
         b["site_loyalty_pending_earn"] = int(pending)
     else:
