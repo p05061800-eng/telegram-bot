@@ -1297,22 +1297,51 @@ def _loyalty_earn_percent_from_env() -> int:
     return max(0, min(100, _env_int("ILLUCARDS_LOYALTY_EARN_PERCENT", 5)))
 
 
+def _loyalty_points_per_unit_from_env() -> int:
+    """Как на сайте IlluCards: баллов за 1 единицу товара. 0 — не использовать правило qty×балл."""
+    return max(0, _env_int("ILLUCARDS_LOYALTY_POINTS_PER_UNIT", 100))
+
+
+def _cart_total_units(lines: List[dict]) -> int:
+    n = 0
+    for x in lines:
+        if isinstance(x, dict):
+            n += int(_cart_line_qty_coerce(x.get("qty")))
+    return max(0, int(n))
+
+
 def _loyalty_compute_earn_estimate(
-    pay_total: int, hint: Optional[dict] = None
+    pay_total: int,
+    hint: Optional[dict] = None,
+    *,
+    cart_lines: Optional[List[dict]] = None,
 ) -> Optional[int]:
     """
-    Оценка бонусов с заказа: сначала поля сайта, иначе ILLUCARDS_LOYALTY_EARN_PERCENT от суммы к оплате.
-    Несуразно большие значения из JSON игнорируем.
+    Оценка бонусов с заказа:
+    1) поля/текст сайта (hint + sync);
+    2) сумма по позициям, если в строках корзины есть числа;
+    3) qty × ILLUCARDS_LOYALTY_POINTS_PER_UNIT (по умолчанию 100 — как витрина «за единицу»);
+    4) иначе процент от суммы (ILLUCARDS_LOYALTY_EARN_PERCENT).
     """
     pt = max(0, int(pay_total or 0))
     if pt <= 0:
         return None
+    cap = max(pt * 3, 500_000)
     if isinstance(hint, dict):
         raw = _loyalty_pending_earn_from_dict(hint)
         if raw is not None:
-            cap = max(pt * 3, 500_000)
             if raw <= cap:
-                return raw
+                return int(raw)
+    if cart_lines:
+        item_sum = _loyalty_pending_earn_from_cart_items(cart_lines)
+        if item_sum is not None and int(item_sum) > 0:
+            if int(item_sum) <= cap:
+                return int(item_sum)
+    ppu = _loyalty_points_per_unit_from_env()
+    if ppu > 0 and cart_lines:
+        units = _cart_total_units(list(cart_lines))
+        if units > 0:
+            return int(units) * int(ppu)
     pct = _loyalty_earn_percent_from_env()
     if pct > 0:
         return (pt * pct) // 100
@@ -3522,7 +3551,9 @@ async def _notify_admin_new_order(
         "payment_proof_submitted": False,
         "clear_cart_on_paid": False,
     }
-    earn_est = _loyalty_compute_earn_estimate(int(total), loyalty_hint_dict)
+    earn_est = _loyalty_compute_earn_estimate(
+        int(total), loyalty_hint_dict, cart_lines=list(lines)
+    )
     if earn_est is not None and int(earn_est) > 0:
         rec["loyalty_earn_estimate"] = int(earn_est)
     ORDERS[order_id] = rec
