@@ -3696,10 +3696,16 @@ def _format_payment_receipt_text(order_id: int, o: dict) -> str:
             f"⭐ Ожидаемое начисление с этого заказа: ~{earn_est} бонусов "
             "(фактическое начисление пришлёт сайт; мы пришлём сообщение при синхронизации)."
         )
-    bal_rc = _loyalty_balance_int(cust_rc)
-    lines.append("")
-    lines.append(f"⭐ На бонусном счёте сейчас: {bal_rc}.")
     rec_loy = USER_SITE_LOYALTY.get(cust_rc) if cust_rc else None
+    lines.append("")
+    has_known_balance = isinstance(rec_loy, dict) and rec_loy.get("balance") is not None
+    if has_known_balance:
+        bal_rc = _loyalty_balance_int(cust_rc)
+        lines.append(f"⭐ На бонусном счёте сейчас: {bal_rc}.")
+    else:
+        lines.append(
+            "⭐ Баланс бонусного счёта обновится после синхронизации с сайтом."
+        )
     if isinstance(rec_loy, dict):
         hint_loy = str(rec_loy.get("hint") or "").strip()
         if hint_loy and len(hint_loy) < 300:
