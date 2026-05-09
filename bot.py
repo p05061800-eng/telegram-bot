@@ -711,6 +711,74 @@ def _issue_login_code(telegram_id: int, username: str = "") -> str:
     return c
 
 
+def _login_wait_id_from_start_payload(raw: str) -> Optional[str]:
+    s = str(raw or "").strip().lower()
+    if not s.startswith("web_login_"):
+        return None
+    wait_id = s[len("web_login_") :].strip()
+    if len(wait_id) == 32 and all(c in "0123456789abcdef" for c in wait_id):
+        return wait_id
+    return None
+
+
+def _is_web_login_start_payload(raw: str) -> bool:
+    s = str(raw or "").strip().lower()
+    return s == "web_login" or _login_wait_id_from_start_payload(s) is not None
+
+
+async def _sync_login_code_to_site(
+    code: str,
+    telegram_user_id: int,
+    username: str = "",
+    wait_id: Optional[str] = None,
+) -> bool:
+    """
+    Optional production bridge: bot memory has the code, site can mirror it in Redis
+    and mark web_login_<wait_id> ready. If env is absent, the bot /api/verify-code
+    flow still works.
+    """
+    url = (os.getenv("ILLUCARDS_LOGIN_CODE_SYNC_URL") or "").strip()
+    secret = (os.getenv("ILLUCARDS_LOGIN_CODE_SYNC_SECRET") or "").strip()
+    if not url:
+        try:
+            url = f"{_illucards_site_base_url()}/api/internal/sync-login-code"
+        except Exception:
+            url = ""
+    if not url or not secret:
+        return False
+    un = str(username or "").strip().lstrip("@")
+    payload: dict = {
+        "code": str(code),
+        "user_id": int(telegram_user_id),
+        "username_display": un if un else f"id{int(telegram_user_id)}",
+        "username_norm": _normalize_login_username(un) if un else "",
+    }
+    if wait_id:
+        wid = _login_wait_id_from_start_payload(f"web_login_{wait_id}") or ""
+        if wid:
+            payload["wait_id"] = wid
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
+            async with session.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {secret}",
+                    "Content-Type": "application/json",
+                },
+            ) as resp:
+                if resp.status >= 300:
+                    body = await resp.text()
+                    logging.getLogger(__name__).warning(
+                        "sync-login-code HTTP %s: %s", resp.status, body[:300]
+                    )
+                    return False
+                return True
+    except Exception:
+        logging.getLogger(__name__).exception("sync-login-code failed")
+        return False
+
+
 def _login_cors_headers() -> dict:
     origin = (os.getenv("LOGIN_CORS_ORIGIN") or "*").strip()
     return {
@@ -838,6 +906,7 @@ async def _http_send_code(request: web.Request) -> web.Response:
             status=503,
         )
     code = _issue_login_code(int(uid), key)
+    await _sync_login_code_to_site(code, int(uid), key)
     try:
         await bot.send_message(
             chat_id=int(uid),
@@ -1273,6 +1342,23 @@ def _loyalty_apply_local_debit(uid: int, amount: int) -> None:
     except (TypeError, ValueError):
         bal = 0
     rec["balance"] = max(0, bal - int(amount))
+    rec["updated"] = time.time()
+
+
+def _loyalty_apply_local_credit(uid: int, amount: int) -> None:
+    """Fallback для заказов из бота: сайт может быть временно недоступен для синка."""
+    if not uid or int(amount) <= 0:
+        return
+    rec = USER_SITE_LOYALTY.get(int(uid))
+    if not isinstance(rec, dict):
+        rec = {}
+        USER_SITE_LOYALTY[int(uid)] = rec
+    try:
+        bal = max(0, int(rec.get("balance") or 0))
+    except (TypeError, ValueError):
+        bal = 0
+    rec["balance"] = bal + int(amount)
+    rec["last_earned"] = int(amount)
     rec["updated"] = time.time()
 
 
@@ -2332,6 +2418,7 @@ async def _run_login_http_api(bot) -> None:
         app["bot_username"] = str(me.username or "").strip()
     except Exception:
         app["bot_username"] = ""
+    globals()["_BOT_APP_BOT"] = bot
     app.router.add_get("/", _http_login_page)
     app.router.add_get("/login", _http_login_page)
     app.router.add_get("/health", _http_health)
@@ -2419,6 +2506,10 @@ ORDER_DEEP_LINK_API_URL = os.getenv(
 ORDER_STATUS_UPDATE_API_URL = os.getenv(
     "ORDER_STATUS_UPDATE_API_URL",
     f"{ILLUCARDS_BASE}/api/order/update",
+).strip()
+ORDER_FROM_BOT_API_URL = os.getenv(
+    "ORDER_FROM_BOT_API_URL",
+    f"{ILLUCARDS_BASE}/api/order/from-bot",
 ).strip()
 ORDER_STATUS_UPDATE_SECRET = os.getenv("ILLUCARDS_ORDER_UPDATE_SECRET", "").strip()
 # Опционально: POST на ваш URL после нажатия «Оплатить» (callback paid) — очистить корзину на сайте.
@@ -5732,6 +5823,108 @@ async def _sync_site_order_status(order: dict) -> None:
         log.exception("IlluCards order status sync failed: order=%s", external_id)
 
 
+def _site_delivery_code_from_bot_order(order: dict) -> str:
+    d = order.get("delivery") if isinstance(order.get("delivery"), dict) else {}
+    raw = str((d or {}).get("country") or "").strip().lower()
+    return {
+        "by": "BY",
+        "belarus": "BY",
+        "ru": "RU",
+        "russia": "RU",
+        "ua": "UA",
+        "ukraine": "UA",
+        "ot": "OTHER",
+        "other": "OTHER",
+    }.get(raw, "BY")
+
+
+def _site_order_items_from_bot_order(order: dict) -> List[dict]:
+    out: List[dict] = []
+    for row in list(order.get("items") or []):
+        if not isinstance(row, dict):
+            continue
+        ref = str(row.get("ref") or row.get("id") or row.get("sku") or row.get("name") or "").strip()
+        name = str(row.get("name") or row.get("title") or ref).strip()
+        if not ref or not name:
+            continue
+        try:
+            qty = max(1, int(row.get("qty") or row.get("quantity") or 1))
+        except (TypeError, ValueError):
+            qty = 1
+        try:
+            price = float(row.get("price") or row.get("priceByn") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        try:
+            price_rub = float(row.get("price_rub") or row.get("priceRub") or 0)
+        except (TypeError, ValueError):
+            price_rub = 0.0
+        out.append(
+            {
+                "id": ref[:120],
+                "title": name[:300],
+                "quantity": qty,
+                "priceByn": price,
+                "priceRub": round(price_rub),
+            }
+        )
+    return out
+
+
+async def _ensure_site_order_for_bot_order(order_id: int, order: dict) -> Optional[str]:
+    """Для заказов, оформленных в Telegram: создать зеркало заказа на сайте."""
+    existing = str(order.get("external_id") or "").strip()
+    if existing:
+        return existing
+    if not ORDER_FROM_BOT_API_URL:
+        return None
+    uid = int(order.get("user_id") or 0)
+    if not uid:
+        return None
+    items = _site_order_items_from_bot_order(order)
+    if not items:
+        return None
+    headers = {"Content-Type": "application/json"}
+    if ORDER_STATUS_UPDATE_SECRET:
+        headers["Authorization"] = f"Bearer {ORDER_STATUS_UPDATE_SECRET}"
+    payload = {
+        "bot_order_id": int(order_id),
+        "user_id": uid,
+        "username": str(order.get("username") or "").strip(),
+        "items": items,
+        "total": _order_resolved_grand_total(order),
+        "delivery": _site_delivery_code_from_bot_order(order),
+        "status": "paid" if order.get("paid") else "new",
+        "bonus_points_spent": int(order.get("bonus_applied") or 0),
+    }
+    log = logging.getLogger(__name__)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
+            async with session.post(
+                ORDER_FROM_BOT_API_URL, json=payload, headers=headers
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status >= 300:
+                    log.warning(
+                        "IlluCards bot order import failed: bot_order=%s HTTP %s %s",
+                        order_id,
+                        resp.status,
+                        str(data)[:300],
+                    )
+                    return None
+    except Exception:
+        log.exception("IlluCards bot order import failed: bot_order=%s", order_id)
+        return None
+    external_id = str(data.get("order_id") or "").strip() if isinstance(data, dict) else ""
+    if external_id:
+        order["external_id"] = external_id
+    if isinstance(data, dict):
+        note = _apply_site_loyalty_from_sync(uid, data)
+        bot = globals().get("_BOT_APP_BOT")
+        _schedule_loyalty_notify(bot, uid, note)
+    return external_id or None
+
+
 def _format_user_deep_link_order_message(order: dict) -> str:
     lines = list(order.get("items") or [])
     d = order.get("delivery") or {}
@@ -5803,6 +5996,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply_site_transition_notice(msg, uid)
     if args:
         first = (args[0] or "").strip()
+        joined = " ".join(args).strip()
+        jl = joined.lower()
+        fl = (first or "").strip().lower()
+        if _is_web_login_start_payload(jl) or _is_web_login_start_payload(fl):
+            await _maybe_thank_first_telegram_auth(msg, uid)
+            un = (msg.from_user.username or "").strip()
+            wait_id = _login_wait_id_from_start_payload(jl) or _login_wait_id_from_start_payload(fl)
+            code = _issue_login_code(uid, un)
+            await _sync_login_code_to_site(code, uid, un, wait_id=wait_id)
+            await msg.reply_text(
+                _telegram_login_code_message(code),
+                reply_markup=REPLY_KB,
+            )
+            await msg.reply_text(
+                "Код уже отправлен. Вернитесь на сайт, вставьте его и нажмите «Войти».",
+                reply_markup=REPLY_KB,
+            )
+            return
         oid = _parse_order_id_from_start_args(list(args))
         if oid:
             order = await _fetch_order_for_deep_link(oid)
@@ -5853,39 +6064,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         if first.lower() == "login":
             un = (msg.from_user.username or "").strip()
-            if not un:
-                await msg.reply_text(
-                    "⚠️ В профиле Telegram не указан @username.\n\n"
-                    "Задайте username в настройках, затем снова: /start login",
-                    reply_markup=REPLY_KB,
-                )
-                return
             code = _issue_login_code(uid, un)
+            await _sync_login_code_to_site(code, uid, un)
             await msg.reply_text(
                 _telegram_login_code_message(code),
-                reply_markup=REPLY_KB,
-            )
-            return
-        joined = " ".join(args).strip()
-        jl = joined.lower()
-        fl = (first or "").strip().lower()
-        if jl == "web_login" or fl == "web_login":
-            await _maybe_thank_first_telegram_auth(msg, uid)
-            un = (msg.from_user.username or "").strip()
-            if not un:
-                await msg.reply_text(
-                    "Чтобы войти на сайте, нужен @username в профиле Telegram.\n\n"
-                    "Добавьте username в настройках Telegram и снова перейдите по кнопке входа с сайта.",
-                    reply_markup=REPLY_KB,
-                )
-                return
-            code = _issue_login_code(uid, un)
-            await msg.reply_text(
-                _telegram_login_code_message(code),
-                reply_markup=REPLY_KB,
-            )
-            await msg.reply_text(
-                "Код уже отправлен. Вернитесь на сайт, вставьте его и нажмите «Войти».",
                 reply_markup=REPLY_KB,
             )
             return
@@ -6554,6 +6736,8 @@ async def on_order_status_buttons(
         cuid = int(o.get("user_id") or 0)
         if cuid:
             _clear_postpaid_thread_if_matches(cuid, oid)
+    if not str(o.get("external_id") or "").strip() and o.get("paid"):
+        await _ensure_site_order_for_bot_order(oid, o)
     await _sync_site_order_status(o)
     await q.answer(MSG_ORDER_STATUS_UPDATED, show_alert=False)
     notice = _format_customer_order_status_notice(oid, str(o.get("status") or ""))
@@ -8091,6 +8275,14 @@ async def on_admin_confirm_payment(
     cust = int(o.get("user_id") or 0)
     if b_sp > 0 and cust:
         _loyalty_apply_local_debit(cust, b_sp)
+    site_order_id = await _ensure_site_order_for_bot_order(oid, o)
+    if not site_order_id and cust:
+        try:
+            earn_est = int(o.get("loyalty_earn_estimate") or 0)
+        except (TypeError, ValueError):
+            earn_est = 0
+        if earn_est > 0:
+            _loyalty_apply_local_credit(cust, earn_est)
     _user_state_clear_payment_states(cust)
     cud = _user_data_for(context.application, cust)
     cud.pop("awaiting_payment_order_id", None)
