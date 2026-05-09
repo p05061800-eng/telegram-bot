@@ -223,6 +223,7 @@ user_states: Dict[int, Dict[str, int]] = {}
 USER_PREF_DELIVERY_COUNTRY: Dict[int, str] = {}
 # Отслеживание пользователей (память процесса): активность, снимок корзины, флаг заказов
 USERS: Dict[int, dict] = {}
+USER_MESSAGES: Dict[int, List[dict]] = {}
 TEMP_MESSAGE_TTL_SEC = _env_int("TEMP_MESSAGE_TTL_SEC", 180)
 
 # Вход на сайт illucards.by: POST /api/send-code, /api/verify-code (память процесса)
@@ -338,6 +339,57 @@ def users_touch(
         and str(action).strip() != ""
     ):
         row["last_action"] = str(action).strip()
+
+
+def _remember_user_message(uid: int, username: Optional[str], kind: str, text: str) -> None:
+    uid = int(uid or 0)
+    if not uid or is_admin(uid):
+        return
+    body = str(text or "").strip()
+    if not body:
+        return
+    bucket = USER_MESSAGES.setdefault(uid, [])
+    bucket.append(
+        {
+            "ts": time.time(),
+            "username": (username or "").strip(),
+            "kind": str(kind or "text").strip() or "text",
+            "text": body[:1500],
+        }
+    )
+    if len(bucket) > 100:
+        del bucket[:-100]
+
+
+def _user_display_name(uid: int, username: Optional[str] = None) -> str:
+    un = str(username or "").strip().lstrip("@")
+    if not un:
+        row = USERS.get(int(uid or 0)) or {}
+        un = str(row.get("username") or "").strip().lstrip("@")
+    return f"@{un}" if un else f"id {int(uid or 0)}"
+
+
+def _format_user_messages_for_admin(uid: int) -> str:
+    rows = list(USER_MESSAGES.get(int(uid or 0)) or [])
+    title = f"💬 Сообщения пользователя {_user_display_name(uid)}"
+    if not rows:
+        return title + "\n\nПока нет сохранённых сообщений от этого пользователя."
+    lines: List[str] = [title, ""]
+    for rec in rows[-30:]:
+        try:
+            ts = float(rec.get("ts") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        tss = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts > 0 else "—"
+        kind = str(rec.get("kind") or "text")
+        body = str(rec.get("text") or "").strip()
+        lines.append(f"{tss} · {kind}")
+        lines.append(body)
+        lines.append("")
+    out = "\n".join(lines).strip()
+    if len(out) > 4090:
+        out = out[:4086] + "…"
+    return out
 
 
 async def track_user_activity(
@@ -6424,16 +6476,20 @@ def _kb_admin_orders_list() -> Optional[InlineKeyboardMarkup]:
         cur_l = _order_line_currency_from_delivery(
             o.get("delivery") if isinstance(o.get("delivery"), dict) else None
         )
-        label = f"#{oid} — {tot} {cur_l}"
+        uid = int(o.get("user_id") or 0)
+        label = f"#{oid} · {_user_display_name(uid, o.get('username'))} · {tot} {cur_l}"
         if len(label) > 60:
             label = label[:57] + "…"
-        rows.append(
+        rows.append([InlineKeyboardButton(label, callback_data=f"open_order_{int(oid)}")])
+        if uid:
+            rows.append(
                 [
                     InlineKeyboardButton(
-                    label, callback_data=f"open_order_{int(oid)}"
-                ),
-            ],
-        )
+                        f"💬 {_user_display_name(uid, o.get('username'))}",
+                        callback_data=f"adm_user_msgs_{uid}",
+                    )
+                ]
+            )
     return InlineKeyboardMarkup(rows)
 
 
@@ -6547,14 +6603,17 @@ async def on_admin_panel_action(
                 "Как только клиент оформит покупку — заказ появится здесь ✨"
             )
         else:
-            body_lines: List[str] = ["📦 Заказы", "", "Выберите заказ 👇", ""]
+            body_lines: List[str] = ["📦 Заказы", "", "Выберите заказ или username 👇", ""]
             for oid in sorted(ORDERS.keys(), key=int):
                 o = ORDERS[oid]
                 tot = _order_resolved_grand_total(o)
                 cur_o = _order_line_currency_from_delivery(
                     o.get("delivery") if isinstance(o.get("delivery"), dict) else None
                 )
-                body_lines.append(f"#{oid} — {tot} {cur_o}")
+                uid = int(o.get("user_id") or 0)
+                uname = _user_display_name(uid, o.get("username"))
+                st_ru = _order_status_label_ru(_norm_bot_order_status(str(o.get("status") or "new")))
+                body_lines.append(f"#{oid} — {uname} — {tot} {cur_o} — {st_ru}")
             text = "\n".join(body_lines)
             if len(text) > 3500:
                 text = text[:3490] + "…"
@@ -6564,6 +6623,31 @@ async def on_admin_panel_action(
             )
     else:
         await q.message.reply_text(_format_admin_stats())
+
+
+async def on_admin_user_messages(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    m = re.match(r"^adm_user_msgs_(\d+)$", (q.data or "").strip())
+    if not m:
+        return
+    if not is_admin(q.from_user.id):
+        return
+    try:
+        uid = int(m.group(1))
+    except ValueError:
+        await q.answer()
+        return
+    await q.answer()
+    await q.message.reply_text(
+        _format_user_messages_for_admin(uid),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("💬 Ответить", callback_data=f"sup:rep:{uid}")]]
+        ),
+        disable_web_page_preview=True,
+    )
 
 
 async def on_admin_open_order(
