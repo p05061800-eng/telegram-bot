@@ -225,6 +225,7 @@ USER_PREF_DELIVERY_COUNTRY: Dict[int, str] = {}
 USERS: Dict[int, dict] = {}
 USER_MESSAGES: Dict[int, List[dict]] = {}
 TEMP_MESSAGE_TTL_SEC = _env_int("TEMP_MESSAGE_TTL_SEC", 180)
+STATE_FILE = (os.getenv("BOT_STATE_FILE") or "bot_state.json").strip()
 
 # Вход на сайт illucards.by: POST /api/send-code, /api/verify-code (память процесса)
 LOGIN_CODES: dict = {}
@@ -252,6 +253,73 @@ def _register_login_username(user_id: int, username: Optional[str]) -> None:
     key = _normalize_login_username(un)
     if key:
         USERNAME_TO_USER_ID[key] = uid
+
+
+def _int_key_dict(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for k, v in raw.items():
+        try:
+            out[int(k)] = v
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def save_state() -> None:
+    if not STATE_FILE:
+        return
+    data = {
+        "order_counter": int(ORDER_COUNTER),
+        "orders": ORDERS,
+        "user_orders": USER_ORDERS,
+        "users": USERS,
+        "user_messages": USER_MESSAGES,
+        "user_site_loyalty": USER_SITE_LOYALTY,
+    }
+    tmp = f"{STATE_FILE}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        logging.getLogger(__name__).exception("Не удалось сохранить состояние бота")
+
+
+def load_state() -> None:
+    global ORDER_COUNTER
+    if not STATE_FILE or not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        logging.getLogger(__name__).exception("Не удалось загрузить состояние бота")
+        return
+    ORDERS.clear()
+    ORDERS.update(_int_key_dict(data.get("orders")))
+    USER_ORDERS.clear()
+    USER_ORDERS.update(_int_key_dict(data.get("user_orders")))
+    USERS.clear()
+    USERS.update(_int_key_dict(data.get("users")))
+    USER_MESSAGES.clear()
+    USER_MESSAGES.update(_int_key_dict(data.get("user_messages")))
+    USER_SITE_LOYALTY.clear()
+    USER_SITE_LOYALTY.update(_int_key_dict(data.get("user_site_loyalty")))
+    try:
+        restored_counter = int(data.get("order_counter") or 1)
+    except (TypeError, ValueError):
+        restored_counter = 1
+    max_oid = max([0] + [int(x) for x in ORDERS.keys()])
+    ORDER_COUNTER = max(restored_counter, max_oid + 1)
+    logging.getLogger(__name__).info(
+        "Состояние загружено: orders=%d users=%d messages=%d next_order=%d",
+        len(ORDERS),
+        len(USERS),
+        len(USER_MESSAGES),
+        ORDER_COUNTER,
+    )
 
 
 def _users_snapshot_cart(uid: int) -> List[dict]:
@@ -359,6 +427,7 @@ def _remember_user_message(uid: int, username: Optional[str], kind: str, text: s
     )
     if len(bucket) > 100:
         del bucket[:-100]
+    save_state()
 
 
 def _user_display_name(uid: int, username: Optional[str] = None) -> str:
@@ -1352,6 +1421,7 @@ def _apply_site_loyalty_from_sync(uid: int, data: dict) -> Optional[str]:
         "updated": time.time(),
         "last_earned": int(earned_i) if earned_i is not None and earned_i > 0 else prev.get("last_earned"),
     }
+    save_state()
     return notify
 
 
@@ -1395,6 +1465,7 @@ def _loyalty_apply_local_debit(uid: int, amount: int) -> None:
         bal = 0
     rec["balance"] = max(0, bal - int(amount))
     rec["updated"] = time.time()
+    save_state()
 
 
 def _loyalty_apply_local_credit(uid: int, amount: int) -> None:
@@ -1412,6 +1483,7 @@ def _loyalty_apply_local_credit(uid: int, amount: int) -> None:
     rec["balance"] = bal + int(amount)
     rec["last_earned"] = int(amount)
     rec["updated"] = time.time()
+    save_state()
 
 
 _LOYALTY_PENDING_EARN_KEYS: Tuple[str, ...] = (
@@ -1911,6 +1983,7 @@ def _user_orders_merge_site(uid: int, site_orders: List[dict]) -> None:
     existing = list(USER_ORDERS.get(int(uid)) or [])
     kept = [r for r in existing if str(r.get("sync_source") or "") != "site"]
     USER_ORDERS[int(uid)] = kept + list(site_orders or [])
+    save_state()
 
 
 async def _http_sync_cart(request: web.Request) -> web.Response:
@@ -3739,6 +3812,7 @@ async def _notify_admin_new_order(
     ORDERS[order_id] = rec
     if uid:
         users_touch(uid, activity_only=True)
+    save_state()
     return order_id
 
 
@@ -4678,6 +4752,7 @@ def _void_unpaid_pending_order_and_restore_checkout(uid: int, ud: dict) -> bool:
     USER_ORDERS[uid] = [x for x in lst if str(x.get("id") or "") != str(oid)]
     if not USER_ORDERS[uid]:
         USER_ORDERS.pop(uid, None)
+    save_state()
     ud.pop("awaiting_payment_order_id", None)
     ud.pop("payment_pending_method", None)
     o.pop("payment_pending_method", None)
@@ -6269,6 +6344,7 @@ async def on_deep_link_confirm_order(
         )
         ORDERS[int(oid)]["clear_cart_on_paid"] = True
         ORDERS[int(oid)]["total_goods"] = int(goods_total)
+        save_state()
         ud["awaiting_payment_order_id"] = int(oid)
         ud.pop("payment_pending_method", None)
     ud.pop("pending_order", None)
@@ -6417,6 +6493,7 @@ async def on_deep_link_structured_submit(
     ORDERS[int(oid)]["total_goods"] = int(goods_total)
     if order_rec.get("external_id"):
         ORDERS[int(oid)]["external_id"] = str(order_rec["external_id"])
+    save_state()
     ud["awaiting_payment_order_id"] = int(oid)
     ud.pop("payment_pending_method", None)
     await q.answer()
@@ -6816,6 +6893,7 @@ async def on_order_status_buttons(
         await _refresh_admin_order_message(context, oid)
         return
     o["status"] = want
+    save_state()
     if want in ("done", "canceled"):
         cuid = int(o.get("user_id") or 0)
         if cuid:
@@ -7972,6 +8050,7 @@ async def on_send_order_to_admin(
     ORDERS[int(oid)]["total_goods"] = int(goods_total)
     if int(spend) > 0:
         ORDERS[int(oid)]["bonus_applied"] = int(spend)
+    save_state()
     ud["awaiting_payment_order_id"] = int(oid)
     ud.pop("payment_pending_method", None)
     await q.answer()
@@ -8237,6 +8316,14 @@ async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not msg or not msg.photo:
         return
     uid = msg.from_user.id if msg.from_user else 0
+    if uid:
+        cap_log = (msg.caption or "").strip()
+        _remember_user_message(
+            uid,
+            getattr(msg.from_user, "username", None) if msg.from_user else None,
+            "photo",
+            cap_log or "[фото]",
+        )
     if uid and _user_state_get(uid, "awaiting_proof") is not None:
         await on_payment_proof_photo(update, context)
         return
@@ -8359,14 +8446,17 @@ async def on_admin_confirm_payment(
     cust = int(o.get("user_id") or 0)
     if b_sp > 0 and cust:
         _loyalty_apply_local_debit(cust, b_sp)
-    site_order_id = await _ensure_site_order_for_bot_order(oid, o)
-    if not site_order_id and cust:
+    await _ensure_site_order_for_bot_order(oid, o)
+    if cust and not o.get("loyalty_credited"):
         try:
             earn_est = int(o.get("loyalty_earn_estimate") or 0)
         except (TypeError, ValueError):
             earn_est = 0
         if earn_est > 0:
             _loyalty_apply_local_credit(cust, earn_est)
+            o["loyalty_credited"] = True
+            o["loyalty_credited_amount"] = int(earn_est)
+            save_state()
     _user_state_clear_payment_states(cust)
     cud = _user_data_for(context.application, cust)
     cud.pop("awaiting_payment_order_id", None)
@@ -8616,6 +8706,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = msg.text.strip()
     user_data = context.user_data
     uid = msg.from_user.id if msg.from_user else 0
+    if uid:
+        _remember_user_message(
+            uid,
+            getattr(msg.from_user, "username", None) if msg.from_user else None,
+            "text",
+            msg.text,
+        )
 
     if _user_state_get(uid, "awaiting_proof") is not None:
         if text in REPLY_MENU_TEXTS:
@@ -8904,6 +9001,7 @@ async def login_http_api_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def post_init(application: Application) -> None:
     log = logging.getLogger(__name__)
+    load_state()
     application.bot_data["deploy_epoch"] = time.time_ns()
     n_sl = len(SITE_LOGIN_PENDING_ORDER)
     n_lc = len(LOGIN_CODES)
@@ -9012,6 +9110,12 @@ def main() -> None:
         CallbackQueryHandler(
             on_admin_open_order,
             pattern=re.compile(r"^open_order_\d+$"),
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_admin_user_messages,
+            pattern=re.compile(r"^adm_user_msgs_\d+$"),
         )
     )
     app.add_handler(
