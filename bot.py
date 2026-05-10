@@ -148,6 +148,30 @@ def is_admin(user_id):
     return user_id == ADMIN_ID
 
 
+def _resolve_admin_chat_id() -> Optional[int]:
+    raw = (
+        os.getenv("TELEGRAM_ADMIN_CHAT_ID")
+        or os.getenv("ILLUCARDS_TELEGRAM_ADMIN_CHAT_ID")
+        or os.getenv("TELEGRAM_ORDER_NOTIFY_ID")
+        or os.getenv("ORDER_NOTIFY_CHAT_ID")
+        or ""
+    )
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _order_belongs_to_telegram_user(order: dict, user_id: int) -> bool:
+    try:
+        return int(order.get("user_id") or 0) == int(user_id)
+    except (TypeError, ValueError):
+        return False
+
+
 # Заказы и админка:
 # 1) Клиенты не получают сообщений с admin inline-кнопками (accept_/sent_/cancel_/delmsg_/adm:/oam: и т.д.).
 # 2) При оформлении из корзины — только ORDERS; в ORDER_NOTIFY_TARGET карточка заказа с кнопками
@@ -6829,7 +6853,14 @@ async def on_user_order_open(
             return
         uid = q.from_user.id
         o = ORDERS.get(oid)
-        if not o or int(o.get("user_id") or 0) != int(uid):
+        admin_chat_id = _resolve_admin_chat_id()
+        if not o:
+            return
+        if (
+            not _order_belongs_to_telegram_user(o, uid)
+            and not is_admin(uid)
+            and (admin_chat_id is None or int(q.message.chat_id) != int(admin_chat_id))
+        ):
             return
         await q.answer()
         await q.message.reply_text(_format_user_order_detail(oid, o))
