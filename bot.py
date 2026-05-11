@@ -17,6 +17,7 @@ import secrets
 import sys
 import time
 import urllib.parse
+import urllib.request
 from copy import deepcopy
 from datetime import datetime
 from threading import Thread
@@ -250,6 +251,7 @@ USERS: Dict[int, dict] = {}
 USER_MESSAGES: Dict[int, List[dict]] = {}
 TEMP_MESSAGE_TTL_SEC = _env_int("TEMP_MESSAGE_TTL_SEC", 180)
 STATE_FILE = (os.getenv("BOT_STATE_FILE") or "bot_state.json").strip()
+STATE_REDIS_KEY = (os.getenv("BOT_STATE_REDIS_KEY") or "illucards:telegram-bot:state").strip()
 
 # Вход на сайт illucards.by: POST /api/send-code, /api/verify-code (память процесса)
 LOGIN_CODES: dict = {}
@@ -291,40 +293,79 @@ def _int_key_dict(raw: object) -> dict:
     return out
 
 
-def save_state() -> None:
-    if not STATE_FILE:
-        return
-    data = {
+def _state_redis_credentials() -> Optional[Tuple[str, str]]:
+    url = (
+        os.getenv("UPSTASH_REDIS_REST_URL")
+        or os.getenv("KV_REST_API_URL")
+        or ""
+    ).strip().rstrip("/")
+    token = (
+        os.getenv("UPSTASH_REDIS_REST_TOKEN")
+        or os.getenv("KV_REST_API_TOKEN")
+        or ""
+    ).strip()
+    if not url or not token:
+        return None
+    return url, token
+
+
+def _state_redis_command(args: List[object]) -> Optional[object]:
+    cred = _state_redis_credentials()
+    if not cred:
+        return None
+    url, token = cred
+    try:
+        body = json.dumps(args).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read().decode("utf-8")
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and parsed.get("error"):
+            logging.getLogger(__name__).warning("Redis state error: %s", parsed.get("error"))
+            return None
+        return parsed.get("result") if isinstance(parsed, dict) else None
+    except Exception:
+        logging.getLogger(__name__).exception("Redis state command failed")
+        return None
+
+
+def _build_state_payload() -> dict:
+    return {
         "order_counter": int(ORDER_COUNTER),
         "orders": ORDERS,
         "user_orders": USER_ORDERS,
+        "user_cart": USER_CART,
+        "user_favorites": USER_FAVORITES,
+        "user_states": user_states,
+        "user_pref_delivery_country": USER_PREF_DELIVERY_COUNTRY,
         "users": USERS,
         "user_messages": USER_MESSAGES,
         "user_site_loyalty": USER_SITE_LOYALTY,
     }
-    tmp = f"{STATE_FILE}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, STATE_FILE)
-    except Exception:
-        logging.getLogger(__name__).exception("Не удалось сохранить состояние бота")
 
 
-def load_state() -> None:
+def _apply_state_payload(data: dict) -> None:
     global ORDER_COUNTER
-    if not STATE_FILE or not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        logging.getLogger(__name__).exception("Не удалось загрузить состояние бота")
-        return
     ORDERS.clear()
     ORDERS.update(_int_key_dict(data.get("orders")))
     USER_ORDERS.clear()
     USER_ORDERS.update(_int_key_dict(data.get("user_orders")))
+    USER_CART.clear()
+    USER_CART.update(_int_key_dict(data.get("user_cart")))
+    USER_FAVORITES.clear()
+    USER_FAVORITES.update(_int_key_dict(data.get("user_favorites")))
+    user_states.clear()
+    user_states.update(_int_key_dict(data.get("user_states")))
+    USER_PREF_DELIVERY_COUNTRY.clear()
+    USER_PREF_DELIVERY_COUNTRY.update(_int_key_dict(data.get("user_pref_delivery_country")))
     USERS.clear()
     USERS.update(_int_key_dict(data.get("users")))
     USER_MESSAGES.clear()
@@ -337,6 +378,50 @@ def load_state() -> None:
         restored_counter = 1
     max_oid = max([0] + [int(x) for x in ORDERS.keys()])
     ORDER_COUNTER = max(restored_counter, max_oid + 1)
+
+
+def save_state() -> None:
+    data = _build_state_payload()
+    if STATE_REDIS_KEY:
+        _state_redis_command(["SET", STATE_REDIS_KEY, json.dumps(data, ensure_ascii=False)])
+    if not STATE_FILE:
+        return
+    tmp = f"{STATE_FILE}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        logging.getLogger(__name__).exception("Не удалось сохранить состояние бота")
+
+
+def load_state() -> None:
+    if STATE_REDIS_KEY:
+        raw = _state_redis_command(["GET", STATE_REDIS_KEY])
+        if isinstance(raw, str) and raw.strip():
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    _apply_state_payload(data)
+                    logging.getLogger(__name__).info(
+                        "Состояние загружено из Redis: orders=%d users=%d messages=%d next_order=%d",
+                        len(ORDERS),
+                        len(USERS),
+                        len(USER_MESSAGES),
+                        ORDER_COUNTER,
+                    )
+                    return
+            except Exception:
+                logging.getLogger(__name__).exception("Не удалось загрузить состояние из Redis")
+    if not STATE_FILE or not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        logging.getLogger(__name__).exception("Не удалось загрузить состояние бота")
+        return
+    _apply_state_payload(data)
     logging.getLogger(__name__).info(
         "Состояние загружено: orders=%d users=%d messages=%d next_order=%d",
         len(ORDERS),
@@ -527,6 +612,7 @@ def _user_state_set(uid: int, key: str, order_id: int) -> None:
         return
     b = _user_state_bucket(uid)
     b[key] = int(order_id)
+    save_state()
 
 
 def _user_state_pop(uid: int, key: str) -> Optional[int]:
@@ -540,6 +626,7 @@ def _user_state_pop(uid: int, key: str) -> Optional[int]:
         user_states.pop(uid, None)
     if v is None:
         return None
+    save_state()
     try:
         return int(v)
     except (TypeError, ValueError):
@@ -557,6 +644,7 @@ def _user_state_clear_payment_states(uid: int) -> None:
     b.pop("crypto_check", None)
     if not b:
         user_states.pop(uid, None)
+    save_state()
 
 
 _POST_DEPLOY_USER_DATA_EPHEMERAL: Tuple[str, ...] = (
@@ -1800,6 +1888,7 @@ def _apply_optional_favorites_from_site_payload(
             USER_FAVORITES[uid] = _normalize_sync_favorites_with_catalog(
                 data[key], products
             )
+            save_state()
             return True
     return False
 
@@ -2079,6 +2168,7 @@ async def _http_sync_favorites(request: web.Request) -> web.Response:
         products = []
     refs = _favorites_list_from_sync_favorites_endpoint(data, products)
     USER_FAVORITES[uid] = refs
+    save_state()
     users_touch(uid, "favorites_sync")
     logging.getLogger(__name__).info(
         "sync/favorites: user_id=%s позиций=%s", uid, len(refs)
@@ -2697,14 +2787,12 @@ SITE_DELIVERY_TO_BOT: dict = {
 
 
 def _remember_user_delivery_country(uid: int, code: str) -> None:
-    try:
-        u = int(uid or 0)
-    except (TypeError, ValueError):
-        u = 0
+    u = int(uid or 0)
     c = str(code or "").strip().lower()
     if not u or c not in DELIVERY_OPTIONS:
         return
     USER_PREF_DELIVERY_COUNTRY[u] = c
+    save_state()
 
 
 def _sync_user_delivery_country_to_user_data(uid: int, user_data: Optional[dict]) -> None:
@@ -3249,6 +3337,7 @@ def _cart_set_items_uid(user_id: int, lines: List[dict]) -> None:
     _ensure_user_cart(user_id)
     USER_CART[user_id]["items"] = list(lines)
     _cart_sync_total_uid(user_id)
+    save_state()
 
 
 def _reprice_uid_cart(
@@ -3322,6 +3411,7 @@ def _cart_dec_line_uid(user_id: int, user_data: Optional[dict], index: int) -> b
 
 def _cart_clear_uid(user_id: int) -> None:
     USER_CART[user_id] = {"items": [], "total": 0}
+    save_state()
 
 
 def _favorites_get_refs_uid(user_id: int, user_data: Optional[dict] = None) -> List[str]:
@@ -3343,6 +3433,7 @@ def _favorites_add_ref_uid(user_id: int, ref: str) -> int:
     if r not in cur:
         cur.append(r)
     USER_FAVORITES[uid] = cur
+    save_state()
     return len(cur)
 
 
@@ -3945,20 +4036,13 @@ def _format_payment_receipt_text(order_id: int, o: dict) -> str:
         earn_est = 0
     if earn_est > 0:
         lines.append("")
-        lines.append(
-            f"⭐ Ожидаемое начисление с этого заказа: ~{earn_est} бонусов "
-            "(фактическое начисление пришлёт сайт; мы пришлём сообщение при синхронизации)."
-        )
+        lines.append(f"⭐ Ожидаемое начисление с этого заказа: ~{earn_est} бонусов.")
     rec_loy = USER_SITE_LOYALTY.get(cust_rc) if cust_rc else None
     lines.append("")
     has_known_balance = isinstance(rec_loy, dict) and rec_loy.get("balance") is not None
     if has_known_balance:
         bal_rc = _loyalty_balance_int(cust_rc)
         lines.append(f"⭐ На бонусном счёте сейчас: {bal_rc}.")
-    else:
-        lines.append(
-            "⭐ Баланс бонусного счёта обновится после синхронизации с сайтом."
-        )
     if isinstance(rec_loy, dict):
         hint_loy = str(rec_loy.get("hint") or "").strip()
         if hint_loy and len(hint_loy) < 300:
@@ -8095,6 +8179,7 @@ async def on_send_order_to_admin(
     USER_ORDERS.setdefault(uid, []).append(order_rec)
     ORDERS[int(oid)]["clear_cart_on_paid"] = True
     ORDERS[int(oid)]["total_goods"] = int(goods_total)
+    ORDERS[int(oid)]["bonus_points_spent"] = int(spend_points)
     if int(spend) > 0:
         ORDERS[int(oid)]["bonus_applied"] = int(spend)
     save_state()
