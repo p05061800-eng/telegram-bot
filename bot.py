@@ -629,14 +629,8 @@ MSG_NO_VITRINA_PROMOS = (
 )
 MSG_PROMO_PARTICIPATION = "Для участия в акции пришлите нам видео с уже имеющимися карточками."
 MSG_LOYALTY_MENU = (
-    "⭐ Бонусная программа IlluCards\n\n"
-    "Баланс приходит с сайта (вход по коду, синк корзины / состояния): поля вроде "
-    "bonusPoints, bonusBalance. В боте 1 бонус = 1 BYN или 1 RUB к сумме заказа "
-    "(та же валюта, что у выбранной доставки).\n\n"
-    "Как списать: оформите заказ из «💚 Корзина» — после выбора страны в превью заказа "
-    "появятся кнопки «Выкл» / «50%» / «Макс». К оплате — уже с учётом бонусов. "
-    "После успешной оплаты баланс в боте уменьшается; точное значение на сайте обновит ваш backend.\n\n"
-    "Если баланс не виден — войдите на сайт через Telegram-код, чтобы сайт передал бонусы в бот."
+    "1 бонус = 100 RUB или 3,5 BYN\n"
+    "Потратить бонусы можно на последующие заказы"
 )
 MSG_ADD_TO_CART_STALE = "Эта карточка устарела в текущем сообщении. Откройте каталог заново и добавьте ещё раз."
 MSG_BUY_HINT = "Можно написать: купить <категория> <номер> или купить <название карточки>."
@@ -1594,14 +1588,32 @@ def _loyalty_compute_earn_estimate(
     return None
 
 
-def _checkout_bonus_cap(uid: int, grand_before_bonus: int) -> int:
-    return min(_loyalty_balance_int(uid), max(0, int(grand_before_bonus)))
+def _bonus_discount_units(points: int, currency: str) -> int:
+    cur = str(currency or "").strip().upper()
+    pts = max(0, int(points or 0))
+    if cur == "RUB":
+        return pts * 100
+    return (pts * 7) // 2
+
+
+def _bonus_points_for_discount(discount: int, currency: str) -> int:
+    cur = str(currency or "").strip().upper()
+    amt = max(0, int(discount or 0))
+    if cur == "RUB":
+        return amt // 100
+    return (amt * 2) // 7
+
+
+def _checkout_bonus_cap(uid: int, grand_before_bonus: int, currency: str = "BYN") -> int:
+    by_balance = _loyalty_balance_int(uid)
+    by_total = _bonus_points_for_discount(max(0, int(grand_before_bonus)), currency)
+    return min(by_balance, by_total)
 
 
 def _checkout_bonus_spend_effective(
-    user_data: dict, uid: int, grand_before_bonus: int
+    user_data: dict, uid: int, grand_before_bonus: int, currency: str = "BYN"
 ) -> int:
-    cap = _checkout_bonus_cap(uid, grand_before_bonus)
+    cap = _checkout_bonus_cap(uid, grand_before_bonus, currency)
     try:
         want = int(user_data.get("checkout_bonus_spend") or 0)
     except (TypeError, ValueError):
@@ -4676,10 +4688,12 @@ def _format_order_preview_with_delivery(
     use_site = bool(fin["use_site"])
     site_gt_raw = fin.get("site_gt_raw")
     grand_show = int(fin["grand_show"])
-    spend = 0
+    spend_points = 0
+    spend_discount = 0
     if checkout_uid:
-        spend = _checkout_bonus_spend_effective(user_data, checkout_uid, grand_show)
-    grand_final = max(0, int(grand_show) - int(spend))
+        spend_points = _checkout_bonus_spend_effective(user_data, checkout_uid, grand_show, g_cur)
+        spend_discount = min(int(grand_show), _bonus_discount_units(spend_points, g_cur))
+    grand_final = max(0, int(grand_show) - int(spend_discount))
     out: List[str] = [
         "📦 Ваш заказ:",
         "",
@@ -4698,22 +4712,22 @@ def _format_order_preview_with_delivery(
     if inc and not site_gt_raw:
         out.append(f"🚚 Доставка: {dlabel} (уже в сумме на сайте)")
         out.append("")
-        if spend > 0:
-            out.append(f"⭐ Списание бонусов: −{spend} {g_cur}")
+        if spend_points > 0:
+            out.append(f"⭐ Списание бонусов: −{spend_points} бонусов ({spend_discount} {g_cur})")
             out.append("")
         out.append(f"💰 Итого: {grand_final} {g_cur}")
     elif use_site:
         out.append(f"🚚 Доставка: {dlabel}")
         out.append("")
-        if spend > 0:
-            out.append(f"⭐ Списание бонусов: −{spend} {g_cur}")
+        if spend_points > 0:
+            out.append(f"⭐ Списание бонусов: −{spend_points} бонусов ({spend_discount} {g_cur})")
             out.append("")
         out.append(f"💰 Итого: {grand_final} {g_cur} (как на сайте)")
     else:
         out.append(f"🚚 Доставка: {dlabel}")
         out.append("")
-        if spend > 0:
-            out.append(f"⭐ Списание бонусов: −{spend} {g_cur}")
+        if spend_points > 0:
+            out.append(f"⭐ Списание бонусов: −{spend_points} бонусов ({spend_discount} {g_cur})")
             out.append("")
         if code == "by" and dcur == "BYN":
             out.append(f"💰 Итого: {grand_final} BYN")
@@ -4801,7 +4815,7 @@ def _kb_order_preview_actions(uid: int, user_data: dict) -> InlineKeyboardMarkup
         ],
     ]
     fin = _checkout_preview_finance(user_data, uid)
-    if fin and uid and _checkout_bonus_cap(uid, int(fin["grand_show"])) > 0:
+    if fin and uid and _checkout_bonus_cap(uid, int(fin["grand_show"]), str(fin["g_cur"])) > 0:
         rows.append(
             [
                 InlineKeyboardButton("⭐ Выкл", callback_data="bo:s:0"),
@@ -6046,7 +6060,8 @@ async def _ensure_site_order_for_bot_order(order_id: int, order: dict) -> Option
         "total": _order_resolved_grand_total(order),
         "delivery": _site_delivery_code_from_bot_order(order),
         "status": "paid" if order.get("paid") else "new",
-        "bonus_points_spent": int(order.get("bonus_applied") or 0),
+        "bonus_points_spent": int(order.get("bonus_points_spent") or 0),
+        "bonus_discount": int(order.get("bonus_applied") or 0),
     }
     log = logging.getLogger(__name__)
     try:
@@ -7908,7 +7923,7 @@ async def on_bonus_spend_pick(
         except Exception:
             pass
         return
-    cap = _checkout_bonus_cap(uid, int(fin["grand_show"]))
+    cap = _checkout_bonus_cap(uid, int(fin["grand_show"]), str(fin["g_cur"]))
     if mode == "0":
         ud["checkout_bonus_spend"] = 0
     elif mode == "h":
@@ -8053,8 +8068,8 @@ async def on_send_order_to_admin(
         base_tot = int(goods_total) + d_amt
     fin_bo = _checkout_preview_finance(ud, uid)
     gref = int(fin_bo["grand_show"]) if fin_bo else int(base_tot)
-    spend_raw = _checkout_bonus_spend_effective(ud, uid, gref)
-    spend = min(int(spend_raw), max(0, int(base_tot)))
+    spend_points = _checkout_bonus_spend_effective(ud, uid, gref, pay_cur)
+    spend = min(_bonus_discount_units(spend_points, pay_cur), max(0, int(base_tot)))
     pay_total = max(0, int(base_tot) - int(spend))
     order_rec = {
         "id": "0",
@@ -8064,6 +8079,7 @@ async def on_send_order_to_admin(
         "delivery": drec,
         "status": "В обработке",
         "bonus_applied": int(spend),
+        "bonus_points_spent": int(spend_points),
     }
     lo_hint_ta = None
     pe_ta = _cart_get_site_loyalty_pending_earn(uid)
@@ -8471,14 +8487,19 @@ async def on_admin_confirm_payment(
     o["paid"] = True
     o["paid_at"] = time.time()
     try:
-        b_sp = int(o.get("bonus_applied") or 0)
+        b_sp = int(o.get("bonus_points_spent") or 0)
     except (TypeError, ValueError):
         b_sp = 0
+    if b_sp <= 0:
+        try:
+            b_sp = int(o.get("bonus_applied") or 0)
+        except (TypeError, ValueError):
+            b_sp = 0
     cust = int(o.get("user_id") or 0)
-    if b_sp > 0 and cust:
+    site_order_id = await _ensure_site_order_for_bot_order(oid, o)
+    if b_sp > 0 and cust and not site_order_id:
         _loyalty_apply_local_debit(cust, b_sp)
-    await _ensure_site_order_for_bot_order(oid, o)
-    if cust and not o.get("loyalty_credited"):
+    if cust and not site_order_id and not o.get("loyalty_credited"):
         try:
             earn_est = int(o.get("loyalty_earn_estimate") or 0)
         except (TypeError, ValueError):
@@ -8987,13 +9008,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if text == BTN_BONUSES:
         bal = _loyalty_balance_int(uid)
-        bal_line = (
-            f"Текущий баланс: {bal} бонусов.\n\n"
-            if bal > 0
-            else "Баланс пока не получен с сайта (0) — войдите на illucards.by через код в Telegram.\n\n"
-        )
         await msg.reply_text(
-            (bal_line + MSG_LOYALTY_MENU).strip()[:4090],
+            f"Текущий баланс: {bal} бонусов.\n\n{MSG_LOYALTY_MENU}",
             reply_markup=REPLY_KB,
             disable_web_page_preview=True,
         )
