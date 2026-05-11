@@ -686,7 +686,6 @@ def _apply_post_deploy_session_reset(uid: int, user_data: dict) -> None:
             pass
     for k in _TINDER_USER_DATA_KEYS:
         user_data.pop(k, None)
-    user_states.pop(int(uid), None)
     user_support_state.pop(int(uid), None)
 
 
@@ -1592,6 +1591,47 @@ def _loyalty_apply_local_credit(uid: int, amount: int) -> None:
     save_state()
 
 
+def _loyalty_credit_order_once(o: dict) -> int:
+    if not isinstance(o, dict) or o.get("loyalty_credited"):
+        return 0
+    uid = int(o.get("user_id") or 0)
+    if not uid:
+        return 0
+    try:
+        earn_est = int(o.get("loyalty_earn_estimate") or 0)
+    except (TypeError, ValueError):
+        earn_est = 0
+    if earn_est <= 0:
+        earn_calc = _loyalty_compute_earn_estimate(
+            int(o.get("total") or 0),
+            None,
+            cart_lines=list(o.get("items") or []),
+        )
+        earn_est = int(earn_calc or 0)
+    if earn_est <= 0:
+        return 0
+    _loyalty_apply_local_credit(uid, earn_est)
+    o["loyalty_credited"] = True
+    o["loyalty_credited_amount"] = int(earn_est)
+    save_state()
+    return int(earn_est)
+
+
+def _loyalty_credit_due_orders_for_user(uid: int) -> int:
+    if not uid:
+        return 0
+    total = 0
+    for o in list(ORDERS.values()):
+        if not isinstance(o, dict):
+            continue
+        if int(o.get("user_id") or 0) != int(uid):
+            continue
+        st = _norm_bot_order_status(str(o.get("status") or "new"))
+        if st in ("accepted", "shipped", "done") or o.get("paid"):
+            total += _loyalty_credit_order_once(o)
+    return int(total)
+
+
 _LOYALTY_PENDING_EARN_KEYS: Tuple[str, ...] = (
     "bonusWillEarn",
     "bonusesWillEarn",
@@ -1939,6 +1979,8 @@ def _resolve_favorite_sync_entry_to_ref(
         if not s:
             return None
         p = _product_from_callback(s, products)
+        if not p:
+            p = _find_product_by_catalog_sku_slug(products, s)
         if p:
             return _product_ref_for_callback(p, _global_product_index(products, p))
         p = _find_product_by_catalog_name(products, s)
@@ -7023,6 +7065,8 @@ async def on_order_status_buttons(
         await _refresh_admin_order_message(context, oid)
         return
     o["status"] = want
+    if want in ("accepted", "shipped", "done"):
+        _loyalty_credit_order_once(o)
     save_state()
     if want in ("done", "canceled"):
         cuid = int(o.get("user_id") or 0)
@@ -8582,16 +8626,8 @@ async def on_admin_confirm_payment(
     site_order_id = await _ensure_site_order_for_bot_order(oid, o)
     if b_sp > 0 and cust and not site_order_id:
         _loyalty_apply_local_debit(cust, b_sp)
-    if cust and not site_order_id and not o.get("loyalty_credited"):
-        try:
-            earn_est = int(o.get("loyalty_earn_estimate") or 0)
-        except (TypeError, ValueError):
-            earn_est = 0
-        if earn_est > 0:
-            _loyalty_apply_local_credit(cust, earn_est)
-            o["loyalty_credited"] = True
-            o["loyalty_credited_amount"] = int(earn_est)
-            save_state()
+    if cust:
+        _loyalty_credit_order_once(o)
     _user_state_clear_payment_states(cust)
     cud = _user_data_for(context.application, cust)
     cud.pop("awaiting_payment_order_id", None)
@@ -9090,6 +9126,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if text == BTN_BONUSES:
+        _loyalty_credit_due_orders_for_user(uid)
         bal = _loyalty_balance_int(uid)
         await msg.reply_text(
             f"Текущий баланс: {bal} бонусов.\n\n{MSG_LOYALTY_MENU}",
