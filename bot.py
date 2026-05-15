@@ -252,6 +252,7 @@ USER_MESSAGES: Dict[int, List[dict]] = {}
 TEMP_MESSAGE_TTL_SEC = _env_int("TEMP_MESSAGE_TTL_SEC", 180)
 STATE_FILE = (os.getenv("BOT_STATE_FILE") or "bot_state.json").strip()
 STATE_REDIS_KEY = (os.getenv("BOT_STATE_REDIS_KEY") or "illucards:telegram-bot:state").strip()
+STATE_REDIS_SAVE_BLOCKED = False
 
 # Вход на сайт illucards.by: POST /api/send-code, /api/verify-code (память процесса)
 LOGIN_CODES: dict = {}
@@ -383,7 +384,21 @@ def _apply_state_payload(data: dict) -> None:
 def save_state() -> None:
     data = _build_state_payload()
     if STATE_REDIS_KEY:
-        _state_redis_command(["SET", STATE_REDIS_KEY, json.dumps(data, ensure_ascii=False)])
+        if not _state_redis_credentials():
+            logging.getLogger(__name__).warning(
+                "Redis state is not configured; using local file only. Orders may disappear after deploy."
+            )
+        elif STATE_REDIS_SAVE_BLOCKED:
+            logging.getLogger(__name__).warning(
+                "Redis state save is blocked because startup load was not confirmed; local file fallback only."
+            )
+        else:
+            saved = _state_redis_command(["SET", STATE_REDIS_KEY, json.dumps(data, ensure_ascii=False)])
+            if saved != "OK":
+                logging.getLogger(__name__).warning(
+                    "Redis state save did not return OK; using local file fallback. result=%r",
+                    saved,
+                )
     if not STATE_FILE:
         return
     tmp = f"{STATE_FILE}.tmp"
@@ -396,13 +411,28 @@ def save_state() -> None:
 
 
 def load_state() -> None:
+    global STATE_REDIS_SAVE_BLOCKED
     if STATE_REDIS_KEY:
-        raw = _state_redis_command(["GET", STATE_REDIS_KEY])
+        raw = None
+        if not _state_redis_credentials():
+            logging.getLogger(__name__).warning(
+                "Redis state is not configured; trying local file fallback. Orders may disappear after deploy."
+            )
+        else:
+            raw = _state_redis_command(["GET", STATE_REDIS_KEY])
+            if raw is None:
+                exists = _state_redis_command(["EXISTS", STATE_REDIS_KEY])
+                if exists not in (0, "0"):
+                    STATE_REDIS_SAVE_BLOCKED = True
+                    logging.getLogger(__name__).warning(
+                        "Redis state load was not confirmed; blocking Redis saves to avoid overwriting old orders."
+                    )
         if isinstance(raw, str) and raw.strip():
             try:
                 data = json.loads(raw)
                 if isinstance(data, dict):
                     _apply_state_payload(data)
+                    STATE_REDIS_SAVE_BLOCKED = False
                     logging.getLogger(__name__).info(
                         "Состояние загружено из Redis: orders=%d users=%d messages=%d next_order=%d",
                         len(ORDERS),
