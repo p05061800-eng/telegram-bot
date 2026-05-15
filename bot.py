@@ -1536,6 +1536,20 @@ def _apply_site_loyalty_from_sync(uid: int, data: dict) -> Optional[str]:
         prev_bal_i = None
     notify: Optional[str] = None
     if earned_i is not None and int(earned_i) > 0:
+        site_oid_raw = (
+            data.get("botOrderId")
+            or data.get("bot_order_id")
+            or data.get("order_id")
+            or data.get("orderId")
+        )
+        try:
+            site_oid = int(site_oid_raw or 0)
+        except (TypeError, ValueError):
+            site_oid = 0
+        order_rec = ORDERS.get(site_oid) if site_oid else None
+        if isinstance(order_rec, dict) and int(order_rec.get("user_id") or 0) == int(uid):
+            order_rec["loyalty_credited"] = True
+            order_rec["loyalty_credited_amount"] = int(earned_i)
         parts = [f"⭐ Зачислено бонусов: +{int(earned_i)}."]
         if bal_i is not None:
             parts.append(f"Всего на бонусном счёте: {int(bal_i)}.")
@@ -1547,8 +1561,12 @@ def _apply_site_loyalty_from_sync(uid: int, data: dict) -> Optional[str]:
             parts.append(msg)
         notify = "\n".join(parts)
     new_bal = bal_i if bal_i is not None else prev_bal_i
-    if new_bal is None and prev_bal_i is not None and earned_i is not None and earned_i > 0:
-        new_bal = int(prev_bal_i) + int(earned_i)
+    if earned_i is not None and int(earned_i) > 0:
+        summed_bal = int(prev_bal_i or 0) + int(earned_i)
+        if new_bal is None:
+            new_bal = summed_bal
+        else:
+            new_bal = max(int(new_bal), summed_bal)
     hint = msg or str(prev.get("hint") or "").strip()[:400]
     USER_SITE_LOYALTY[int(uid)] = {
         "balance": new_bal,
