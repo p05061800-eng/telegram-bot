@@ -1973,9 +1973,12 @@ def _apply_optional_favorites_from_site_payload(
         return False
     for key in _FAVORITE_SYNC_PAYLOAD_KEYS:
         if key in data and isinstance(data.get(key), list):
-            USER_FAVORITES[uid] = _normalize_sync_favorites_with_catalog(
+            refs = _normalize_sync_favorites_with_catalog(
                 data[key], products
             )
+            if not refs and not _sync_explicit_clear(data, "clearFavorites", "clear_favorites"):
+                return False
+            USER_FAVORITES[uid] = refs
             save_state()
             return True
     return False
@@ -2195,10 +2198,24 @@ def _normalize_sync_orders(raw: object) -> List[dict]:
 def _user_orders_merge_site(uid: int, site_orders: List[dict]) -> None:
     if not uid:
         return
+    if not site_orders:
+        return
     existing = list(USER_ORDERS.get(int(uid)) or [])
     kept = [r for r in existing if str(r.get("sync_source") or "") != "site"]
     USER_ORDERS[int(uid)] = kept + list(site_orders or [])
     save_state()
+
+
+def _sync_explicit_clear(data: dict, *keys: str) -> bool:
+    if not isinstance(data, dict):
+        return False
+    for key in keys:
+        v = data.get(key)
+        if v is True:
+            return True
+        if isinstance(v, str) and v.strip().lower() in ("1", "true", "yes", "y"):
+            return True
+    return False
 
 
 async def _http_sync_cart(request: web.Request) -> web.Response:
@@ -2223,7 +2240,8 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
         products = []
     if products and lines:
         _reconcile_cart_lines_to_catalog(products, lines)
-    _cart_set_items_uid(uid, lines)
+    if lines or _sync_explicit_clear(data, "clearCart", "clear_cart"):
+        _cart_set_items_uid(uid, lines)
     _cart_apply_site_pricing_hints(uid, data)
     _apply_optional_favorites_from_site_payload(uid, data, products)
     note_loy = _apply_site_loyalty_from_sync(uid, data)
@@ -2257,6 +2275,13 @@ async def _http_sync_favorites(request: web.Request) -> web.Response:
     except Exception:
         products = []
     refs = _favorites_list_from_sync_favorites_endpoint(data, products)
+    if not refs and not _sync_explicit_clear(data, "clearFavorites", "clear_favorites"):
+        return _login_json_response({
+            "success": True,
+            "user_id": uid,
+            "items": len(USER_FAVORITES.get(uid) or []),
+            "ignored_empty": True,
+        })
     USER_FAVORITES[uid] = refs
     save_state()
     users_touch(uid, "favorites_sync")
@@ -2289,7 +2314,8 @@ async def _http_sync_state(request: web.Request) -> web.Response:
     if products and lines:
         _reconcile_cart_lines_to_catalog(products, lines)
     _apply_optional_favorites_from_site_payload(uid, data, products)
-    _cart_set_items_uid(uid, lines)
+    if lines or _sync_explicit_clear(data, "clearCart", "clear_cart"):
+        _cart_set_items_uid(uid, lines)
     _cart_apply_site_pricing_hints(uid, data)
     fav_n = len(USER_FAVORITES.get(uid) or [])
     n_site_orders = 0
@@ -4374,6 +4400,7 @@ async def _admin_delete_order_chat_message(
     if int(o.get("admin_message_id") or 0) == mid and int(o.get("admin_chat_id") or 0) == chat_id:
         o["admin_message_id"] = None
         o["admin_chat_id"] = None
+        save_state()
     try:
         await q.answer("Сообщение удалено.", show_alert=False)
     except Exception:
@@ -4926,7 +4953,7 @@ def _clear_checkout_delivery(user_data: dict) -> None:
 
 
 def _void_unpaid_pending_order_and_restore_checkout(uid: int, ud: dict) -> bool:
-    """Отменить неоплаченный заказ в ORDERS и вернуть черновик в user_data (для «Назад»)."""
+    """Вернуть неоплаченный заказ в черновик/корзину без удаления заказа."""
     oid_raw = ud.get("awaiting_payment_order_id")
     if oid_raw is None:
         return False
@@ -4959,15 +4986,11 @@ def _void_unpaid_pending_order_and_restore_checkout(uid: int, ud: dict) -> bool:
         ud["delivery_currency"] = d.get("currency")
     _clear_crypto_auto_watch(o, uid)
     _user_state_pop(uid, "awaiting_proof")
-    ORDERS.pop(oid, None)
-    lst = list(USER_ORDERS.get(uid) or [])
-    USER_ORDERS[uid] = [x for x in lst if str(x.get("id") or "") != str(oid)]
-    if not USER_ORDERS[uid]:
-        USER_ORDERS.pop(uid, None)
-    save_state()
+    _cart_set_items_uid(uid, items)
     ud.pop("awaiting_payment_order_id", None)
     ud.pop("payment_pending_method", None)
     o.pop("payment_pending_method", None)
+    save_state()
     return True
 
 
@@ -6749,19 +6772,37 @@ def _kb_admin_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("📦 Заказы", callback_data="adm:orders"),
+                InlineKeyboardButton("🆕 Новые заказы", callback_data="adm:orders_new"),
+                InlineKeyboardButton("📦 Заказы", callback_data="adm:orders_all"),
+            ],
+            [
+                InlineKeyboardButton("🚚 Отправленные", callback_data="adm:orders_shipped"),
                 InlineKeyboardButton("📈 Статистика", callback_data="adm:stats"),
             ],
         ],
     )
 
 
-def _kb_admin_orders_list() -> Optional[InlineKeyboardMarkup]:
-    if not ORDERS:
-        return None
-    rows: List[List[InlineKeyboardButton]] = []
+def _admin_orders_for_section(section: str) -> List[Tuple[int, dict]]:
+    rows: List[Tuple[int, dict]] = []
+    sec = str(section or "all").strip()
     for oid in sorted(ORDERS.keys(), key=lambda k: int(k)):
         o = ORDERS[oid]
+        st = _norm_bot_order_status(str(o.get("status") or "new"))
+        if sec == "new" and st != "new":
+            continue
+        if sec == "shipped" and st != "shipped":
+            continue
+        rows.append((int(oid), o))
+    return rows
+
+
+def _kb_admin_orders_list(section: str = "all") -> Optional[InlineKeyboardMarkup]:
+    admin_orders = _admin_orders_for_section(section)
+    if not admin_orders:
+        return None
+    rows: List[List[InlineKeyboardButton]] = []
+    for oid, o in admin_orders:
         tot = _order_resolved_grand_total(o)
         cur_l = _order_line_currency_from_delivery(
             o.get("delivery") if isinstance(o.get("delivery"), dict) else None
@@ -6879,23 +6920,33 @@ async def on_admin_panel_action(
     q = update.callback_query
     if not q or not q.from_user or not q.data or not q.message:
         return
-    m = re.match(r"^adm:(orders|stats)$", (q.data or "").strip())
+    m = re.match(r"^adm:(orders_new|orders_all|orders_shipped|stats)$", (q.data or "").strip())
     if not m:
         return
     if not is_admin(q.from_user.id):
         return
     action = m.group(1)
     await q.answer()
-    if action == "orders":
-        if not ORDERS:
+    if action.startswith("orders_"):
+        section = {
+            "orders_new": "new",
+            "orders_all": "all",
+            "orders_shipped": "shipped",
+        }.get(action, "all")
+        title = {
+            "new": "🆕 Новые заказы",
+            "all": "📦 Заказы",
+            "shipped": "🚚 Отправленные",
+        }.get(section, "📦 Заказы")
+        admin_orders = _admin_orders_for_section(section)
+        if not admin_orders:
             await q.message.reply_text(
-                "📦 Пока нет заказов\n\n"
+                f"{title}\n\nПока нет заказов\n\n"
                 "Как только клиент оформит покупку — заказ появится здесь ✨"
             )
         else:
-            body_lines: List[str] = ["📦 Заказы", "", "Выберите заказ или username 👇", ""]
-            for oid in sorted(ORDERS.keys(), key=int):
-                o = ORDERS[oid]
+            body_lines: List[str] = [title, "", "Выберите заказ или username 👇", ""]
+            for oid, o in admin_orders:
                 tot = _order_resolved_grand_total(o)
                 cur_o = _order_line_currency_from_delivery(
                     o.get("delivery") if isinstance(o.get("delivery"), dict) else None
@@ -6909,7 +6960,7 @@ async def on_admin_panel_action(
                 text = text[:3490] + "…"
             await q.message.reply_text(
                 text,
-                reply_markup=_kb_admin_orders_list(),
+                reply_markup=_kb_admin_orders_list(section),
             )
     else:
         await q.message.reply_text(_format_admin_stats())
@@ -8273,6 +8324,38 @@ async def on_send_order_to_admin(
     if int(spend) > 0:
         ORDERS[int(oid)]["bonus_applied"] = int(spend)
     save_state()
+    if int(pay_total) <= 0 and int(spend_points) > 0:
+        order_rec["status"] = "Принят"
+        order_rec["paid"] = True
+        order_rec["payment_method"] = "bonuses"
+        ORDERS[int(oid)]["paid"] = True
+        ORDERS[int(oid)]["paid_at"] = time.time()
+        ORDERS[int(oid)]["payment_method"] = "bonuses"
+        ORDERS[int(oid)]["status"] = "accepted"
+        ORDERS[int(oid)]["bonus_paid_full"] = True
+        _loyalty_apply_local_debit(uid, int(spend_points))
+        _user_state_clear_payment_states(uid)
+        _clear_crypto_auto_watch(ORDERS[int(oid)], uid)
+        _clear_checkout_delivery(ud)
+        _cart_clear_site_pricing_hints(uid)
+        _clear_user_cart_after_payment_proof(uid, int(oid), ORDERS[int(oid)])
+        try:
+            asyncio.get_running_loop().create_task(
+                _notify_site_cart_cleared_after_proof(uid, int(oid), ORDERS[int(oid)])
+            )
+        except RuntimeError:
+            pass
+        save_state()
+        await _send_deferred_admin_order_panel(context, int(oid), ORDERS[int(oid)])
+        await q.answer()
+        await q.message.reply_text(
+            "✅ Заказ полностью оплачен бонусами.\n\n"
+            f"⭐ Списано бонусов: {int(spend_points)}.\n"
+            "Мы приняли заказ и передали его администратору.",
+            reply_markup=REPLY_KB,
+        )
+        users_touch(uid, "payment")
+        return
     ud["awaiting_payment_order_id"] = int(oid)
     ud.pop("payment_pending_method", None)
     await q.answer()
@@ -9312,7 +9395,7 @@ def main() -> None:
     app.add_handler(
         CallbackQueryHandler(
             on_admin_panel_action,
-            pattern=re.compile(r"^adm:(orders|stats)$"),
+            pattern=re.compile(r"^adm:(orders_new|orders_all|orders_shipped|stats)$"),
         )
     )
     app.add_handler(
