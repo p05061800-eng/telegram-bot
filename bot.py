@@ -1365,6 +1365,14 @@ def _resolve_sync_uid(data: dict) -> int:
         return 0
 
 
+def _resolve_sync_uid_from_request(request: web.Request, data: Optional[dict] = None) -> int:
+    payload = dict(data or {})
+    for key in ("user_id", "username", "secret"):
+        if key not in payload and key in request.query:
+            payload[key] = request.query.get(key)
+    return _resolve_sync_uid(payload)
+
+
 def _coerce_loyalty_int(val: object) -> Optional[int]:
     if val is None or isinstance(val, bool):
         return None
@@ -2357,6 +2365,46 @@ async def _http_sync_favorites(request: web.Request) -> web.Response:
     return _login_json_response({"success": True, "user_id": uid, "items": len(refs)})
 
 
+async def _http_get_sync_state(request: web.Request) -> web.Response:
+    data = {
+        "user_id": request.query.get("user_id"),
+        "username": request.query.get("username"),
+        "secret": request.query.get("secret"),
+    }
+    if not _sync_auth_ok(request, data):
+        return _login_json_response({"success": False, "error": "Forbidden"}, status=403)
+    uid = _resolve_sync_uid_from_request(request, data)
+    if not uid:
+        return _login_json_response({"success": False, "error": "Пользователь не найден"}, status=404)
+    cart_raw = USER_CART.get(uid)
+    cart_items = []
+    cart_total = 0
+    if isinstance(cart_raw, dict):
+        cart_items = list(cart_raw.get("items") or [])
+        try:
+            cart_total = int(cart_raw.get("total") or 0)
+        except (TypeError, ValueError):
+            cart_total = 0
+    if not cart_total and cart_items:
+        try:
+            cart_total, _ = _cart_totals(cart_items)
+        except Exception:
+            cart_total = 0
+    loyalty = USER_SITE_LOYALTY.get(uid) if isinstance(USER_SITE_LOYALTY.get(uid), dict) else {}
+    return _login_json_response(
+        {
+            "success": True,
+            "user_id": uid,
+            "cart": cart_items,
+            "cart_items": len(cart_items),
+            "cart_total": cart_total,
+            "favorites": list(USER_FAVORITES.get(uid) or []),
+            "favorite_items": len(USER_FAVORITES.get(uid) or []),
+            "bonus_balance": loyalty.get("balance"),
+        }
+    )
+
+
 async def _http_sync_state(request: web.Request) -> web.Response:
     try:
         data = await request.json()
@@ -2867,6 +2915,7 @@ async def _run_login_http_api(bot) -> None:
     app.router.add_post("/api/telegram-auth", _http_telegram_auth)
     app.router.add_post("/api/sync/cart", _http_sync_cart)
     app.router.add_post("/api/sync/favorites", _http_sync_favorites)
+    app.router.add_get("/api/sync/state", _http_get_sync_state)
     app.router.add_post("/api/sync/state", _http_sync_state)
     app.router.add_post("/api/sync/promotions", _http_sync_home_promotions)
     runner = web.AppRunner(app)
@@ -4796,12 +4845,13 @@ def _format_mine_orders_text_and_kb(
     rows: List[List[InlineKeyboardButton]] = []
     for oid, o in reg[:25]:
         tot = _order_resolved_grand_total(o)
+        _, qty = _cart_totals(list(o.get("items") or []))
         st = str(o.get("status") or "new")
         badge = _user_order_status_badge(st)
         cur = _order_line_currency_from_delivery(
             o.get("delivery") if isinstance(o.get("delivery"), dict) else None
         )
-        lines.append(f"#{oid} — {tot} {cur} — {badge}")
+        lines.append(f"#{oid} — {qty} шт. — {tot} {cur} — {badge}")
         rows.append(
             [
                 InlineKeyboardButton("📦", callback_data=f"user_order_{oid}"),
@@ -4811,12 +4861,13 @@ def _format_mine_orders_text_and_kb(
         if len(rows) >= 30:
             break
         tot = int(rec.get("total") or 0)
+        _, qty = _cart_totals(list(rec.get("items") or []))
         st_site = str(rec.get("status") or "на сайте").strip()
         badge = f"🌐 {st_site[:36]}" if st_site else "🌐 на сайте"
         drec = rec.get("delivery") if isinstance(rec.get("delivery"), dict) else None
         cur = _order_line_currency_from_delivery(drec)
         disp = str(rec.get("external_id") or rec.get("id") or "")[:20]
-        lines.append(f"🌐 {disp} — {tot} {cur} — {badge}")
+        lines.append(f"🌐 {disp} — {qty} шт. — {tot} {cur} — {badge}")
         tok = _site_user_order_token(int(user_id), rec)
         rows.append(
             [
@@ -4835,6 +4886,7 @@ def _format_user_order_detail(order_id: object, o: dict) -> str:
     drec = o.get("delivery") if isinstance(o.get("delivery"), dict) else None
     line_cur = _order_line_currency_from_delivery(drec)
     items_block = _format_order_items_for_admin(list(o.get("items") or []), line_cur)
+    _, qty = _cart_totals(list(o.get("items") or []))
     tot = _order_resolved_grand_total(o)
     st = str(o.get("status") or "new")
     sk = "canceled" if st == "cancelled" else st
@@ -4858,6 +4910,7 @@ def _format_user_order_detail(order_id: object, o: dict) -> str:
     if b_ap > 0:
         parts.append(f"⭐ Списано бонусов: {b_ap} {line_cur}")
         parts.append("")
+    parts.append(f"📦 Количество карточек: {qty} шт.")
     parts.append(f"💰 Итого: {tot} {line_cur}")
     if dline:
         parts.extend(["", dline])
