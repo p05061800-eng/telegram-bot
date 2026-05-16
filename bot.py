@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
 import aiohttp
+import redis
 from flask import Flask, jsonify, request
 from aiohttp import web
 from telegram import (
@@ -253,6 +254,7 @@ TEMP_MESSAGE_TTL_SEC = _env_int("TEMP_MESSAGE_TTL_SEC", 180)
 STATE_FILE = (os.getenv("BOT_STATE_FILE") or "bot_state.json").strip()
 STATE_REDIS_KEY = (os.getenv("BOT_STATE_REDIS_KEY") or "illucards:telegram-bot:state").strip()
 STATE_REDIS_SAVE_BLOCKED = False
+STATE_REDIS_CLIENT = None
 
 # Вход на сайт illucards.by: POST /api/send-code, /api/verify-code (память процесса)
 LOGIN_CODES: dict = {}
@@ -310,10 +312,48 @@ def _state_redis_credentials() -> Optional[Tuple[str, str]]:
     return url, token
 
 
+def _state_redis_url_client():
+    global STATE_REDIS_CLIENT
+    redis_url = (os.getenv("REDIS_URL") or "").strip()
+    if not redis_url:
+        return None
+    if STATE_REDIS_CLIENT is not None:
+        return STATE_REDIS_CLIENT
+    try:
+        STATE_REDIS_CLIENT = redis.Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+        )
+        STATE_REDIS_CLIENT.ping()
+        logging.getLogger(__name__).info("Redis state connected via REDIS_URL")
+        return STATE_REDIS_CLIENT
+    except Exception:
+        STATE_REDIS_CLIENT = None
+        logging.getLogger(__name__).exception("Redis state REDIS_URL connection failed")
+        return None
+
+
 def _state_redis_command(args: List[object]) -> Optional[object]:
     cred = _state_redis_credentials()
     if not cred:
-        return None
+        client = _state_redis_url_client()
+        if client is None:
+            return None
+        try:
+            cmd = str(args[0] if args else "").upper()
+            if cmd == "GET" and len(args) >= 2:
+                return client.get(str(args[1]))
+            if cmd == "SET" and len(args) >= 3:
+                return "OK" if client.set(str(args[1]), str(args[2])) else None
+            if cmd == "EXISTS" and len(args) >= 2:
+                return int(client.exists(str(args[1])))
+            logging.getLogger(__name__).warning("Unsupported REDIS_URL state command: %r", args)
+            return None
+        except Exception:
+            logging.getLogger(__name__).exception("Redis state REDIS_URL command failed")
+            return None
     url, token = cred
     try:
         body = json.dumps(args).encode("utf-8")
@@ -383,8 +423,18 @@ def _apply_state_payload(data: dict) -> None:
 
 def save_state() -> None:
     data = _build_state_payload()
+    if STATE_REDIS_SAVE_BLOCKED:
+        has_persistent_data = any(
+            bool(data.get(k))
+            for k in ("orders", "user_orders", "user_cart", "user_favorites", "user_site_loyalty")
+        )
+        if not has_persistent_data:
+            logging.getLogger(__name__).error(
+                "State save skipped: persistent storage was not loaded and current state is empty."
+            )
+            return
     if STATE_REDIS_KEY:
-        if not _state_redis_credentials():
+        if not _state_redis_credentials() and not (os.getenv("REDIS_URL") or "").strip():
             logging.getLogger(__name__).warning(
                 "Redis state is not configured; using local file only. Orders may disappear after deploy."
             )
@@ -412,11 +462,13 @@ def save_state() -> None:
 
 def load_state() -> None:
     global STATE_REDIS_SAVE_BLOCKED
+    loaded = False
     if STATE_REDIS_KEY:
         raw = None
-        if not _state_redis_credentials():
+        if not _state_redis_credentials() and not (os.getenv("REDIS_URL") or "").strip():
+            STATE_REDIS_SAVE_BLOCKED = True
             logging.getLogger(__name__).warning(
-                "Redis state is not configured; trying local file fallback. Orders may disappear after deploy."
+                "Redis state is not configured; trying local file fallback and blocking empty saves."
             )
         else:
             raw = _state_redis_command(["GET", STATE_REDIS_KEY])
@@ -434,16 +486,26 @@ def load_state() -> None:
                     _apply_state_payload(data)
                     STATE_REDIS_SAVE_BLOCKED = False
                     logging.getLogger(__name__).info(
-                        "Состояние загружено из Redis: orders=%d users=%d messages=%d next_order=%d",
+                        "Состояние загружено из Redis: orders=%d user_orders=%d carts=%d favorites=%d users=%d messages=%d next_order=%d",
                         len(ORDERS),
+                        len(USER_ORDERS),
+                        len(USER_CART),
+                        len(USER_FAVORITES),
                         len(USERS),
                         len(USER_MESSAGES),
                         ORDER_COUNTER,
                     )
+                    loaded = True
                     return
             except Exception:
+                STATE_REDIS_SAVE_BLOCKED = True
                 logging.getLogger(__name__).exception("Не удалось загрузить состояние из Redis")
     if not STATE_FILE or not os.path.exists(STATE_FILE):
+        if not loaded:
+            STATE_REDIS_SAVE_BLOCKED = True
+            logging.getLogger(__name__).error(
+                "No persistent state loaded: Redis unavailable/unconfigured and local state file is missing. Blocking empty saves."
+            )
         return
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -452,9 +514,13 @@ def load_state() -> None:
         logging.getLogger(__name__).exception("Не удалось загрузить состояние бота")
         return
     _apply_state_payload(data)
+    STATE_REDIS_SAVE_BLOCKED = False
     logging.getLogger(__name__).info(
-        "Состояние загружено: orders=%d users=%d messages=%d next_order=%d",
+        "Состояние загружено: orders=%d user_orders=%d carts=%d favorites=%d users=%d messages=%d next_order=%d",
         len(ORDERS),
+        len(USER_ORDERS),
+        len(USER_CART),
+        len(USER_FAVORITES),
         len(USERS),
         len(USER_MESSAGES),
         ORDER_COUNTER,
