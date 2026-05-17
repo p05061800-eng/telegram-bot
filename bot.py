@@ -2199,6 +2199,20 @@ def _normalize_sync_delivery(raw: object) -> dict:
     }
 
 
+def _site_status_to_bot_status(raw: object) -> str:
+    s = str(raw or "").strip().lower()
+    return {
+        "confirmed": "accepted",
+        "paid": "accepted",
+        "shipped": "shipped",
+        "sent": "shipped",
+        "delivered": "done",
+        "cancelled": "canceled",
+        "canceled": "canceled",
+        "new": "new",
+    }.get(s, str(raw or "На сайте").strip() or "На сайте")
+
+
 def _normalize_sync_site_order(raw: object) -> Optional[dict]:
     if not isinstance(raw, dict):
         return None
@@ -2239,7 +2253,7 @@ def _normalize_sync_site_order(raw: object) -> Optional[dict]:
     if st is None or str(st).strip() == "":
         status_label = "На сайте"
     else:
-        status_label = str(st).strip()
+        status_label = _site_status_to_bot_status(st)
     return {
         "id": ext[:80],
         "external_id": ext[:120],
@@ -2984,6 +2998,10 @@ SYNC_EVERY_SEC = _env_int("ILLUCARDS_SYNC_EVERY_SEC", 900)
 ORDER_DEEP_LINK_API_URL = os.getenv(
     "ORDER_DEEP_LINK_API_URL",
     f"{ILLUCARDS_BASE}/api/order/{{id}}",
+).strip()
+ORDER_USER_ORDERS_API_URL = os.getenv(
+    "ORDER_USER_ORDERS_API_URL",
+    f"{ILLUCARDS_BASE}/api/orders?user_id={{user_id}}",
 ).strip()
 ORDER_STATUS_UPDATE_API_URL = os.getenv(
     "ORDER_STATUS_UPDATE_API_URL",
@@ -3990,7 +4008,7 @@ def _format_order_items_for_admin(lines: List[dict], currency: str = "BYN") -> s
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
         sub = p * q
-        rows.append(f"• {name} — {sub} {cur}")
+        rows.append(f"• {name} — {q} шт. × {p} {cur} = {sub} {cur}")
     return "\n".join(rows) if rows else "—"
 
 
@@ -4617,10 +4635,7 @@ def _format_cart_message(
         q = _cart_line_qty_coerce(x.get("qty"))
         lc = str(x.get("line_currency") or "").strip().upper()
         line_cur = lc if lc in ("BYN", "RUB") else cur
-        if q <= 1:
-            out.append(f"• {name} — {p} {line_cur}")
-        else:
-            out.append(f"• {name} — {p * q} {line_cur} (×{q})")
+        out.append(f"• {name} — {q} шт. × {p} {line_cur} = {p * q} {line_cur}")
     if from_site_hint:
         out += ["", f"💰 Итого (как на сайте, с доставкой): {shown_grand} {cur}"]
     else:
@@ -4662,10 +4677,7 @@ def _format_login_site_cart_pending_text(
         q = int(x.get("qty") or 1)
         lc = str(x.get("line_currency") or "").strip().upper()
         xcur = lc if lc in ("BYN", "RUB") else g_cur
-        if q <= 1:
-            out.append(f"• {name} — {p} {xcur}")
-        else:
-            out.append(f"• {name} — {p * q} {xcur} (×{q})")
+        out.append(f"• {name} — {q} шт. × {p} {xcur} = {p * q} {xcur}")
     out.append("")
     site_gt_raw = _cart_get_site_grand_total(uid, g_cur)
     inc = _cart_site_delivery_included(uid)
@@ -4808,6 +4820,83 @@ def _user_site_orders_for_list(user_id: int) -> List[dict]:
     ]
 
 
+def _site_order_rec_from_deep_link_shape(order_id: str, order: dict, status: object = "") -> dict:
+    lines = deepcopy(list(order.get("items") or []))
+    drec = deepcopy(order.get("delivery") or {})
+    try:
+        total_goods, _ = _cart_totals(lines)
+    except Exception:
+        total_goods = 0
+    try:
+        total = int(float(order.get("total") or order.get("site_grand_total_hint") or 0))
+    except (TypeError, ValueError):
+        total = 0
+    if total <= 0:
+        try:
+            total = int(total_goods) + int(drec.get("amount") or 0)
+        except (TypeError, ValueError):
+            total = int(total_goods)
+    ext = str(order.get("external_id") or order_id).strip()
+    return {
+        "id": ext[:80],
+        "external_id": ext[:120],
+        "items": lines,
+        "total": max(0, int(total)),
+        "total_goods": int(total_goods),
+        "delivery": drec,
+        "status": _site_status_to_bot_status(status),
+        "sync_source": "site",
+    }
+
+
+async def _refresh_user_site_orders_from_site(user_id: int) -> int:
+    """Pull durable order history from IlluCards site before showing Telegram 'Мои заказы'."""
+    uid = int(user_id or 0)
+    if not uid or not ORDER_USER_ORDERS_API_URL:
+        return 0
+    safe_uid = urllib.parse.quote(str(uid), safe="")
+    if "{user_id}" in ORDER_USER_ORDERS_API_URL:
+        url = ORDER_USER_ORDERS_API_URL.replace("{user_id}", safe_uid)
+    else:
+        sep = "&" if "?" in ORDER_USER_ORDERS_API_URL else "?"
+        url = f"{ORDER_USER_ORDERS_API_URL}{sep}user_id={safe_uid}"
+    log = logging.getLogger(__name__)
+    headers: dict = {}
+    if ORDER_STATUS_UPDATE_SECRET:
+        headers["Authorization"] = f"Bearer {ORDER_STATUS_UPDATE_SECRET}"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.get(url, headers=headers or None) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    log.warning("IlluCards user orders sync HTTP %s: %s", resp.status, body[:300])
+                    return 0
+                data = await resp.json()
+    except Exception:
+        log.exception("IlluCards user orders sync failed user_id=%s", uid)
+        return 0
+    raw_orders = data.get("orders") if isinstance(data, dict) else data
+    if not isinstance(raw_orders, list):
+        return 0
+    out: List[dict] = []
+    for raw in raw_orders[:30]:
+        if not isinstance(raw, dict):
+            continue
+        ext = str(raw.get("external_id") or raw.get("id") or "").strip()
+        rec: Optional[dict] = None
+        if ext:
+            detail = await _fetch_order_from_deep_link_api(ext)
+            if detail:
+                rec = _site_order_rec_from_deep_link_shape(ext, detail, raw.get("status"))
+        if rec is None:
+            rec = _normalize_sync_site_order(raw)
+        if rec:
+            out.append(rec)
+    if out:
+        _user_orders_merge_site(uid, out)
+    return len(out)
+
+
 def _site_user_order_token(uid: int, rec: dict) -> str:
     key = str(rec.get("external_id") or rec.get("id") or "")
     return hashlib.sha256(f"{int(uid)}:{key}".encode("utf-8")).hexdigest()[:12]
@@ -4825,9 +4914,10 @@ def _find_user_site_order_by_token(uid: int, token: str) -> Optional[dict]:
     return None
 
 
-def _format_mine_orders_text_and_kb(
+async def _format_mine_orders_text_and_kb(
     user_id: int,
 ) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    await _refresh_user_site_orders_from_site(user_id)
     reg = _user_orders_registry_for_user(user_id)
     site_recs = _user_site_orders_for_list(user_id)
     if not reg and not site_recs:
@@ -4973,7 +5063,7 @@ def _format_checkout_preview_for_user(
         q = int(x.get("qty") or 1)
         lc = str(x.get("line_currency") or "").strip().upper()
         line_cur = lc if lc in ("BYN", "RUB") else cur
-        out.append(f"• {name} — {p} {line_cur} × {q}")
+        out.append(f"• {name} — {q} шт. × {p} {line_cur} = {p * q} {line_cur}")
     out += ["", f"💰 {total} {cur}"]
     return "\n".join(out)
 
@@ -5027,7 +5117,7 @@ def _format_order_preview_with_delivery(
         sub = p * q
         lc = str(x.get("line_currency") or "").strip().upper()
         xcur = lc if lc in ("BYN", "RUB") else g_cur
-        out.append(f"• {name} — {sub} {xcur}")
+        out.append(f"• {name} — {q} шт. × {p} {xcur} = {sub} {xcur}")
     out.append("")
     if inc and not site_gt_raw:
         out.append(f"🚚 Доставка: {dlabel} (уже в сумме на сайте)")
@@ -6436,7 +6526,7 @@ def _format_user_deep_link_order_message(order: dict) -> str:
         sub = p * q
         lc = str(x.get("line_currency") or "").strip().upper()
         xcur = lc if lc in ("BYN", "RUB") else g_cur
-        out.append(f"• {name} — {sub} {xcur}")
+        out.append(f"• {name} — {q} шт. × {p} {xcur} = {sub} {xcur}")
     out.append("")
     out.append(f"🚚 Доставка: {label}")
     out.append("")
@@ -7229,6 +7319,9 @@ async def on_user_order_open(
         return
     uid = q.from_user.id
     rec = _find_user_site_order_by_token(uid, m2.group(1))
+    if not rec:
+        await _refresh_user_site_orders_from_site(uid)
+        rec = _find_user_site_order_by_token(uid, m2.group(1))
     if not rec:
         try:
             await q.answer("Заказ не найден или устарел", show_alert=False)
@@ -8927,7 +9020,7 @@ async def on_receipt_callback(
     except Exception:
         pass
     if action == "orders":
-        body, kb = _format_mine_orders_text_and_kb(uid)
+        body, kb = await _format_mine_orders_text_and_kb(uid)
         await q.message.reply_text(body, reply_markup=kb)
     else:
         user_support_state[uid] = True
@@ -9351,7 +9444,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not uid:
             await msg.reply_text(FALLBACK_USER_TEXT)
             return
-        body, kb = _format_mine_orders_text_and_kb(uid)
+        body, kb = await _format_mine_orders_text_and_kb(uid)
         await msg.reply_text(body, reply_markup=kb)
         return
 
