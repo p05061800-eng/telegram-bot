@@ -32,8 +32,7 @@
   </script>
   <p id="widgetHint" style="font-size:0.85rem;color:#666;margin-top:.5rem;"></p>
   <hr style="margin:1rem 0;" />
-  <p>Сначала откройте бота в Telegram, затем укажите тот же @username.</p>
-  <a id="botStartLink" class="bot-link" href="#" target="_blank" rel="noopener">Открыть бота</a>
+  <p>Укажите ваш @username.</p>
   <label for="username">@username</label>
   <input id="username" type="text" autocomplete="username" placeholder="@username" />
   <label for="code">Код из Telegram (4 цифры)</label>
@@ -91,13 +90,7 @@
     };
     (function initWidgetHint() {
       var hint = document.getElementById("widgetHint");
-      var botLink = document.getElementById("botStartLink");
       var botUsername = ("__BOT_USERNAME__" || "").trim();
-      if (botLink && botUsername) {
-        botLink.href = "https://t.me/" + encodeURIComponent(botUsername) + "?start=web_login";
-      } else if (botLink) {
-        botLink.style.display = "none";
-      }
       if (!hint) return;
       if (!botUsername) {
         hint.textContent = "Telegram-виджет временно недоступен: не удалось определить username бота.";

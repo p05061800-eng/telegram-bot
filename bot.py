@@ -766,7 +766,7 @@ def _apply_post_deploy_session_reset(uid: int, user_data: dict) -> None:
     """После рестарта процесса (деплой): сбросить только user_data и служебные флаги.
 
     Не трогаем USER_CART и SITE_LOGIN_PENDING_ORDER: корзина могла только что прийти с сайта
-    через POST /api/verify-code или sync до первого нажатия пользователя — иначе «💚 Корзина»
+    через POST /api/verify-code или sync до первого нажатия пользователя — иначе «🛒 Корзина»
     пустая и «Подтвердить заказ» теряет текст черновика.
     """
     if not uid:
@@ -879,7 +879,7 @@ MSG_UNKNOWN_TEXT = (
 
 # Reply-клавиатура: короткие подписи + эмодзи
 BTN_CATALOG = "📦 Каталог"
-BTN_CART = "💚 Корзина"
+BTN_CART = "🛒 Корзина"
 BTN_POPULAR = "🔥 Акции"
 BTN_CHAT = "💬 Связь"
 BTN_MY_ORDERS = "📋 Мои заказы"
@@ -1993,7 +1993,13 @@ def _normalize_sync_cart_items(
         except (TypeError, ValueError):
             price = 0
         try:
-            qty = int(x.get("qty") or 1)
+            qty = int(
+                x.get("qty")
+                or x.get("quantity")
+                or x.get("count")
+                or x.get("amount")
+                or 1
+            )
         except (TypeError, ValueError):
             qty = 1
         qty = max(1, min(qty, 999))
@@ -3003,6 +3009,10 @@ ORDER_USER_ORDERS_API_URL = os.getenv(
     "ORDER_USER_ORDERS_API_URL",
     f"{ILLUCARDS_BASE}/api/orders?user_id={{user_id}}",
 ).strip()
+SITE_USER_STATE_API_URL = os.getenv(
+    "SITE_USER_STATE_API_URL",
+    f"{ILLUCARDS_BASE}/api/user-state?user_id={{user_id}}",
+).strip()
 ORDER_STATUS_UPDATE_API_URL = os.getenv(
     "ORDER_STATUS_UPDATE_API_URL",
     f"{ILLUCARDS_BASE}/api/order/update",
@@ -3012,6 +3022,11 @@ ORDER_FROM_BOT_API_URL = os.getenv(
     f"{ILLUCARDS_BASE}/api/order/from-bot",
 ).strip()
 ORDER_STATUS_UPDATE_SECRET = os.getenv("ILLUCARDS_ORDER_UPDATE_SECRET", "").strip()
+SITE_USER_STATE_SYNC_SECRET = (
+    os.getenv("ILLUCARDS_USER_STATE_SYNC_SECRET")
+    or os.getenv("ILLUCARDS_ORDER_UPDATE_SECRET")
+    or ""
+).strip()
 # Опционально: POST на ваш URL после нажатия «Оплатить» (callback paid) — очистить корзину на сайте.
 ILLUCARDS_CART_CLEAR_ON_PROOF_URL = (os.getenv("ILLUCARDS_CART_CLEAR_ON_PROOF_URL") or "").strip()
 # Тот же секрет, что на сайте (Vercel): GET /api/order/{id} и POST /api/order/update — Bearer.
@@ -3341,11 +3356,8 @@ def _rarity_label_ru(s: str) -> str:
 
 REPLY_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(BTN_CATALOG), KeyboardButton(BTN_CART)],
-        [KeyboardButton(BTN_POPULAR), KeyboardButton(BTN_CHAT)],
-        [KeyboardButton(BTN_MY_ORDERS), KeyboardButton(BTN_DELIVERY)],
-        [KeyboardButton(BTN_FAVORITES), KeyboardButton(BTN_RANDOM_CARD)],
-        [KeyboardButton(BTN_BONUSES)],
+        [KeyboardButton(BTN_CHAT), KeyboardButton(BTN_MY_ORDERS)],
+        [KeyboardButton(BTN_DELIVERY), KeyboardButton(BTN_BONUSES)],
     ],
     resize_keyboard=True,
 )
@@ -3353,14 +3365,9 @@ REPLY_KB = ReplyKeyboardMarkup(
 # Тексты reply-клавиатуры (сброс режима «чат с админом» при переходе в меню)
 REPLY_MENU_TEXTS = frozenset(
     {
-        BTN_CATALOG,
-        BTN_CART,
-        BTN_POPULAR,
         BTN_CHAT,
         BTN_MY_ORDERS,
         BTN_DELIVERY,
-        BTN_FAVORITES,
-        BTN_RANDOM_CARD,
         BTN_BONUSES,
     },
 )
@@ -3892,7 +3899,7 @@ def _cart_grand_total_for_display(
     cur: str,
 ) -> Tuple[int, bool]:
     """
-    Итог для текста «💚 Корзина». Второй элемент True — показываем как «с сайта».
+    Итог для текста «🛒 Корзина». Второй элемент True — показываем как «с сайта».
     Если число с сайта явно не сходится с позициями + доставка, показываем расчёт бота.
     """
     exp = _cart_expected_grand_with_delivery(uid, user_data, lines)
@@ -4002,8 +4009,9 @@ def _format_order_items_for_admin(lines: List[dict], currency: str = "BYN") -> s
     cur = str(currency or "BYN").strip().upper() or "BYN"
     rows: List[str] = []
     for x in lines:
-        name = (x.get("name") or "—")[:200]
-        if len((x.get("name") or "")) > 200:
+        name_raw = str(x.get("name") or "—")
+        name = name_raw[:200]
+        if len(name_raw) > 200:
             name = name.rstrip() + "…"
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
@@ -4628,8 +4636,9 @@ def _format_cart_message(
     for x in lines:
         if not isinstance(x, dict):
             continue
-        name = (x.get("name") or "—")[:200]
-        if len((x.get("name") or "")) > 200:
+        name_raw = str(x.get("name") or "—")
+        name = name_raw[:200]
+        if len(name_raw) > 200:
             name = name.rstrip() + "…"
         p = _coerce_card_price_int(x.get("price"))
         q = _cart_line_qty_coerce(x.get("qty"))
@@ -4670,8 +4679,9 @@ def _format_login_site_cart_pending_text(
         g_cur = _goods_currency_for_delivery_country(bot_code)
     out: List[str] = []
     for x in lines:
-        name = (x.get("name") or "—")[:200]
-        if len((x.get("name") or "")) > 200:
+        name_raw = str(x.get("name") or "—")
+        name = name_raw[:200]
+        if len(name_raw) > 200:
             name = name.rstrip() + "…"
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
@@ -4726,9 +4736,9 @@ async def _send_site_login_cart_order_message(bot, uid: int, preview_inner: str)
         return
     intro = (
         "✅ Вход на сайт подтверждён.\n\n"
-        "Состав из корзины сайта уже в «💚 Корзина» бота. "
+        "Состав из корзины сайта уже в «🛒 Корзина» бота. "
         "«Подтвердить заказ» только закрывает черновик здесь — в чат админа ничего не отправляется; "
-        "администратор увидит заказ после оплаты (оформите из «💚 Корзина» → доставка → оплата → скрин). "
+        "администратор увидит заказ после оплаты (оформите из «🛒 Корзина» → доставка → оплата → скрин). "
         "«Отмена» — без подтверждения."
     )
     body = f"{intro}\n\n{preview_inner.strip()}"
@@ -4897,6 +4907,58 @@ async def _refresh_user_site_orders_from_site(user_id: int) -> int:
     return len(out)
 
 
+async def _refresh_user_state_from_site(user_id: int) -> bool:
+    """Pull cart/favorites/bonus state from IlluCards site before showing it in Telegram."""
+    uid = int(user_id or 0)
+    if not uid or not SITE_USER_STATE_API_URL or not SITE_USER_STATE_SYNC_SECRET:
+        return False
+    safe_uid = urllib.parse.quote(str(uid), safe="")
+    if "{user_id}" in SITE_USER_STATE_API_URL:
+        url = SITE_USER_STATE_API_URL.replace("{user_id}", safe_uid)
+    else:
+        sep = "&" if "?" in SITE_USER_STATE_API_URL else "?"
+        url = f"{SITE_USER_STATE_API_URL}{sep}user_id={safe_uid}"
+    log = logging.getLogger(__name__)
+    headers = {"Authorization": f"Bearer {SITE_USER_STATE_SYNC_SECRET}"}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    log.warning("IlluCards user-state sync HTTP %s: %s", resp.status, body[:300])
+                    return False
+                data = await resp.json()
+    except Exception:
+        log.exception("IlluCards user-state sync failed user_id=%s", uid)
+        return False
+    if not isinstance(data, dict):
+        return False
+    del_raw = data.get("deliveryCountry") or data.get("delivery_country") or "BY"
+    bot_code, _, _, _ = _delivery_option_for_site_code(str(del_raw or "BY"))
+    try:
+        products = await load_products()
+    except Exception:
+        products = []
+    changed = False
+    if "cart" in data:
+        lines = _normalize_sync_cart_items(data.get("cart"), bot_code)
+        if products and lines:
+            _reconcile_cart_lines_to_catalog(products, lines)
+        _cart_set_items_uid(uid, lines)
+        _remember_user_delivery_country(uid, bot_code)
+        _cart_apply_site_pricing_hints(uid, data)
+        changed = True
+    if "favorites" in data:
+        refs = _normalize_sync_favorites_with_catalog(data.get("favorites"), products)
+        USER_FAVORITES[uid] = refs
+        changed = True
+    _apply_site_loyalty_from_sync(uid, data)
+    if changed:
+        users_touch(uid, "site_state_pull")
+    save_state()
+    return True
+
+
 def _site_user_order_token(uid: int, rec: dict) -> str:
     key = str(rec.get("external_id") or rec.get("id") or "")
     return hashlib.sha256(f"{int(uid)}:{key}".encode("utf-8")).hexdigest()[:12]
@@ -4944,7 +5006,7 @@ async def _format_mine_orders_text_and_kb(
         lines.append(f"#{oid} — {qty} шт. — {tot} {cur} — {badge}")
         rows.append(
             [
-                InlineKeyboardButton("📦", callback_data=f"user_order_{oid}"),
+                InlineKeyboardButton(f"📦 #{oid}", callback_data=f"user_order_{oid}"),
             ],
         )
     for rec in site_recs[:20]:
@@ -4952,8 +5014,8 @@ async def _format_mine_orders_text_and_kb(
             break
         tot = int(rec.get("total") or 0)
         _, qty = _cart_totals(list(rec.get("items") or []))
-        st_site = str(rec.get("status") or "на сайте").strip()
-        badge = f"🌐 {st_site[:36]}" if st_site else "🌐 на сайте"
+        st_site = _site_status_to_bot_status(str(rec.get("status") or ""))
+        badge = _user_order_status_badge(st_site) if st_site else "🌐 на сайте"
         drec = rec.get("delivery") if isinstance(rec.get("delivery"), dict) else None
         cur = _order_line_currency_from_delivery(drec)
         disp = str(rec.get("external_id") or rec.get("id") or "")[:20]
@@ -4961,7 +5023,7 @@ async def _format_mine_orders_text_and_kb(
         tok = _site_user_order_token(int(user_id), rec)
         rows.append(
             [
-                InlineKeyboardButton("📦", callback_data=f"uos:{tok}"),
+                InlineKeyboardButton(f"📦 {disp or 'заказ'}", callback_data=f"uos:{tok}"),
             ],
         )
     text = "\n".join(lines)
@@ -5056,8 +5118,9 @@ def _format_checkout_preview_for_user(
         cur = default_cur
     out: List[str] = ["🛒", ""]
     for x in lines:
-        name = (x.get("name") or "—")[:200]
-        if len((x.get("name") or "")) > 200:
+        name_raw = str(x.get("name") or "—")
+        name = name_raw[:200]
+        if len(name_raw) > 200:
             name = name.rstrip() + "…"
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
@@ -5109,8 +5172,9 @@ def _format_order_preview_with_delivery(
         "",
     ]
     for x in lines:
-        name = (x.get("name") or "—")[:200]
-        if len((x.get("name") or "")) > 200:
+        name_raw = str(x.get("name") or "—")
+        name = name_raw[:200]
+        if len(name_raw) > 200:
             name = name.rstrip() + "…"
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
@@ -5777,7 +5841,7 @@ async def on_tinder_swipe(
             _cart_price_region_for_user(uid_t, ud)
         )
         short = f"{len(lines)} поз. · {tot} {cur_t}"
-        await q.answer(f"💚 Корзина: {short}", show_alert=False)
+        await q.answer(f"🛒 Корзина: {short}", show_alert=False)
     elif op == "v":
         uid_t = q.from_user.id if q.from_user else 0
         cnt = len(_favorites_get_refs_uid(uid_t, ud))
@@ -6518,8 +6582,9 @@ def _format_user_deep_link_order_message(order: dict) -> str:
         "",
     ]
     for x in lines:
-        name = (x.get("name") or "—")[:200]
-        if len((x.get("name") or "")) > 200:
+        name_raw = str(x.get("name") or "—")
+        name = name_raw[:200]
+        if len(name_raw) > 200:
             name = name.rstrip() + "…"
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
@@ -7572,6 +7637,7 @@ async def send_favorites_deck(
     if not products:
         await msg.reply_text(MSG_CATALOG_LOAD_FAIL)
         return
+    await _refresh_user_state_from_site(uid)
     refs = set(_favorites_get_refs_uid(uid, context.user_data))
     if not refs:
         await msg.reply_text(
@@ -9206,7 +9272,7 @@ async def on_view_cart_callback(
         log_vc.exception("vc:0 корзина user_id=%s", uid)
         try:
             await q.message.reply_text(
-                "Не удалось показать корзину. Попробуйте кнопку «💚 Корзина» внизу или «Связь».",
+                "Не удалось показать корзину. Попробуйте кнопку «🛒 Корзина» внизу или «Связь».",
                 reply_markup=REPLY_KB,
             )
         except Exception:
@@ -9412,6 +9478,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log_cart = logging.getLogger(__name__)
         try:
             await _delete_user_temp_messages(context.bot, uid)
+            await _refresh_user_state_from_site(uid)
             _ensure_user_cart(uid, user_data)
             cl = _cart_get_lines_uid(uid, user_data)
             products = list(context.application.bot_data.get("products") or [])
@@ -9420,10 +9487,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 if products:
                     context.application.bot_data["products"] = products
             if products:
-                _reprice_lines_for_delivery(
-                    cl, products, _cart_price_region_for_user(uid, user_data)
-                )
-                _cart_set_items_uid(uid, cl)
+                try:
+                    _reprice_lines_for_delivery(
+                        cl, products, _cart_price_region_for_user(uid, user_data)
+                    )
+                    _cart_set_items_uid(uid, cl)
+                except Exception:
+                    log_cart.exception("Корзина: не удалось пересчитать цены user_id=%s", uid)
             t = _format_cart_message(cl, user_data, cart_uid=uid)
             kb = _kb_cart(cl)
             await msg.reply_text(t, reply_markup=kb)
