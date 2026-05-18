@@ -1739,6 +1739,28 @@ def _loyalty_credit_order_once(o: dict) -> int:
     return int(earn_est)
 
 
+def _loyalty_finalize_order_bonuses_once(o: dict) -> None:
+    if not isinstance(o, dict):
+        return
+    uid = int(o.get("user_id") or 0)
+    if not uid:
+        return
+    try:
+        spent = int(o.get("bonus_points_spent") or 0)
+    except (TypeError, ValueError):
+        spent = 0
+    if spent <= 0:
+        try:
+            spent = int(o.get("bonus_applied") or 0)
+        except (TypeError, ValueError):
+            spent = 0
+    if spent > 0 and not o.get("loyalty_debited"):
+        _loyalty_apply_local_debit(uid, int(spent))
+        o["loyalty_debited"] = True
+        o["loyalty_debited_amount"] = int(spent)
+    _loyalty_credit_order_once(o)
+
+
 def _loyalty_credit_due_orders_for_user(uid: int) -> int:
     if not uid:
         return 0
@@ -2251,16 +2273,71 @@ def _normalize_sync_site_order(raw: object) -> Optional[dict]:
         total_goods, _ = _cart_totals(lines)
     except Exception:
         total_goods = 0
-    try:
-        total = int(float(raw.get("total") or total_goods or 0))
-    except (TypeError, ValueError):
+    final_total = _loyalty_find_int(
+        raw,
+        (
+            "finalTotal",
+            "final_total",
+            "payTotal",
+            "pay_total",
+            "amountToPay",
+            "amount_to_pay",
+            "totalAfterBonus",
+            "total_after_bonus",
+            "totalAfterBonuses",
+            "total_after_bonuses",
+            "grandTotalAfterBonus",
+            "grand_total_after_bonus",
+            "paidTotal",
+            "paid_total",
+        ),
+        2,
+    )
+    total_raw = _loyalty_find_int(raw, ("total", "grandTotal", "grand_total", "orderTotal", "order_total"), 2)
+    bonus_applied = _loyalty_find_int(
+        raw,
+        (
+            "bonusApplied",
+            "bonus_applied",
+            "bonusDiscount",
+            "bonus_discount",
+            "bonusesApplied",
+            "bonuses_applied",
+            "pointsDiscount",
+            "points_discount",
+            "loyaltyDiscount",
+            "loyalty_discount",
+        ),
+        2,
+    )
+    bonus_spent = _loyalty_find_int(
+        raw,
+        (
+            "bonusPointsSpent",
+            "bonus_points_spent",
+            "pointsSpent",
+            "points_spent",
+            "bonusesSpent",
+            "bonuses_spent",
+            "loyaltyPointsSpent",
+            "loyalty_points_spent",
+        ),
+        2,
+    )
+    if final_total is not None:
+        total = int(final_total)
+    elif total_raw is not None and bonus_applied is not None and int(bonus_applied) > 0:
+        total = max(0, int(total_raw) - int(bonus_applied))
+    elif total_raw is not None:
+        total = int(total_raw)
+    else:
         total = int(total_goods)
     st = raw.get("status")
     if st is None or str(st).strip() == "":
         status_label = "На сайте"
     else:
         status_label = _site_status_to_bot_status(st)
-    return {
+    rec = {
         "id": ext[:80],
         "external_id": ext[:120],
         "items": lines,
@@ -2270,6 +2347,11 @@ def _normalize_sync_site_order(raw: object) -> Optional[dict]:
         "status": status_label,
         "sync_source": "site",
     }
+    if bonus_applied is not None and int(bonus_applied) > 0:
+        rec["bonus_applied"] = int(bonus_applied)
+    if bonus_spent is not None and int(bonus_spent) > 0:
+        rec["bonus_points_spent"] = int(bonus_spent)
+    return rec
 
 
 def _normalize_sync_orders(raw: object) -> List[dict]:
@@ -4837,17 +4919,76 @@ def _site_order_rec_from_deep_link_shape(order_id: str, order: dict, status: obj
         total_goods, _ = _cart_totals(lines)
     except Exception:
         total_goods = 0
-    try:
-        total = int(float(order.get("total") or order.get("site_grand_total_hint") or 0))
-    except (TypeError, ValueError):
+    final_total = _loyalty_find_int(
+        order,
+        (
+            "finalTotal",
+            "final_total",
+            "payTotal",
+            "pay_total",
+            "amountToPay",
+            "amount_to_pay",
+            "totalAfterBonus",
+            "total_after_bonus",
+            "totalAfterBonuses",
+            "total_after_bonuses",
+            "grandTotalAfterBonus",
+            "grand_total_after_bonus",
+            "paidTotal",
+            "paid_total",
+        ),
+        2,
+    )
+    total_raw = _loyalty_find_int(
+        order,
+        ("total", "grandTotal", "grand_total", "orderTotal", "order_total", "site_grand_total_hint"),
+        2,
+    )
+    bonus_applied = _loyalty_find_int(
+        order,
+        (
+            "bonusApplied",
+            "bonus_applied",
+            "bonusDiscount",
+            "bonus_discount",
+            "bonusesApplied",
+            "bonuses_applied",
+            "pointsDiscount",
+            "points_discount",
+            "loyaltyDiscount",
+            "loyalty_discount",
+        ),
+        2,
+    )
+    bonus_spent = _loyalty_find_int(
+        order,
+        (
+            "bonusPointsSpent",
+            "bonus_points_spent",
+            "pointsSpent",
+            "points_spent",
+            "bonusesSpent",
+            "bonuses_spent",
+            "loyaltyPointsSpent",
+            "loyalty_points_spent",
+        ),
+        2,
+    )
+    if final_total is not None:
+        total = int(final_total)
+    elif total_raw is not None and bonus_applied is not None and int(bonus_applied) > 0:
+        total = max(0, int(total_raw) - int(bonus_applied))
+    elif total_raw is not None:
+        total = int(total_raw)
+    else:
         total = 0
-    if total <= 0:
+    if total <= 0 and bonus_applied is None:
         try:
             total = int(total_goods) + int(drec.get("amount") or 0)
         except (TypeError, ValueError):
             total = int(total_goods)
     ext = str(order.get("external_id") or order_id).strip()
-    return {
+    rec = {
         "id": ext[:80],
         "external_id": ext[:120],
         "items": lines,
@@ -4857,6 +4998,11 @@ def _site_order_rec_from_deep_link_shape(order_id: str, order: dict, status: obj
         "status": _site_status_to_bot_status(status),
         "sync_source": "site",
     }
+    if bonus_applied is not None and int(bonus_applied) > 0:
+        rec["bonus_applied"] = int(bonus_applied)
+    if bonus_spent is not None and int(bonus_spent) > 0:
+        rec["bonus_points_spent"] = int(bonus_spent)
+    return rec
 
 
 async def _refresh_user_site_orders_from_site(user_id: int) -> int:
@@ -7442,7 +7588,7 @@ async def on_order_status_buttons(
         return
     o["status"] = want
     if want in ("accepted", "shipped", "done"):
-        _loyalty_credit_order_once(o)
+        _loyalty_finalize_order_bonuses_once(o)
     save_state()
     if want in ("done", "canceled"):
         cuid = int(o.get("user_id") or 0)
@@ -8611,7 +8757,6 @@ async def on_send_order_to_admin(
         ORDERS[int(oid)]["payment_method"] = "bonuses"
         ORDERS[int(oid)]["status"] = "accepted"
         ORDERS[int(oid)]["bonus_paid_full"] = True
-        _loyalty_apply_local_debit(uid, int(spend_points))
         _user_state_clear_payment_states(uid)
         _clear_crypto_auto_watch(ORDERS[int(oid)], uid)
         _clear_checkout_delivery(ud)
