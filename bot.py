@@ -1771,7 +1771,7 @@ def _loyalty_credit_due_orders_for_user(uid: int) -> int:
         if int(o.get("user_id") or 0) != int(uid):
             continue
         st = _norm_bot_order_status(str(o.get("status") or "new"))
-        if st in ("accepted", "shipped", "done") or o.get("paid"):
+        if st in ("accepted", "shipped", "done"):
             total += _loyalty_credit_order_once(o)
     return int(total)
 
@@ -8757,6 +8757,7 @@ async def on_send_order_to_admin(
         ORDERS[int(oid)]["payment_method"] = "bonuses"
         ORDERS[int(oid)]["status"] = "accepted"
         ORDERS[int(oid)]["bonus_paid_full"] = True
+        _loyalty_finalize_order_bonuses_once(ORDERS[int(oid)])
         _user_state_clear_payment_states(uid)
         _clear_crypto_auto_watch(ORDERS[int(oid)], uid)
         _clear_checkout_delivery(ud)
@@ -9167,21 +9168,8 @@ async def on_admin_confirm_payment(
         return
     o["paid"] = True
     o["paid_at"] = time.time()
-    try:
-        b_sp = int(o.get("bonus_points_spent") or 0)
-    except (TypeError, ValueError):
-        b_sp = 0
-    if b_sp <= 0:
-        try:
-            b_sp = int(o.get("bonus_applied") or 0)
-        except (TypeError, ValueError):
-            b_sp = 0
     cust = int(o.get("user_id") or 0)
-    site_order_id = await _ensure_site_order_for_bot_order(oid, o)
-    if b_sp > 0 and cust and not site_order_id:
-        _loyalty_apply_local_debit(cust, b_sp)
-    if cust:
-        _loyalty_credit_order_once(o)
+    await _ensure_site_order_for_bot_order(oid, o)
     _user_state_clear_payment_states(cust)
     cud = _user_data_for(context.application, cust)
     cud.pop("awaiting_payment_order_id", None)
