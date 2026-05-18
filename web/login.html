@@ -54,13 +54,17 @@
     }
     async function post(path, body) {
       const url = (API || "") + path;
-      const r = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const data = await r.json().catch(function () { return {}; });
-      return { ok: r.ok, data: data };
+      try {
+        const r = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = await r.json().catch(function () { return {}; });
+        return { ok: r.ok, data: data };
+      } catch (e) {
+        return { ok: false, data: { error: "Сайт не получил ответ от бота. Попробуйте ещё раз." } };
+      }
     }
     function redirectAfterLogin() {
       if (!REDIRECT_TO) return;
@@ -103,9 +107,10 @@
       if (!u) { setMsg("Введите @username", "err"); return; }
       setMsg("Отправляем…", "");
       this.disabled = true;
+      document.getElementById("code").value = "";
       var res = await post("/api/send-code", { username: u });
       this.disabled = false;
-      if (res.ok && res.data.success) setMsg("Код отправлен в Telegram.", "ok");
+      if (res.ok && res.data.success) setMsg("Код отправлен в Telegram. Если предыдущий код не подошёл, используйте новый.", "ok");
       else setMsg(res.data.error || "Ошибка", "err");
     };
     document.getElementById("btnVerify").onclick = async function () {
@@ -126,7 +131,9 @@
         } catch (e) {}
         setMsg("Вход выполнен.", "ok");
         redirectAfterLogin();
-      } else setMsg(res.data.error || "Ошибка", "err");
+      } else {
+        setMsg((res.data.error || "Ошибка") + ". Можно запросить новый код и попробовать снова.", "err");
+      }
     };
   </script>
 </body>

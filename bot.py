@@ -281,7 +281,13 @@ def _register_login_username(user_id: int, username: Optional[str]) -> None:
         return
     key = _normalize_login_username(un)
     if key:
+        prev_uid = USERNAME_TO_USER_ID.get(key)
         USERNAME_TO_USER_ID[key] = uid
+        row = users_ensure(uid)
+        prev_username = row.get("username")
+        row["username"] = key
+        if prev_uid != uid or prev_username != key:
+            save_state()
 
 
 def _int_key_dict(raw: object) -> dict:
@@ -390,6 +396,7 @@ def _build_state_payload() -> dict:
         "users": USERS,
         "user_messages": USER_MESSAGES,
         "user_site_loyalty": USER_SITE_LOYALTY,
+        "username_to_user_id": USERNAME_TO_USER_ID,
     }
 
 
@@ -413,6 +420,27 @@ def _apply_state_payload(data: dict) -> None:
     USER_MESSAGES.update(_int_key_dict(data.get("user_messages")))
     USER_SITE_LOYALTY.clear()
     USER_SITE_LOYALTY.update(_int_key_dict(data.get("user_site_loyalty")))
+    USERNAME_TO_USER_ID.clear()
+    raw_login_map = data.get("username_to_user_id")
+    if isinstance(raw_login_map, dict):
+        for raw_key, raw_uid in raw_login_map.items():
+            key = _normalize_login_username(str(raw_key or ""))
+            try:
+                uid = int(raw_uid or 0)
+            except (TypeError, ValueError):
+                uid = 0
+            if key and uid:
+                USERNAME_TO_USER_ID[key] = uid
+    for raw_uid, row in list(USERS.items()):
+        if not isinstance(row, dict):
+            continue
+        key = _normalize_login_username(str(row.get("username") or ""))
+        try:
+            uid = int(raw_uid or 0)
+        except (TypeError, ValueError):
+            uid = 0
+        if key and uid:
+            USERNAME_TO_USER_ID[key] = uid
     try:
         restored_counter = int(data.get("order_counter") or 1)
     except (TypeError, ValueError):
