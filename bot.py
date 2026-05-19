@@ -425,8 +425,10 @@ def _apply_state_payload(data: dict) -> None:
     if loaded_user_messages or not USER_MESSAGES:
         USER_MESSAGES.clear()
         USER_MESSAGES.update(loaded_user_messages)
-    USER_SITE_LOYALTY.clear()
-    USER_SITE_LOYALTY.update(_int_key_dict(data.get("user_site_loyalty")))
+    loaded_site_loyalty = _int_key_dict(data.get("user_site_loyalty"))
+    if loaded_site_loyalty or not USER_SITE_LOYALTY:
+        USER_SITE_LOYALTY.clear()
+        USER_SITE_LOYALTY.update(loaded_site_loyalty)
     USERNAME_TO_USER_ID.clear()
     raw_login_map = data.get("username_to_user_id")
     if isinstance(raw_login_map, dict):
@@ -1459,6 +1461,31 @@ def _loyalty_find_int(data: dict, keys: Tuple[str, ...], depth: int) -> Optional
     return None
 
 
+def _loyalty_find_balance_int(data: dict, keys: Tuple[str, ...], depth: int) -> Optional[int]:
+    found: List[int] = []
+
+    def walk(node: object, left: int) -> None:
+        if not isinstance(node, dict) or left < 0:
+            return
+        for key in keys:
+            if key in node:
+                val = _coerce_loyalty_int(node.get(key))
+                if val is not None:
+                    found.append(int(val))
+        for nest in _LOYALTY_NEST_KEYS:
+            sub = node.get(nest)
+            if isinstance(sub, dict):
+                walk(sub, left - 1)
+
+    walk(data, depth)
+    positives = [v for v in found if int(v) > 0]
+    if positives:
+        return max(int(v) for v in positives)
+    if found:
+        return max(0, int(found[0]))
+    return None
+
+
 _LOYALTY_PENDING_EARN_TEXT_KEYS: Tuple[str, ...] = (
     "bonusMessage",
     "loyaltyMessage",
@@ -1616,7 +1643,7 @@ def _parse_site_loyalty_snapshot(data: dict) -> dict:
             if msg:
                 break
     return {
-        "balance": _loyalty_find_int(data, bal_k, 2),
+        "balance": _loyalty_find_balance_int(data, bal_k, 3),
         "earned": _loyalty_find_int(data, earned_k, 2),
         "message": msg,
     }
@@ -1642,6 +1669,25 @@ def _apply_site_loyalty_from_sync(uid: int, data: dict) -> Optional[str]:
     except (TypeError, ValueError):
         prev_bal_i = None
     notify: Optional[str] = None
+    if bal_i is not None and int(bal_i) <= 0 and prev_bal_i is not None and int(prev_bal_i) > 0:
+        spent_i = _loyalty_find_int(
+            data,
+            (
+                "bonusPointsSpent",
+                "bonus_points_spent",
+                "pointsSpent",
+                "points_spent",
+                "bonusesSpent",
+                "bonuses_spent",
+                "bonusApplied",
+                "bonus_applied",
+                "bonusDiscount",
+                "bonus_discount",
+            ),
+            2,
+        )
+        if spent_i is None or int(spent_i) <= 0:
+            bal_i = prev_bal_i
     if earned_i is not None and int(earned_i) > 0:
         site_oid_raw = (
             data.get("botOrderId")
@@ -6185,7 +6231,7 @@ def _deep_link_candidate_dicts(raw: dict) -> List[dict]:
     if not isinstance(raw, dict):
         return []
     out: List[dict] = [raw]
-    for k in ("order", "data", "result", "payload"):
+    for k in ("order", "data", "result", "payload", "cart", "checkout"):
         v = raw.get(k)
         if isinstance(v, dict):
             out.append(v)
@@ -6436,7 +6482,15 @@ def _normalize_deep_link_order(
         return None
     if products:
         _reconcile_cart_lines_to_catalog(products, items_out)
-    d = raw.get("delivery")
+    source = raw
+    for cand in _deep_link_candidate_dicts(raw):
+        if isinstance(cand.get("delivery"), (dict, str)) or any(
+            cand.get(k) is not None
+            for k in ("delivery_label", "delivery_name", "shipping_label", "delivery_amount", "shipping")
+        ):
+            source = cand
+            break
+    d = source.get("delivery")
     if isinstance(d, dict) and (d.get("label") or d.get("name")):
         label = str(d.get("label") or d.get("name") or "").strip()
         try:
@@ -6454,22 +6508,22 @@ def _normalize_deep_link_order(
         country, label, amount, currency = _delivery_option_for_site_code(d)
     else:
         label = str(
-            raw.get("delivery_label")
-            or raw.get("delivery_name")
-            or raw.get("shipping_label")
+            source.get("delivery_label")
+            or source.get("delivery_name")
+            or source.get("shipping_label")
             or ""
         ).strip()
         try:
             amount = int(
-                raw.get("delivery_amount")
-                if raw.get("delivery_amount") is not None
-                else raw.get("shipping")
+                source.get("delivery_amount")
+                if source.get("delivery_amount") is not None
+                else source.get("shipping")
                 or 0
             )
         except (TypeError, ValueError):
             amount = 0
-        currency = str(raw.get("delivery_currency") or "BYN").strip() or "BYN"
-        country = str(raw.get("delivery_country") or "").strip()
+        currency = str(source.get("delivery_currency") or "BYN").strip() or "BYN"
+        country = str(source.get("delivery_country") or "").strip()
     if not label:
         opt = DELIVERY_OPTIONS.get(region_bot, DELIVERY_OPTIONS["by"])
         label, amount, currency = opt[0], int(opt[1]), str(opt[2])
@@ -6525,6 +6579,23 @@ def _normalize_deep_link_order(
         ),
         2,
     )
+    total_raw = _loyalty_find_int(
+        raw,
+        (
+            "total",
+            "grandTotal",
+            "grandTotalRub",
+            "grand_total",
+            "cartGrandTotal",
+            "orderTotal",
+            "order_total",
+            "amountDue",
+            "amount_due",
+        ),
+        3,
+    )
+    computed_total = int(total_goods) + int(amount)
+    site_hint = _deep_link_raw_grand_total(raw)
     out = {
         "items": items_out,
         "delivery": {
@@ -6534,8 +6605,8 @@ def _normalize_deep_link_order(
             "currency": currency,
         },
         "external_id": str(raw.get("id") or external_id),
-        "total": raw.get("total"),
-        "site_grand_total_hint": _deep_link_raw_grand_total(raw),
+        "total": int(total_raw) if total_raw is not None else raw.get("total"),
+        "site_grand_total_hint": int(site_hint),
     }
     if bonus_applied is not None and int(bonus_applied) > 0:
         out["bonus_applied"] = int(bonus_applied)
@@ -6545,8 +6616,12 @@ def _normalize_deep_link_order(
         out["final_total"] = int(final_total)
         out["total"] = int(final_total)
     elif bonus_applied is not None and int(bonus_applied) > 0:
-        out["total"] = max(0, int(total_goods) + int(amount) - int(bonus_applied))
+        out["total"] = max(0, int(computed_total) - int(bonus_applied))
         out["site_grand_total_hint"] = int(out["total"])
+    elif total_raw is not None and 0 < int(total_raw) < int(computed_total):
+        out["final_total"] = int(total_raw)
+        out["total"] = int(total_raw)
+        out["site_grand_total_hint"] = int(total_raw)
     return out
 
 
@@ -9878,7 +9953,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if text == BTN_BONUSES:
-        _loyalty_credit_due_orders_for_user(uid)
         bal = _loyalty_balance_int(uid)
         await msg.reply_text(
             f"Текущий баланс: {bal} бонусов.\n\n{MSG_LOYALTY_MENU}",
