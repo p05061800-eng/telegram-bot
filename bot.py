@@ -402,10 +402,14 @@ def _build_state_payload() -> dict:
 
 def _apply_state_payload(data: dict) -> None:
     global ORDER_COUNTER
-    ORDERS.clear()
-    ORDERS.update(_int_key_dict(data.get("orders")))
-    USER_ORDERS.clear()
-    USER_ORDERS.update(_int_key_dict(data.get("user_orders")))
+    loaded_orders = _int_key_dict(data.get("orders"))
+    if loaded_orders or not ORDERS:
+        ORDERS.clear()
+        ORDERS.update(loaded_orders)
+    loaded_user_orders = _int_key_dict(data.get("user_orders"))
+    if loaded_user_orders or not USER_ORDERS:
+        USER_ORDERS.clear()
+        USER_ORDERS.update(loaded_user_orders)
     USER_CART.clear()
     USER_CART.update(_int_key_dict(data.get("user_cart")))
     USER_FAVORITES.clear()
@@ -416,8 +420,10 @@ def _apply_state_payload(data: dict) -> None:
     USER_PREF_DELIVERY_COUNTRY.update(_int_key_dict(data.get("user_pref_delivery_country")))
     USERS.clear()
     USERS.update(_int_key_dict(data.get("users")))
-    USER_MESSAGES.clear()
-    USER_MESSAGES.update(_int_key_dict(data.get("user_messages")))
+    loaded_user_messages = _int_key_dict(data.get("user_messages"))
+    if loaded_user_messages or not USER_MESSAGES:
+        USER_MESSAGES.clear()
+        USER_MESSAGES.update(loaded_user_messages)
     USER_SITE_LOYALTY.clear()
     USER_SITE_LOYALTY.update(_int_key_dict(data.get("user_site_loyalty")))
     USERNAME_TO_USER_ID.clear()
@@ -658,8 +664,6 @@ def _remember_user_message(uid: int, username: Optional[str], kind: str, text: s
             "text": body[:1500],
         }
     )
-    if len(bucket) > 100:
-        del bucket[:-100]
     save_state()
 
 
@@ -2405,8 +2409,19 @@ def _user_orders_merge_site(uid: int, site_orders: List[dict]) -> None:
     if not site_orders:
         return
     existing = list(USER_ORDERS.get(int(uid)) or [])
-    kept = [r for r in existing if str(r.get("sync_source") or "") != "site"]
-    USER_ORDERS[int(uid)] = kept + list(site_orders or [])
+    merged: List[dict] = []
+    seen: set = set()
+    for rec in existing + list(site_orders or []):
+        if not isinstance(rec, dict):
+            continue
+        key = str(rec.get("external_id") or rec.get("id") or "").strip()
+        if not key:
+            key = f"local:{len(merged)}:{id(rec)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(rec)
+    USER_ORDERS[int(uid)] = merged
     save_state()
 
 
@@ -4057,6 +4072,21 @@ def _order_status_label_ru(status: str) -> str:
 def _norm_bot_order_status(status: str) -> str:
     """Единый ключ статуса заказа в ORDERS (cancelled → canceled)."""
     s = str(status or "new").strip().lower()
+    aliases = {
+        "в обработке": "new",
+        "новый": "new",
+        "новые": "new",
+        "принят": "accepted",
+        "в сборке": "accepted",
+        "отправлен": "shipped",
+        "отправленные": "shipped",
+        "завершён": "done",
+        "завершен": "done",
+        "отменён": "canceled",
+        "отменен": "canceled",
+    }
+    if s in aliases:
+        return aliases[s]
     if s == "cancelled":
         return "canceled"
     return s
@@ -4275,6 +4305,8 @@ async def _notify_admin_new_order(
     delivery: Optional[dict] = None,
     *,
     loyalty_hint_dict: Optional[dict] = None,
+    bonus_applied: int = 0,
+    bonus_points_spent: int = 0,
 ) -> Optional[int]:
     """Новый заказ только в ORDERS; в ORDER_NOTIFY_TARGET карточка заказа — после оплаты (_send_deferred_admin_order_panel)."""
     global ORDER_COUNTER
@@ -4303,6 +4335,10 @@ async def _notify_admin_new_order(
     )
     if earn_est is not None and int(earn_est) > 0:
         rec["loyalty_earn_estimate"] = int(earn_est)
+    if int(bonus_applied) > 0:
+        rec["bonus_applied"] = int(bonus_applied)
+    if int(bonus_points_spent) > 0:
+        rec["bonus_points_spent"] = int(bonus_points_spent)
     ORDERS[order_id] = rec
     if uid:
         users_touch(uid, activity_only=True)
@@ -4693,9 +4729,17 @@ def _order_resolved_grand_total(o: dict) -> int:
     """Итог для отображения и ORDERS: при явном расхождении с позициями — исправляем o['total']."""
     comp = _order_computed_grand_total(o)
     try:
+        bonus_applied = int(o.get("bonus_applied") or 0)
+    except (TypeError, ValueError):
+        bonus_applied = 0
+    try:
         stored = int(o.get("total") or 0)
     except (TypeError, ValueError):
         stored = 0
+    if bonus_applied > 0 and comp >= 0:
+        if stored != comp:
+            o["total"] = int(comp)
+        return int(comp)
     if comp <= 0:
         return max(0, stored)
     if stored <= 0:
@@ -7237,7 +7281,7 @@ def _admin_orders_for_section(section: str) -> List[Tuple[int, dict]]:
     for oid in sorted(ORDERS.keys(), key=lambda k: int(k)):
         o = ORDERS[oid]
         st = _norm_bot_order_status(str(o.get("status") or "new"))
-        if sec == "new" and st != "new":
+        if sec == "new" and st in ("accepted", "shipped", "done", "canceled"):
             continue
         if sec == "shipped" and st != "shipped":
             continue
@@ -7245,56 +7289,60 @@ def _admin_orders_for_section(section: str) -> List[Tuple[int, dict]]:
     return rows
 
 
-def _kb_admin_orders_list(section: str = "all") -> Optional[InlineKeyboardMarkup]:
+def _admin_customer_rows_for_section(section: str = "all") -> List[Tuple[int, str, int, int]]:
     admin_orders = _admin_orders_for_section(section)
-    if not admin_orders:
-        return None
-    rows: List[List[InlineKeyboardButton]] = []
-    for oid, o in admin_orders:
-        tot = _order_resolved_grand_total(o)
-        cur_l = _order_line_currency_from_delivery(
-            o.get("delivery") if isinstance(o.get("delivery"), dict) else None
-        )
+    grouped: Dict[int, dict] = {}
+    for _oid, o in admin_orders:
         uid = int(o.get("user_id") or 0)
-        label = f"#{oid} · {_user_display_name(uid, o.get('username'))} · {tot} {cur_l}"
-        if len(label) > 60:
-            label = label[:57] + "…"
-        rows.append([InlineKeyboardButton(label, callback_data=f"open_order_{int(oid)}")])
-        if uid:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        f"💬 {_user_display_name(uid, o.get('username'))}",
-                        callback_data=f"adm_user_msgs_{uid}",
-                    )
-                ]
-            )
-    return InlineKeyboardMarkup(rows)
-
-
-def _format_admin_stats() -> str:
-    """Сводка по ORDERS в памяти процесса (дата «сегодня» — локальное время сервера)."""
-    today_local = datetime.now().date()
-    today_count = 0
-    revenue_byn = 0
-    revenue_rub = 0
-    by_status = {"new": 0, "accepted": 0, "shipped": 0, "done": 0, "canceled": 0}
-    for o in ORDERS.values():
-        raw_st = str(o.get("status") or "new").strip().lower()
-        st = raw_st
-        if st == "cancelled":
-            st = "canceled"
-        if st not in by_status:
-            st = "new"
-        by_status[st] += 1
+        if not uid:
+            continue
+        rec = grouped.setdefault(
+            uid,
+            {
+                "name": _user_display_name(uid, o.get("username")),
+                "count": 0,
+                "last_ts": 0.0,
+            },
+        )
+        rec["count"] = int(rec.get("count") or 0) + 1
         try:
             ts = float(o.get("created_at") or 0)
         except (TypeError, ValueError):
             ts = 0.0
-        if ts > 0 and datetime.fromtimestamp(ts).date() == today_local:
-            today_count += 1
+        rec["last_ts"] = max(float(rec.get("last_ts") or 0.0), ts)
+    rows: List[Tuple[int, str, int, int]] = []
+    for uid, rec in grouped.items():
+        rows.append((int(uid), str(rec.get("name") or f"id {uid}"), int(rec.get("count") or 0), int(rec.get("last_ts") or 0)))
+    rows.sort(key=lambda x: (-x[3], x[1].lower()))
+    return rows
+
+
+def _kb_admin_orders_list(section: str = "all") -> Optional[InlineKeyboardMarkup]:
+    customers = _admin_customer_rows_for_section(section)
+    if not customers:
+        return None
+    rows: List[List[InlineKeyboardButton]] = []
+    sec = str(section or "all").strip() or "all"
+    for uid, name, count, _last_ts in customers:
+        label = f"{name} · заказов: {count}"
+        if len(label) > 60:
+            label = label[:57] + "…"
+        rows.append([InlineKeyboardButton(label, callback_data=f"adm_user_{sec}_{uid}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _format_admin_stats() -> str:
+    """Сводка по всем ORDERS за всё время."""
+    revenue_byn = 0
+    revenue_rub = 0
+    by_status = {"new": 0, "accepted": 0, "shipped": 0, "done": 0, "canceled": 0}
+    for o in ORDERS.values():
+        st = _norm_bot_order_status(str(o.get("status") or "new"))
+        if st not in by_status:
+            st = "new"
+        by_status[st] += 1
         tot = _order_resolved_grand_total(o)
-        if raw_st not in ("canceled", "cancelled"):
+        if st != "canceled":
             d_st = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
             if str(d_st.get("country") or "").strip().lower() == "by":
                 revenue_byn += tot
@@ -7304,9 +7352,9 @@ def _format_admin_stats() -> str:
     lines = [
         "📈 Статистика",
         "",
-        f"📅 Сегодня заказов: {today_count}",
-        f"📦 Всего заказов: {n_all}",
-        f"💰 Выручка: {revenue_byn} BYN + {revenue_rub} RUB",
+        "📅 Период: всё время",
+        f"📦 Всего заказов за всё время: {n_all}",
+        f"💰 Выручка за всё время: {revenue_byn} BYN + {revenue_rub} RUB",
         "",
         "📊 По статусам:",
         f"🆕 Новые: {by_status['new']}",
@@ -7316,6 +7364,61 @@ def _format_admin_stats() -> str:
         f"❌ Отменены: {by_status['canceled']}",
     ]
     return "\n".join(lines)
+
+
+def _admin_user_orders_for_section(uid: int, section: str = "all") -> List[Tuple[int, dict]]:
+    rows: List[Tuple[int, dict]] = []
+    for oid, o in _admin_orders_for_section(section):
+        if int(o.get("user_id") or 0) == int(uid):
+            rows.append((int(oid), o))
+    rows.sort(key=lambda x: float(x[1].get("created_at") or 0), reverse=True)
+    return rows
+
+
+def _format_admin_customer_detail(uid: int, section: str = "all") -> str:
+    title_map = {
+        "new": "новые/не принятые",
+        "all": "все",
+        "shipped": "отправленные",
+    }
+    orders = _admin_user_orders_for_section(uid, section)
+    name = _user_display_name(uid)
+    if orders:
+        name = _user_display_name(uid, orders[0][1].get("username"))
+    parts: List[str] = [
+        f"👤 Клиент: {name}",
+        f"🆔 id: {int(uid)}",
+        f"📦 Заказы: {title_map.get(str(section or 'all'), 'все')}",
+        "",
+    ]
+    if not orders:
+        parts.append("Заказов в этом разделе нет.")
+    else:
+        for oid, o in orders[:25]:
+            tot = _order_resolved_grand_total(o)
+            cur = _order_line_currency_from_delivery(
+                o.get("delivery") if isinstance(o.get("delivery"), dict) else None
+            )
+            st_ru = _order_status_label_ru(_norm_bot_order_status(str(o.get("status") or "new")))
+            try:
+                ts = float(o.get("created_at") or 0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            tss = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts > 0 else "—"
+            parts.append(f"#{oid} — {tot} {cur} — {st_ru} — {tss}")
+    parts.extend(["", _format_user_messages_for_admin(uid)])
+    body = "\n".join(parts)
+    if len(body) > 4090:
+        body = body[:4086] + "…"
+    return body
+
+
+def _kb_admin_customer_detail(uid: int, section: str = "all") -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for oid, _o in _admin_user_orders_for_section(uid, section)[:20]:
+        rows.append([InlineKeyboardButton(f"📦 Открыть заказ #{oid}", callback_data=f"open_order_{oid}")])
+    rows.append([InlineKeyboardButton("💬 Ответить клиенту", callback_data=f"sup:rep:{int(uid)}")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7393,16 +7496,9 @@ async def on_admin_panel_action(
                 "Как только клиент оформит покупку — заказ появится здесь ✨"
             )
         else:
-            body_lines: List[str] = [title, "", "Выберите заказ или username 👇", ""]
-            for oid, o in admin_orders:
-                tot = _order_resolved_grand_total(o)
-                cur_o = _order_line_currency_from_delivery(
-                    o.get("delivery") if isinstance(o.get("delivery"), dict) else None
-                )
-                uid = int(o.get("user_id") or 0)
-                uname = _user_display_name(uid, o.get("username"))
-                st_ru = _order_status_label_ru(_norm_bot_order_status(str(o.get("status") or "new")))
-                body_lines.append(f"#{oid} — {uname} — {tot} {cur_o} — {st_ru}")
+            body_lines: List[str] = [title, "", "Выберите клиента 👇", ""]
+            for uid, name, count, _last_ts in _admin_customer_rows_for_section(section):
+                body_lines.append(f"👤 {name} — заказов: {count}")
             text = "\n".join(body_lines)
             if len(text) > 3500:
                 text = text[:3490] + "…"
@@ -7419,22 +7515,21 @@ async def on_admin_user_messages(
     q = update.callback_query
     if not q or not q.from_user or not q.data or not q.message:
         return
-    m = re.match(r"^adm_user_msgs_(\d+)$", (q.data or "").strip())
+    m = re.match(r"^adm_user_(new|all|shipped)_(\d+)$", (q.data or "").strip())
     if not m:
         return
     if not is_admin(q.from_user.id):
         return
     try:
-        uid = int(m.group(1))
+        section = m.group(1)
+        uid = int(m.group(2))
     except ValueError:
         await q.answer()
         return
     await q.answer()
     await q.message.reply_text(
-        _format_user_messages_for_admin(uid),
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("💬 Ответить", callback_data=f"sup:rep:{uid}")]]
-        ),
+        _format_admin_customer_detail(uid, section),
+        reply_markup=_kb_admin_customer_detail(uid, section),
         disable_web_page_preview=True,
     )
 
@@ -8763,7 +8858,14 @@ async def on_send_order_to_admin(
     if pe_ta is not None and int(pe_ta) > 0:
         lo_hint_ta = {"bonusWillEarn": int(pe_ta)}
     oid = await _notify_admin_new_order(
-        context, u, list(lines), int(pay_total), deepcopy(drec), loyalty_hint_dict=lo_hint_ta
+        context,
+        u,
+        list(lines),
+        int(pay_total),
+        deepcopy(drec),
+        loyalty_hint_dict=lo_hint_ta,
+        bonus_applied=int(spend),
+        bonus_points_spent=int(spend_points),
     )
     if oid is None:
         await _notify_callback_issue(q, context)
@@ -9856,7 +9958,7 @@ def main() -> None:
     app.add_handler(
         CallbackQueryHandler(
             on_admin_user_messages,
-            pattern=re.compile(r"^adm_user_msgs_\d+$"),
+            pattern=re.compile(r"^adm_user_(new|all|shipped)_\d+$"),
         )
     )
     app.add_handler(
