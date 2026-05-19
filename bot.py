@@ -849,7 +849,7 @@ MSG_NO_VITRINA_PROMOS = (
 )
 MSG_PROMO_PARTICIPATION = "Для участия в акции пришлите нам видео с уже имеющимися карточками."
 MSG_LOYALTY_MENU = (
-    "1 бонус = 100 RUB или 3,5 BYN\n"
+    "100 бонусов = 100 RUB или 3,5 BYN\n"
     "Потратить бонусы можно на последующие заказы"
 )
 MSG_ADD_TO_CART_STALE = "Эта карточка устарела в текущем сообщении. Откройте каталог заново и добавьте ещё раз."
@@ -1766,10 +1766,13 @@ def _loyalty_menu_text(uid: int) -> str:
     if country not in DELIVERY_OPTIONS:
         country = "by"
     cur = _goods_currency_for_delivery_country(country)
-    discount = _bonus_discount_units(bal, cur)
+    if cur == "BYN":
+        discount_txt = f"{(bal * 3.5 / 100):g} BYN"
+    else:
+        discount_txt = f"{_bonus_discount_units(bal, cur)} {cur}"
     return (
         f"Текущий баланс: {bal} бонусов.\n"
-        f"{bal} бонусов = {discount} {cur}.\n\n"
+        f"{bal} бонусов = {discount_txt}.\n\n"
         f"{MSG_LOYALTY_MENU}"
     )
 
@@ -1959,16 +1962,16 @@ def _bonus_discount_units(points: int, currency: str) -> int:
     cur = str(currency or "").strip().upper()
     pts = max(0, int(points or 0))
     if cur == "RUB":
-        return pts * 100
-    return (pts * 7) // 2
+        return pts
+    return (pts * 7) // 200
 
 
 def _bonus_points_for_discount(discount: int, currency: str) -> int:
     cur = str(currency or "").strip().upper()
     amt = max(0, int(discount or 0))
     if cur == "RUB":
-        return amt // 100
-    return (amt * 2) // 7
+        return amt
+    return (amt * 200 + 6) // 7
 
 
 def _checkout_bonus_cap(uid: int, grand_before_bonus: int, currency: str = "BYN") -> int:
