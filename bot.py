@@ -336,9 +336,11 @@ def _state_redis_url_client():
         STATE_REDIS_CLIENT.ping()
         logging.getLogger(__name__).info("Redis state connected via REDIS_URL")
         return STATE_REDIS_CLIENT
-    except Exception:
+    except Exception as e:
         STATE_REDIS_CLIENT = None
-        logging.getLogger(__name__).exception("Redis state REDIS_URL connection failed")
+        logging.getLogger(__name__).exception(
+            "Redis state REDIS_URL connection failed: %s", e
+        )
         return None
 
 
@@ -1756,6 +1758,20 @@ def _loyalty_balance_int(uid: int) -> int:
         return max(0, int(rec.get("balance") or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _loyalty_menu_text(uid: int) -> str:
+    bal = _loyalty_balance_int(uid)
+    country = str(USER_PREF_DELIVERY_COUNTRY.get(int(uid or 0)) or "").strip().lower()
+    if country not in DELIVERY_OPTIONS:
+        country = "by"
+    cur = _goods_currency_for_delivery_country(country)
+    discount = _bonus_discount_units(bal, cur)
+    return (
+        f"Текущий баланс: {bal} бонусов.\n"
+        f"{bal} бонусов = {discount} {cur}.\n\n"
+        f"{MSG_LOYALTY_MENU}"
+    )
 
 
 def _loyalty_apply_local_debit(uid: int, amount: int) -> None:
@@ -6264,11 +6280,30 @@ def _deep_link_delivery_bot_code(raw: dict) -> str:
     for cand in _deep_link_candidate_dicts(raw):
         d = cand.get("delivery")
         if isinstance(d, dict):
-            cc = str(d.get("country") or d.get("code") or "").strip()
+            cc = str(
+                d.get("country")
+                or d.get("code")
+                or d.get("countryCode")
+                or d.get("country_code")
+                or d.get("region")
+                or d.get("label")
+                or d.get("name")
+                or ""
+            ).strip()
             if cc:
                 break
         if not cc:
-            for key in ("delivery_country", "deliveryCountry", "deliveryRegion"):
+            for key in (
+                "delivery_country",
+                "deliveryCountry",
+                "deliveryRegion",
+                "delivery_label",
+                "deliveryLabel",
+                "delivery_name",
+                "deliveryName",
+                "shipping_label",
+                "shippingLabel",
+            ):
                 v = cand.get(key)
                 if v is None:
                     continue
@@ -7036,6 +7071,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await _send_start_intro_with_site_button(msg, uid, context.user_data)
                 return
             await _maybe_thank_first_telegram_auth(msg, uid)
+            d_order = order.get("delivery") if isinstance(order.get("delivery"), dict) else {}
+            _remember_user_delivery_country(uid, str(d_order.get("country") or ""))
             tok = secrets.token_hex(8)
             context.user_data["deep_link_order_session"] = {
                 "token": tok,
@@ -9953,9 +9990,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if text == BTN_BONUSES:
-        bal = _loyalty_balance_int(uid)
         await msg.reply_text(
-            f"Текущий баланс: {bal} бонусов.\n\n{MSG_LOYALTY_MENU}",
+            _loyalty_menu_text(uid),
             reply_markup=REPLY_KB,
             disable_web_page_preview=True,
         )
