@@ -6283,6 +6283,62 @@ def _deep_link_raw_grand_total(raw: dict) -> int:
     return 0
 
 
+def _deep_link_force_region_from_payload(raw: dict) -> str:
+    seen = False
+
+    def walk(node: object, depth: int, *, ru_only: bool) -> str:
+        nonlocal seen
+        if depth < 0:
+            return ""
+        if isinstance(node, dict):
+            for k, v in node.items():
+                ks = str(k or "").strip().lower()
+                if ks in (
+                    "pricerub",
+                    "price_rub",
+                    "unitpricerub",
+                    "unit_price_rub",
+                    "grandtotalrub",
+                    "grand_total_rub",
+                    "linetotalrub",
+                    "line_total_rub",
+                ):
+                    return "ru"
+                if not ru_only and ks in ("pricebyn", "price_byn", "grandtotalbyn", "grand_total_byn"):
+                    seen = True
+                r = walk(v, depth - 1, ru_only=ru_only)
+                if r:
+                    return r
+        elif isinstance(node, list):
+            for v in node[:50]:
+                r = walk(v, depth - 1, ru_only=ru_only)
+                if r:
+                    return r
+        else:
+            s = str(node or "").strip().lower()
+            if (
+                s in ("rub", "₽", "руб", "рубль", "рублей", "russia", "ru", "rus", "россия", "россии", "рф")
+                or " rub" in f" {s} "
+                or "руб" in s
+                or "russia" in s
+                or "росси" in s
+            ):
+                return "ru"
+            if not ru_only and (
+                s in ("byn", "беларусь", "беларуси", "by", "blr", "рб") or "беларус" in s
+            ):
+                seen = True
+        return ""
+
+    forced = walk(raw, 5, ru_only=True)
+    if forced:
+        return forced
+    forced = walk(raw, 5, ru_only=False)
+    if forced:
+        return forced
+    return "by" if seen else ""
+
+
 def _deep_link_delivery_bot_code(raw: dict) -> str:
     """Код доставки by|ru|ua|ot из JSON заказа с сайта (в т.ч. вложенный order/data)."""
     cc = ""
@@ -6488,6 +6544,9 @@ def _normalize_deep_link_order(
     if not raw_items:
         return None
     region_bot = _deep_link_delivery_bot_code(raw)
+    forced_region = _deep_link_force_region_from_payload(raw)
+    if forced_region:
+        region_bot = forced_region
     total_currency_hint = str(
         _deep_link_find_first(
             raw,
@@ -6599,6 +6658,9 @@ def _normalize_deep_link_order(
     norm_country, norm_label, norm_amount, norm_currency = _delivery_option_for_site_code(
         country or label or region_bot
     )
+    if forced_region:
+        norm_country = forced_region
+        norm_currency = _goods_currency_for_delivery_country(forced_region)
     if norm_country != region_bot:
         region_bot = norm_country
         lc_norm = _goods_currency_for_delivery_country(region_bot)
