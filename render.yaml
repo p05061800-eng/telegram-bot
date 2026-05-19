@@ -19,6 +19,8 @@ services:
         sync: false
       - key: UPSTASH_REDIS_REST_TOKEN
         sync: false
+      - key: REDIS_URL
+        sync: false
       - key: LOGIN_API_DISABLE
         value: "0"
       - key: LOGIN_API_PUBLIC_URL
