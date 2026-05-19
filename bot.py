@@ -331,6 +331,7 @@ def _state_redis_url_client():
             decode_responses=True,
             socket_connect_timeout=5,
             socket_timeout=5,
+            ssl_cert_reqs=None,
         )
         STATE_REDIS_CLIENT.ping()
         logging.getLogger(__name__).info("Redis state connected via REDIS_URL")
@@ -6474,7 +6475,57 @@ def _normalize_deep_link_order(
         label, amount, currency = opt[0], int(opt[1]), str(opt[2])
     if region_bot != "by":
         _, _, currency = DELIVERY_OPTIONS.get(region_bot, DELIVERY_OPTIONS["ru"])
-    return {
+    bonus_applied = _loyalty_find_int(
+        raw,
+        (
+            "bonusApplied",
+            "bonus_applied",
+            "bonusDiscount",
+            "bonus_discount",
+            "bonusesApplied",
+            "bonuses_applied",
+            "pointsDiscount",
+            "points_discount",
+            "loyaltyDiscount",
+            "loyalty_discount",
+        ),
+        2,
+    )
+    bonus_spent = _loyalty_find_int(
+        raw,
+        (
+            "bonusPointsSpent",
+            "bonus_points_spent",
+            "pointsSpent",
+            "points_spent",
+            "bonusesSpent",
+            "bonuses_spent",
+            "loyaltyPointsSpent",
+            "loyalty_points_spent",
+        ),
+        2,
+    )
+    final_total = _loyalty_find_int(
+        raw,
+        (
+            "finalTotal",
+            "final_total",
+            "payTotal",
+            "pay_total",
+            "amountToPay",
+            "amount_to_pay",
+            "totalAfterBonus",
+            "total_after_bonus",
+            "totalAfterBonuses",
+            "total_after_bonuses",
+            "grandTotalAfterBonus",
+            "grand_total_after_bonus",
+            "paidTotal",
+            "paid_total",
+        ),
+        2,
+    )
+    out = {
         "items": items_out,
         "delivery": {
             "country": region_bot,
@@ -6486,6 +6537,17 @@ def _normalize_deep_link_order(
         "total": raw.get("total"),
         "site_grand_total_hint": _deep_link_raw_grand_total(raw),
     }
+    if bonus_applied is not None and int(bonus_applied) > 0:
+        out["bonus_applied"] = int(bonus_applied)
+    if bonus_spent is not None and int(bonus_spent) > 0:
+        out["bonus_points_spent"] = int(bonus_spent)
+    if final_total is not None and int(final_total) >= 0:
+        out["final_total"] = int(final_total)
+        out["total"] = int(final_total)
+    elif bonus_applied is not None and int(bonus_applied) > 0:
+        out["total"] = max(0, int(total_goods) + int(amount) - int(bonus_applied))
+        out["site_grand_total_hint"] = int(out["total"])
+    return out
 
 
 def _order_record_to_deep_link_shape(rec: dict, fallback_id: str) -> Optional[dict]:
@@ -6816,15 +6878,29 @@ def _format_user_deep_link_order_message(order: dict) -> str:
     hint = _coerce_card_price_int(order.get("site_grand_total_hint") or 0)
     computed = int(goods_total) + int(amount)
     total_show = computed
+    try:
+        bonus_applied = int(order.get("bonus_applied") or 0)
+    except (TypeError, ValueError):
+        bonus_applied = 0
+    try:
+        final_total = int(order.get("final_total") or 0)
+    except (TypeError, ValueError):
+        final_total = 0
     # Подсказку с сайта берём только если она не меньше суммы товаров и близка к
     # «товары + доставка» — иначе в JSON часто попадает чужое поле (скидка, BYN и т.д.).
-    if (
+    if final_total > 0:
+        total_show = int(final_total)
+    elif bonus_applied > 0:
+        total_show = max(0, int(computed) - int(bonus_applied))
+    elif (
         hint > 0
         and _site_grand_covers_goods(hint, int(goods_total))
         and computed > 0
         and abs(int(hint) - int(computed)) <= max(100, int(computed) // 25)
     ):
         total_show = int(hint)
+    if bonus_applied > 0:
+        out.append(f"⭐ Бонусы: -{bonus_applied} {g_cur}")
     if g_cur == "BYN":
         out.append(f"💰 Итого: {total_show} BYN")
     else:
