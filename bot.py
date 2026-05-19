@@ -1767,10 +1767,7 @@ def _loyalty_menu_text(uid: int) -> str:
     if country not in DELIVERY_OPTIONS:
         country = "by"
     cur = _goods_currency_for_delivery_country(country)
-    if cur == "BYN":
-        discount_txt = f"{(bal * 3.5 / 100):g} BYN"
-    else:
-        discount_txt = f"{_bonus_discount_units(bal, cur)} {cur}"
+    discount_txt = _bonus_discount_label(bal, cur)
     return (
         f"Текущий баланс: {bal} бонусов.\n"
         f"{bal} бонусов = {discount_txt}.\n\n"
@@ -1973,6 +1970,14 @@ def _bonus_points_for_discount(discount: int, currency: str) -> int:
     if cur == "RUB":
         return amt
     return (amt * 200 + 6) // 7
+
+
+def _bonus_discount_label(points: int, currency: str) -> str:
+    pts = max(0, int(points or 0))
+    cur = str(currency or "").strip().upper()
+    if cur == "BYN":
+        return f"{(pts * 3.5 / 100):g} BYN"
+    return f"{_bonus_discount_units(pts, cur)} {cur or 'RUB'}"
 
 
 def _checkout_bonus_cap(uid: int, grand_before_bonus: int, currency: str = "BYN") -> int:
@@ -4271,7 +4276,7 @@ def _format_admin_order_detail_text(order_id: int, o: dict) -> str:
     except (TypeError, ValueError):
         b_ap = 0
     if b_ap > 0:
-        parts.extend(["", f"⭐ Списано бонусов: {b_ap} {line_cur}"])
+        parts.extend(["", f"⭐ Списано бонусов: {b_ap} = {_bonus_discount_label(b_ap, line_cur)}"])
     parts.extend(
         [
             "",
@@ -4488,7 +4493,7 @@ def _format_payment_receipt_text(order_id: int, o: dict) -> str:
         b_ap = 0
     if b_ap > 0:
         lines.append("")
-        lines.append(f"⭐ Списано бонусов: {b_ap} {line_cur}")
+        lines.append(f"⭐ Списано бонусов: {b_ap} = {_bonus_discount_label(b_ap, line_cur)}")
     lines.append("")
     lines.append(f"💰 Сумма: {_order_resolved_grand_total(o)} {line_cur}")
     lines.extend(
@@ -5345,7 +5350,7 @@ def _format_user_order_detail(order_id: object, o: dict) -> str:
     except (TypeError, ValueError):
         b_ap = 0
     if b_ap > 0:
-        parts.append(f"⭐ Списано бонусов: {b_ap} {line_cur}")
+        parts.append(f"⭐ Списано бонусов: {b_ap} = {_bonus_discount_label(b_ap, line_cur)}")
         parts.append("")
     parts.append(f"📦 Количество карточек: {qty} шт.")
     parts.append(f"💰 Итого: {tot} {line_cur}")
@@ -6483,6 +6488,23 @@ def _normalize_deep_link_order(
     if not raw_items:
         return None
     region_bot = _deep_link_delivery_bot_code(raw)
+    total_currency_hint = str(
+        _deep_link_find_first(
+            raw,
+            (
+                "currency",
+                "totalCurrency",
+                "total_currency",
+                "grandTotalCurrency",
+                "grand_total_currency",
+                "cartGrandTotalCurrency",
+                "cart_grand_total_currency",
+            ),
+        )
+        or ""
+    ).strip().upper()
+    if region_bot == "by" and total_currency_hint == "RUB":
+        region_bot = "ru"
     items_out: List[dict] = []
     for it in raw_items:
         if not isinstance(it, dict):
@@ -6543,6 +6565,15 @@ def _normalize_deep_link_order(
             amount = 0
         currency = str(d.get("currency") or "BYN").strip() or "BYN"
         country = str(d.get("country") or "").strip()
+        if not country:
+            country = str(
+                d.get("code")
+                or d.get("countryCode")
+                or d.get("country_code")
+                or d.get("region")
+                or label
+                or ""
+            ).strip()
     elif isinstance(d, str) and d.strip():
         country, label, amount, currency = _delivery_option_for_site_code(d)
     else:
@@ -6563,11 +6594,36 @@ def _normalize_deep_link_order(
             amount = 0
         currency = str(source.get("delivery_currency") or "BYN").strip() or "BYN"
         country = str(source.get("delivery_country") or "").strip()
+        if not country:
+            country = label
+    norm_country, norm_label, norm_amount, norm_currency = _delivery_option_for_site_code(
+        country or label or region_bot
+    )
+    if norm_country != region_bot:
+        region_bot = norm_country
+        lc_norm = _goods_currency_for_delivery_country(region_bot)
+        for idx, line in enumerate(items_out):
+            if isinstance(line, dict):
+                line["line_currency"] = lc_norm
+                if idx < len(raw_items) and isinstance(raw_items[idx], dict):
+                    try:
+                        q_reprice = int(line.get("qty") or 1)
+                    except (TypeError, ValueError):
+                        q_reprice = 1
+                    new_price = _deep_link_item_unit_price(raw_items[idx], region_bot, q_reprice)
+                    if new_price > 0:
+                        line["price"] = int(new_price)
+    country = norm_country
     if not label:
         opt = DELIVERY_OPTIONS.get(region_bot, DELIVERY_OPTIONS["by"])
         label, amount, currency = opt[0], int(opt[1]), str(opt[2])
+    elif amount <= 0 and norm_amount > 0:
+        amount = int(norm_amount)
+    if not currency or currency.upper() not in ("BYN", "RUB"):
+        currency = norm_currency
     if region_bot != "by":
         _, _, currency = DELIVERY_OPTIONS.get(region_bot, DELIVERY_OPTIONS["ru"])
+    total_goods, _ = _cart_totals(items_out)
     bonus_applied = _loyalty_find_int(
         raw,
         (
@@ -7014,7 +7070,7 @@ def _format_user_deep_link_order_message(order: dict) -> str:
     ):
         total_show = int(hint)
     if bonus_applied > 0:
-        out.append(f"⭐ Бонусы: -{bonus_applied} {g_cur}")
+        out.append(f"⭐ Списано бонусов: {bonus_applied} = {_bonus_discount_label(bonus_applied, g_cur)}")
     if g_cur == "BYN":
         out.append(f"💰 Итого: {total_show} BYN")
     else:
@@ -7369,6 +7425,20 @@ async def on_deep_link_structured_submit(
         "delivery": deepcopy(drec),
         "status": "В обработке",
     }
+    try:
+        dl_bonus_applied = int(order.get("bonus_applied") or 0)
+    except (TypeError, ValueError):
+        dl_bonus_applied = 0
+    try:
+        dl_bonus_points_spent = int(order.get("bonus_points_spent") or 0)
+    except (TypeError, ValueError):
+        dl_bonus_points_spent = 0
+    if dl_bonus_points_spent <= 0:
+        dl_bonus_points_spent = dl_bonus_applied
+    if dl_bonus_applied > 0:
+        order_rec["bonus_applied"] = int(dl_bonus_applied)
+    if dl_bonus_points_spent > 0:
+        order_rec["bonus_points_spent"] = int(dl_bonus_points_spent)
     baseline_dl = int(goods_total) + int(d_amt)
     try:
         external_total = int(round(float(order.get("total"))))
@@ -7399,6 +7469,8 @@ async def on_deep_link_structured_submit(
         int(order_rec["total"]),
         deepcopy(drec),
         loyalty_hint_dict=order,
+        bonus_applied=int(dl_bonus_applied),
+        bonus_points_spent=int(dl_bonus_points_spent),
     )
     if oid is None:
         try:
@@ -7411,6 +7483,10 @@ async def on_deep_link_structured_submit(
     USER_ORDERS.setdefault(u.id, []).append(order_rec)
     ORDERS[int(oid)]["clear_cart_on_paid"] = True
     ORDERS[int(oid)]["total_goods"] = int(goods_total)
+    if int(dl_bonus_applied) > 0:
+        ORDERS[int(oid)]["bonus_applied"] = int(dl_bonus_applied)
+    if int(dl_bonus_points_spent) > 0:
+        ORDERS[int(oid)]["bonus_points_spent"] = int(dl_bonus_points_spent)
     if order_rec.get("external_id"):
         ORDERS[int(oid)]["external_id"] = str(order_rec["external_id"])
     save_state()
