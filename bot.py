@@ -252,7 +252,11 @@ USERS: Dict[int, dict] = {}
 USER_MESSAGES: Dict[int, List[dict]] = {}
 TEMP_MESSAGE_TTL_SEC = _env_int("TEMP_MESSAGE_TTL_SEC", 180)
 STATE_FILE = (os.getenv("BOT_STATE_FILE") or "bot_state.json").strip()
-STATE_REDIS_KEY = (os.getenv("BOT_STATE_REDIS_KEY") or "illucards:telegram-bot:state").strip()
+STATE_REDIS_KEY = (
+    os.getenv("BOT_STATE_REDIS_KEY")
+    or os.getenv("STATE_REDIS_KEY")
+    or "illucards:telegram-bot:state"
+).strip()
 STATE_REDIS_SAVE_BLOCKED = False
 STATE_REDIS_CLIENT = None
 
@@ -366,6 +370,12 @@ def _state_redis_command(args: List[object]) -> Optional[object]:
             return None
     url, token = cred
     try:
+        logging.getLogger(__name__).info(
+            "Redis state REST command: cmd=%s url_configured=%s token_configured=%s",
+            str(args[0] if args else "").upper(),
+            bool(url),
+            bool(token),
+        )
         body = json.dumps(args).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -503,9 +513,10 @@ def save_state() -> None:
 def load_state() -> None:
     global STATE_REDIS_SAVE_BLOCKED
     loaded = False
+    redis_configured = bool(_state_redis_credentials() or (os.getenv("REDIS_URL") or "").strip())
     if STATE_REDIS_KEY:
         raw = None
-        if not _state_redis_credentials() and not (os.getenv("REDIS_URL") or "").strip():
+        if not redis_configured:
             STATE_REDIS_SAVE_BLOCKED = True
             logging.getLogger(__name__).warning(
                 "Redis state is not configured; trying local file fallback and blocking empty saves."
@@ -514,7 +525,18 @@ def load_state() -> None:
             raw = _state_redis_command(["GET", STATE_REDIS_KEY])
             if raw is None:
                 exists = _state_redis_command(["EXISTS", STATE_REDIS_KEY])
-                if exists not in (0, "0"):
+                if exists in (0, "0"):
+                    STATE_REDIS_SAVE_BLOCKED = False
+                    logging.getLogger(__name__).info(
+                        "Redis state key %r is empty; starting with fresh state and allowing saves.",
+                        STATE_REDIS_KEY,
+                    )
+                elif exists is None:
+                    STATE_REDIS_SAVE_BLOCKED = True
+                    logging.getLogger(__name__).warning(
+                        "Redis state is configured but command failed; blocking Redis saves to avoid overwriting old orders."
+                    )
+                else:
                     STATE_REDIS_SAVE_BLOCKED = True
                     logging.getLogger(__name__).warning(
                         "Redis state load was not confirmed; blocking Redis saves to avoid overwriting old orders."
@@ -540,6 +562,8 @@ def load_state() -> None:
             except Exception:
                 STATE_REDIS_SAVE_BLOCKED = True
                 logging.getLogger(__name__).exception("Не удалось загрузить состояние из Redis")
+    if redis_configured and not STATE_REDIS_SAVE_BLOCKED:
+        return
     if not STATE_FILE or not os.path.exists(STATE_FILE):
         if not loaded:
             STATE_REDIS_SAVE_BLOCKED = True
