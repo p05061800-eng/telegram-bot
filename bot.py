@@ -3137,8 +3137,7 @@ async def _run_login_http_api(bot) -> None:
     app.router.add_post("/api/sync/promotions", _http_sync_home_promotions)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Логин API держим на отдельном порту, чтобы не конфликтовать с Flask /health на PORT.
-    raw_port = (os.getenv("LOGIN_API_PORT") or "8765").strip()
+    raw_port = (os.getenv("LOGIN_API_PORT") or os.getenv("PORT") or "10000").strip()
     try:
         port = int(raw_port)
     except ValueError:
@@ -3147,10 +3146,14 @@ async def _run_login_http_api(bot) -> None:
     if host_raw:
         host = host_raw
     else:
-        host = "127.0.0.1"
+        host = "0.0.0.0"
     site = web.TCPSite(runner, host=host, port=port)
     await site.start()
-    log.info("Вход на сайт: HTTP %s:%s (/, /login, /api/send-code, /api/verify-code)", host, port)
+    log.info(
+        "HTTP API сайта: %s:%s (/, /health, /login, /api/send-code, /api/verify-code, /api/sync/cart)",
+        host,
+        port,
+    )
     stop = asyncio.Event()
     try:
         await stop.wait()
@@ -10376,7 +10379,6 @@ async def post_init(application: Application) -> None:
 def main() -> None:
     if not token:
         sys.exit("TELEGRAM_BOT_TOKEN is not set")
-    _ensure_flask_health_server_thread()
 
     app = (
         Application.builder()
