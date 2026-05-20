@@ -7195,37 +7195,90 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _maybe_thank_first_telegram_auth(msg, uid)
             d_order = order.get("delivery") if isinstance(order.get("delivery"), dict) else {}
             _remember_user_delivery_country(uid, str(d_order.get("country") or ""))
-            tok = secrets.token_hex(8)
-            context.user_data["deep_link_order_session"] = {
-                "token": tok,
-                "order": deepcopy(order),
+            lines = deepcopy(list(order.get("items") or []))
+            drec = deepcopy(d_order)
+            try:
+                d_amt = int(drec.get("amount") if drec.get("amount") is not None else 0)
+            except (TypeError, ValueError):
+                d_amt = 0
+            goods_total, _ = _cart_totals(list(lines))
+            try:
+                total = int(order.get("final_total") if order.get("final_total") is not None else order.get("total") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            if total <= 0:
+                total = int(goods_total) + int(d_amt)
+                try:
+                    total = max(0, total - int(order.get("bonus_applied") or 0))
+                except (TypeError, ValueError):
+                    pass
+            try:
+                dl_bonus_applied = int(order.get("bonus_applied") or 0)
+            except (TypeError, ValueError):
+                dl_bonus_applied = 0
+            try:
+                dl_bonus_points_spent = int(order.get("bonus_points_spent") or 0)
+            except (TypeError, ValueError):
+                dl_bonus_points_spent = 0
+            if dl_bonus_points_spent <= 0:
+                dl_bonus_points_spent = dl_bonus_applied
+            oid_new = await _notify_admin_new_order(
+                context,
+                msg.from_user,
+                list(lines),
+                int(total),
+                deepcopy(drec),
+                loyalty_hint_dict=order,
+                bonus_applied=int(dl_bonus_applied),
+                bonus_points_spent=int(dl_bonus_points_spent),
+            )
+            if oid_new is None:
+                await msg.reply_text(
+                    "Не удалось передать заказ администратору. Попробуйте открыть заказ с сайта ещё раз.",
+                    reply_markup=REPLY_KB,
+                )
+                return
+            order_rec = {
+                "id": str(oid_new),
+                "external_id": str(order.get("external_id") or oid),
+                "items": deepcopy(list(lines)),
+                "total": int(total),
+                "total_goods": int(goods_total),
+                "delivery": deepcopy(drec),
+                "status": "В обработке",
             }
-            preview = _format_user_deep_link_order_message(order)
-            body = f"{START_ORDER_FROM_SITE_HEADER}\n\n{preview}"
+            if int(dl_bonus_applied) > 0:
+                order_rec["bonus_applied"] = int(dl_bonus_applied)
+                ORDERS[int(oid_new)]["bonus_applied"] = int(dl_bonus_applied)
+            if int(dl_bonus_points_spent) > 0:
+                order_rec["bonus_points_spent"] = int(dl_bonus_points_spent)
+                ORDERS[int(oid_new)]["bonus_points_spent"] = int(dl_bonus_points_spent)
+            USER_ORDERS.setdefault(uid, []).append(order_rec)
+            ORDERS[int(oid_new)]["clear_cart_on_paid"] = True
+            ORDERS[int(oid_new)]["total_goods"] = int(goods_total)
+            if order_rec.get("external_id"):
+                ORDERS[int(oid_new)]["external_id"] = str(order_rec["external_id"])
+            save_state()
+            context.user_data.pop("deep_link_order_session", None)
+            context.user_data["awaiting_payment_order_id"] = int(oid_new)
+            context.user_data.pop("payment_pending_method", None)
+            preview = _format_user_order_detail(str(oid_new), order_rec)
+            body = f"📦 Ваш заказ уже записан в боте:\nID заказа: {order_rec['external_id']}\n\n{preview.split(chr(10), 2)[2] if preview.startswith('📦 Заказ') and len(preview.split(chr(10), 2)) > 2 else preview}"
             if len(body) > 4000:
                 body = body[:3990] + "…"
+            await msg.reply_text(body, reply_markup=REPLY_KB)
+            pay_cur_dl = _order_line_currency_from_delivery(drec)
+            lo_est_dl = (ORDERS.get(int(oid_new)) or {}).get("loyalty_earn_estimate")
             await msg.reply_text(
-                body,
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "✅ Подтвердить заказ",
-                                callback_data=f"dlco:{tok}",
-                            ),
-                            InlineKeyboardButton(
-                                "Отмена",
-                                callback_data=f"dlca:{tok}",
-                            ),
-                        ],
-                    ],
-                ),
+                _payment_intro_text(int(total), pay_cur_dl, loyalty_earn_estimate=lo_est_dl),
+                reply_markup=_kb_payment_methods_with_back(),
             )
             await msg.reply_text(
                 "Полную коллекцию можно открыть на сайте:",
                 reply_markup=_illucards_site_open_markup(uid),
             )
             await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
+            users_touch(uid, "payment")
             return
         if first.lower() == "login":
             un = (msg.from_user.username or "").strip()
