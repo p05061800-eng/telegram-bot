@@ -326,13 +326,14 @@ def _state_redis_url_client():
     if STATE_REDIS_CLIENT is not None:
         return STATE_REDIS_CLIENT
     try:
-        print("REDIS_URL =", redis_url)
+        print("REDIS URL =", redis_url)
         STATE_REDIS_CLIENT = redis.Redis.from_url(
             redis_url,
             decode_responses=True,
             socket_connect_timeout=5,
             socket_timeout=5,
-            ssl_cert_reqs=None,
+            ssl=True,
+            ssl_cert_reqs="none",
         )
         STATE_REDIS_CLIENT.ping()
         print("REDIS CONNECTED SUCCESSFULLY")
@@ -340,7 +341,7 @@ def _state_redis_url_client():
         return STATE_REDIS_CLIENT
     except Exception as e:
         STATE_REDIS_CLIENT = None
-        logging.exception("REDIS FULL ERROR")
+        print("REDIS FULL ERROR:", e)
         logging.exception(e)
         return None
 
