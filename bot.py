@@ -7148,6 +7148,74 @@ def register_shared_deep_link_order(order_id: str, payload: dict) -> None:
     SHARED_DEEP_LINK_ORDERS[str(order_id)] = deepcopy(payload)
 
 
+async def _create_order_from_synced_site_cart(
+    msg: Message, context: ContextTypes.DEFAULT_TYPE, uid: int
+) -> bool:
+    lines = _cart_get_lines_uid(uid, context.user_data)
+    if not lines:
+        return False
+    cc = str(USER_PREF_DELIVERY_COUNTRY.get(uid) or "by").strip().lower()
+    if cc not in DELIVERY_OPTIONS:
+        cc = "by"
+    dlabel, damount, dcur = DELIVERY_OPTIONS.get(cc, DELIVERY_OPTIONS["by"])
+    drec = {
+        "country": cc,
+        "label": dlabel,
+        "amount": int(damount),
+        "currency": dcur,
+    }
+    pay_cur = "BYN" if cc == "by" and dcur == "BYN" else "RUB"
+    products_dl = await _get_products(context)
+    if products_dl and lines:
+        _reprice_lines_for_delivery(lines, products_dl, cc)
+    goods_total, _ = _cart_totals(list(lines))
+    site_gt = _cart_get_site_grand_total(uid, pay_cur)
+    if site_gt and not _site_grand_covers_goods(int(site_gt), int(goods_total)):
+        site_gt = None
+    total = int(site_gt) if site_gt and int(site_gt) > 0 else int(goods_total)
+    pe = _cart_get_site_loyalty_pending_earn(uid)
+    lo_hint = {"bonusWillEarn": int(pe)} if pe is not None and int(pe) > 0 else None
+    oid = await _notify_admin_new_order(
+        context,
+        msg.from_user,
+        list(lines),
+        int(total),
+        deepcopy(drec),
+        loyalty_hint_dict=lo_hint,
+    )
+    if oid is None:
+        logging.getLogger(__name__).warning(
+            "site cart fallback: failed to create admin order uid=%s items=%s",
+            uid,
+            len(lines),
+        )
+        return False
+    order_rec = {
+        "id": str(oid),
+        "items": deepcopy(list(lines)),
+        "total": int(total),
+        "total_goods": int(goods_total),
+        "delivery": deepcopy(drec),
+        "status": "В обработке",
+    }
+    USER_ORDERS.setdefault(uid, []).append(order_rec)
+    ORDERS[int(oid)]["clear_cart_on_paid"] = True
+    ORDERS[int(oid)]["total_goods"] = int(goods_total)
+    save_state()
+    context.user_data.pop("pending_order", None)
+    SITE_LOGIN_PENDING_ORDER.pop(uid, None)
+    context.user_data["awaiting_payment_order_id"] = int(oid)
+    context.user_data.pop("payment_pending_method", None)
+    await msg.reply_text(ORDER_AUTO_ACK, reply_markup=REPLY_KB)
+    lo_est = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
+    await msg.reply_text(
+        _payment_intro_text(int(total), pay_cur, loyalty_earn_estimate=lo_est),
+        reply_markup=_kb_payment_methods_with_back(),
+    )
+    users_touch(uid, "payment")
+    return True
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not msg or not msg.from_user:
@@ -7326,6 +7394,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
         return
+    if await _create_order_from_synced_site_cart(msg, context, uid):
+        return
+    logging.getLogger(__name__).warning(
+        "start without order payload and no synced cart: uid=%s args=%s cart=%s pending=%s",
+        uid,
+        args,
+        len(_cart_get_lines_uid(uid, context.user_data)),
+        bool(SITE_LOGIN_PENDING_ORDER.get(uid)),
+    )
     await _send_start_intro_with_site_button(msg, uid, context.user_data)
 
 
