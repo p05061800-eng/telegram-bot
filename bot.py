@@ -332,8 +332,7 @@ def _state_redis_url_client():
             decode_responses=True,
             socket_connect_timeout=5,
             socket_timeout=5,
-            ssl=True,
-            ssl_cert_reqs="none",
+            ssl_cert_reqs=None,
         )
         STATE_REDIS_CLIENT.ping()
         print("REDIS CONNECTED SUCCESSFULLY")
