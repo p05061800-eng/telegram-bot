@@ -7358,6 +7358,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
         if jl in START_IGNORED_DEEP_LINK or fl in START_IGNORED_DEEP_LINK:
+            if await _create_order_from_synced_site_cart(msg, context, uid):
+                return
             await _send_start_intro_with_site_button(msg, uid, context.user_data)
             return
         t = joined
