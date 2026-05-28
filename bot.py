@@ -4343,10 +4343,7 @@ def _format_payment_proof_caption(order_id: int, o: dict, uid: int) -> str:
 async def _send_deferred_admin_order_panel(
     context: ContextTypes.DEFAULT_TYPE, order_id: int, o: dict
 ) -> None:
-    """Карточка заказа админу (принять/отправить/…), если при оформлении не отправляли."""
-    # Жёсткий барьер: никакой карточки админу до подтверждения оплаты.
-    if not o.get("paid"):
-        return
+    """Карточка заказа админу (принять/отправить/…), если ещё не отправляли."""
     if o.get("admin_chat_id") is not None and o.get("admin_message_id") is not None:
         return
     log = logging.getLogger(__name__)
@@ -4407,7 +4404,7 @@ async def _notify_admin_new_order(
     bonus_applied: int = 0,
     bonus_points_spent: int = 0,
 ) -> Optional[int]:
-    """Новый заказ только в ORDERS; в ORDER_NOTIFY_TARGET карточка заказа — после оплаты (_send_deferred_admin_order_panel)."""
+    """Создать заказ в ORDERS и отправить карточку админу с кнопками действий."""
     global ORDER_COUNTER
     order_id = int(ORDER_COUNTER)
     uid = int(user.id) if user else 0
@@ -4441,6 +4438,7 @@ async def _notify_admin_new_order(
     ORDERS[order_id] = rec
     if uid:
         users_touch(uid, activity_only=True)
+    await _send_deferred_admin_order_panel(context, order_id, rec)
     save_state()
     return order_id
 
