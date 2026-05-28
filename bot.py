@@ -4980,18 +4980,43 @@ def _format_login_site_cart_pending_text(
     return s
 
 
-async def _send_site_login_cart_order_message(bot, uid: int, preview_inner: str) -> None:
-    """Сообщение в Telegram после успешного входа на сайт по коду."""
+def _kb_site_order_confirm_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Подтвердить заказ",
+                    callback_data="confirm_order",
+                ),
+                InlineKeyboardButton(
+                    "Отмена",
+                    callback_data="cancel_order",
+                ),
+            ],
+        ]
+    )
+
+
+async def _send_site_cart_confirm_prompt(
+    bot, uid: int, preview_inner: str, *, intro_kind: str = "draft"
+) -> None:
+    """Сообщение с inline «Подтвердить заказ» / «Отмена» (корзина с сайта)."""
     log = logging.getLogger(__name__)
     if not preview_inner.strip():
         return
-    intro = (
-        "✅ Вход на сайт подтверждён.\n\n"
-        "Состав из корзины сайта уже в «🛒 Корзина» бота. "
-        "«Подтвердить заказ» только закрывает черновик здесь — в чат админа ничего не отправляется; "
-        "администратор увидит заказ после оплаты (оформите из «🛒 Корзина» → доставка → оплата → скрин). "
-        "«Отмена» — без подтверждения."
-    )
+    if intro_kind == "verified":
+        intro = (
+            "✅ Вход на сайт подтверждён.\n\n"
+            "Состав из корзины сайта уже в «🛒 Корзина» бота. "
+            "Нажмите «Подтвердить заказ» — откроются способы оплаты. "
+            "«Отмена» — без подтверждения."
+        )
+    else:
+        intro = (
+            "🛒 Заказ с сайта подтянут в бота.\n\n"
+            "Нажмите «Подтвердить заказ» — откроются способы оплаты. "
+            "«Отмена» — сбросить черновик."
+        )
     body = f"{intro}\n\n{preview_inner.strip()}"
     if len(body) > 4090:
         body = body[:4082] + "…"
@@ -5000,23 +5025,44 @@ async def _send_site_login_cart_order_message(bot, uid: int, preview_inner: str)
             chat_id=int(uid),
             text=body,
             disable_web_page_preview=True,
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "✅ Подтвердить заказ",
-                            callback_data="confirm_order",
-                        ),
-                        InlineKeyboardButton(
-                            "Отмена",
-                            callback_data="cancel_order",
-                        ),
-                    ],
-                ],
-            ),
+            reply_markup=_kb_site_order_confirm_cancel(),
         )
     except Exception:
-        log.exception("verify-code → не удалось отправить корзину user_id=%s", uid)
+        log.exception("site cart confirm prompt → user_id=%s", uid)
+
+
+async def _maybe_prompt_site_cart_confirmation(
+    bot,
+    uid: int,
+    user_data: Optional[dict] = None,
+    *,
+    intro_kind: str = "draft",
+) -> bool:
+    """Если есть корзина с сайта — отправить превью с кнопками подтверждения."""
+    if not uid:
+        return False
+    lines = _cart_get_lines_uid(uid, user_data)
+    preview = (SITE_LOGIN_PENDING_ORDER.get(int(uid)) or "").strip()
+    if not preview and lines:
+        cc = str(USER_PREF_DELIVERY_COUNTRY.get(int(uid)) or "by")
+        try:
+            products = await load_products()
+        except Exception:
+            products = []
+        preview = _format_login_site_cart_pending_text(int(uid), cc, products)
+        if preview:
+            SITE_LOGIN_PENDING_ORDER[int(uid)] = preview
+    if not preview or not lines:
+        return False
+    await _send_site_cart_confirm_prompt(
+        bot, int(uid), preview, intro_kind=intro_kind
+    )
+    return True
+
+
+async def _send_site_login_cart_order_message(bot, uid: int, preview_inner: str) -> None:
+    """Сообщение в Telegram после успешного входа на сайт по коду."""
+    await _send_site_cart_confirm_prompt(bot, uid, preview_inner, intro_kind="verified")
 
 
 def _format_user_orders_message(user_id: int) -> str:
@@ -7269,6 +7315,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Код уже отправлен. Вернитесь на сайт, вставьте его и нажмите «Войти».",
                 reply_markup=REPLY_KB,
             )
+            if await _maybe_prompt_site_cart_confirmation(
+                context.bot, uid, context.user_data, intro_kind="draft"
+            ):
+                await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
             return
         oid = _parse_order_id_from_start_args(list(args))
         if oid:
@@ -7383,6 +7433,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
         if jl in START_IGNORED_DEEP_LINK or fl in START_IGNORED_DEEP_LINK:
+            if await _maybe_prompt_site_cart_confirmation(
+                context.bot, uid, context.user_data, intro_kind="draft"
+            ):
+                await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
+                return
             if await _create_order_from_synced_site_cart(msg, context, uid):
                 return
             await _send_start_intro_with_site_button(msg, uid, context.user_data)
@@ -7419,6 +7474,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Полную коллекцию можно открыть на сайте:",
             reply_markup=_illucards_site_open_markup(uid),
         )
+        await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
+        return
+    if await _maybe_prompt_site_cart_confirmation(
+        context.bot, uid, context.user_data, intro_kind="draft"
+    ):
         await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
         return
     if await _create_order_from_synced_site_cart(msg, context, uid):
