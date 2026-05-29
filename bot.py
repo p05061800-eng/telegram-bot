@@ -141,13 +141,22 @@ def _read_order_notify_target():
 ORDER_NOTIFY_TARGET = _read_order_notify_target()
 ORDER_MENTION = (os.getenv("ORDER_MENTION", "@Daniel_official") or "@Daniel_official").strip()
 
-# Админ-панель (/admin) и /say — только этот Telegram user id
+# Админ-панель (/admin) и /say — основной id; дополнительные через TELEGRAM_ADMIN_IDS (через запятую)
 ADMIN_ID = 711309799
+_ADMIN_IDS_EXTRA: set = set()
+for _adm_raw in (os.getenv("TELEGRAM_ADMIN_IDS") or "").split(","):
+    _adm_raw = _adm_raw.strip()
+    if _adm_raw.isdecimal():
+        _ADMIN_IDS_EXTRA.add(int(_adm_raw))
+ADMIN_IDS: set = {int(ADMIN_ID)} | _ADMIN_IDS_EXTRA
 ADMIN_ACCESS_DENIED = "Нет доступа: эта команда только для администратора."
 
 
-def is_admin(user_id):
-    return user_id == ADMIN_ID
+def is_admin(user_id) -> bool:
+    try:
+        return int(user_id) in ADMIN_IDS
+    except (TypeError, ValueError):
+        return False
 
 
 def _resolve_admin_chat_id() -> Optional[int]:
@@ -2562,6 +2571,8 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
     note_loy = _apply_site_loyalty_from_sync(uid, data)
     bot_loy = request.app.get("bot")
     _schedule_loyalty_notify(bot_loy, uid, note_loy)
+    if lines:
+        _schedule_site_cart_confirm_prompt(bot_loy, uid, intro_kind="verified")
     users_touch(uid, "cart_sync")
     body_loy: Dict[str, object] = {"success": True, "user_id": uid, "items": len(lines)}
     lb_loy = USER_SITE_LOYALTY.get(uid, {}).get("balance")
@@ -2689,6 +2700,8 @@ async def _http_sync_state(request: web.Request) -> web.Response:
     note_st = _apply_site_loyalty_from_sync(uid, data)
     bot_st = request.app.get("bot")
     _schedule_loyalty_notify(bot_st, uid, note_st)
+    if lines:
+        _schedule_site_cart_confirm_prompt(bot_st, uid, intro_kind="verified")
     users_touch(uid, "sync")
     body = {
         "success": True,
@@ -4340,6 +4353,24 @@ def _format_payment_proof_caption(order_id: int, o: dict, uid: int) -> str:
     return cap
 
 
+def _admin_order_notify_targets() -> List[object]:
+    """Куда слать карточку заказа с кнопками ✅ Принять / ❌ Отменить."""
+    out: List[object] = []
+    seen: set = set()
+    for raw in (ORDER_NOTIFY_TARGET, ADMIN_ID, _resolve_admin_chat_id()):
+        if raw is None or raw == "":
+            continue
+        if isinstance(raw, int):
+            key = ("i", int(raw))
+        else:
+            key = ("s", str(raw).strip().lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(raw)
+    return out
+
+
 async def _send_deferred_admin_order_panel(
     context: ContextTypes.DEFAULT_TYPE, order_id: int, o: dict
 ) -> None:
@@ -4350,28 +4381,22 @@ async def _send_deferred_admin_order_panel(
     text = _format_admin_order_detail_text(order_id, o)
     kb = _kb_order_admin_actions(order_id, str(o.get("status") or "new"))
     m = None
-    try:
-        m = await context.bot.send_message(
-            chat_id=ORDER_NOTIFY_TARGET,
-            text=text,
-            reply_markup=kb,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        log.exception(
-            "post-payment order panel → ORDER_NOTIFY_TARGET order_id=%s", order_id
-        )
-    if m is None:
+    for tgt in _admin_order_notify_targets():
         try:
-            m = await context.bot.send_message(
-                chat_id=ADMIN_ID,
+            sent = await context.bot.send_message(
+                chat_id=tgt,
                 text=text,
                 reply_markup=kb,
                 disable_web_page_preview=True,
             )
+            if m is None:
+                m = sent
         except Exception:
-            log.exception("post-payment order panel → ADMIN_ID order_id=%s", order_id)
-            return
+            log.exception(
+                "admin order panel → target=%s order_id=%s", tgt, order_id
+            )
+    if m is None:
+        return
     o["admin_chat_id"] = int(m.chat_id)
     o["admin_message_id"] = int(m.message_id)
 
@@ -4989,7 +5014,7 @@ def _kb_site_order_confirm_cancel() -> InlineKeyboardMarkup:
                     callback_data="confirm_order",
                 ),
                 InlineKeyboardButton(
-                    "Отмена",
+                    "❌ Отменить",
                     callback_data="cancel_order",
                 ),
             ],
@@ -5031,6 +5056,26 @@ async def _send_site_cart_confirm_prompt(
         log.exception("site cart confirm prompt → user_id=%s", uid)
 
 
+def _schedule_site_cart_confirm_prompt(bot, uid: int, *, intro_kind: str = "verified") -> None:
+    """После sync с сайта — превью заказа с кнопками в Telegram (если нет активной оплаты)."""
+    if not bot or not uid:
+        return
+
+    async def _job() -> None:
+        if _user_state_get(int(uid), "awaiting_proof") is not None:
+            return
+        if _user_state_get(int(uid), "awaiting_payment_order_id") is not None:
+            return
+        await _maybe_prompt_site_cart_confirmation(
+            bot, int(uid), None, intro_kind=intro_kind
+        )
+
+    try:
+        asyncio.get_running_loop().create_task(_job())
+    except RuntimeError:
+        pass
+
+
 async def _maybe_prompt_site_cart_confirmation(
     bot,
     uid: int,
@@ -5052,7 +5097,9 @@ async def _maybe_prompt_site_cart_confirmation(
         preview = _format_login_site_cart_pending_text(int(uid), cc, products)
         if preview:
             SITE_LOGIN_PENDING_ORDER[int(uid)] = preview
-    if not preview or not lines:
+    if not lines:
+        return False
+    if not preview:
         return False
     await _send_site_cart_confirm_prompt(
         bot, int(uid), preview, intro_kind=intro_kind
@@ -7463,7 +7510,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                             callback_data="confirm_order",
                         ),
                         InlineKeyboardButton(
-                            "Отмена",
+                            "❌ Отменить",
                             callback_data="cancel_order",
                         ),
                     ],
