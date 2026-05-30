@@ -65,7 +65,9 @@ python3 main.py
 | `LOGIN_API_PUBLIC_URL` | Публичный базовый URL для login/sync |
 | `LOGIN_API_HOST` / `LOGIN_API_PORT` | Хост/порт aiohttp (по умолчанию `127.0.0.1` / `8765`) |
 | `POST_LOGIN_REDIRECT` | URL после успешного входа (например `https://www.illucards.by/account`) |
-| `TELEGRAM_ORDER_NOTIFY_ID` | Чат уведомлений о заказах (число или `@username`) |
+| `TELEGRAM_ORDER_NOTIFY_ID` | Чат уведомлений о заказах (число или `@username`). По умолчанию в коде — `711309799` (личка админа) |
+| `TELEGRAM_ADMIN_CHAT_ID` | То же для reply-тредов поддержки (опционально, напр. `711309799`) |
+| `TELEGRAM_ADMIN_IDS` | Доп. Telegram user id админов через запятую (кнопки «Принять» и `/admin`) |
 | `ORDER_MENTION` | Упоминание в текстах заказа |
 | `TELEGRAM_POLLING_BOOTSTRAP_RETRIES` | Повторы bootstrap при старте polling (по умолчанию 35) |
 | `ILLUCARDS_CART_CLEAR_ON_PROOF_URL` | Опционально: URL для **POST**, когда клиент нажал «✅ Оплатить» в боте — очистить корзину на сайте (см. «Корзина и чек») |

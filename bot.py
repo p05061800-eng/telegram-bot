@@ -124,12 +124,16 @@ def _ensure_flask_health_server_thread() -> None:
     thr.start()
 
 
-# Куда бот пишет о новых заказах: по умолчанию @Daniel_official; переопределение — TELEGRAM_ORDER_NOTIFY_ID (int или @username).
+# Админ-панель (/admin) и /say — основной id; дополнительные через TELEGRAM_ADMIN_IDS (через запятую)
+ADMIN_ID = 711309799
+
+
+# Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
 def _read_order_notify_target():
-    """Куда слать заказы: по умолчанию @Daniel_official; из .env — int id или @username."""
+    """Куда слать заказы: из .env int id или @username; иначе личка ADMIN_ID."""
     s = (os.getenv("TELEGRAM_ORDER_NOTIFY_ID") or os.getenv("ORDER_NOTIFY_CHAT_ID") or "").strip()
     if not s:
-        return "@Daniel_official"
+        return int(ADMIN_ID)
     if s.startswith("@"):
         return s
     try:
@@ -140,9 +144,6 @@ def _read_order_notify_target():
 
 ORDER_NOTIFY_TARGET = _read_order_notify_target()
 ORDER_MENTION = (os.getenv("ORDER_MENTION", "@Daniel_official") or "@Daniel_official").strip()
-
-# Админ-панель (/admin) и /say — основной id; дополнительные через TELEGRAM_ADMIN_IDS (через запятую)
-ADMIN_ID = 711309799
 _ADMIN_IDS_EXTRA: set = set()
 for _adm_raw in (os.getenv("TELEGRAM_ADMIN_IDS") or "").split(","):
     _adm_raw = _adm_raw.strip()
