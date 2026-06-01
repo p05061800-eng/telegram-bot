@@ -817,6 +817,7 @@ def _user_state_clear_payment_states(uid: int) -> None:
 
 _POST_DEPLOY_USER_DATA_EPHEMERAL: Tuple[str, ...] = (
     "pending_order",
+    "pending_site_order_meta",
     "deep_link_order_session",
     "awaiting_payment_order_id",
     "payment_pending_method",
@@ -6320,15 +6321,29 @@ async def crypto_auto_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 def _extract_total_from_order_text(text: str) -> Optional[str]:
     if not (text or "").strip():
         return None
-    for pat in (
-        r"💰\s*Итого\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*BYN",
-        r"Итого\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*BYN",
-        r"Итого\s+([0-9]+(?:[.,][0-9]+)?)\s*BYN",
+    for cur, pats in (
+        (
+            "BYN",
+            (
+                r"💰\s*Итого\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*BYN",
+                r"Итого\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*BYN",
+                r"Итого\s+([0-9]+(?:[.,][0-9]+)?)\s*BYN",
+            ),
+        ),
+        (
+            "RUB",
+            (
+                r"💰\s*Итого\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*RUB",
+                r"Итого\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*RUB",
+                r"Итого\s+([0-9]+(?:[.,][0-9]+)?)\s*RUB",
+            ),
+        ),
     ):
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            num = m.group(1).replace(",", ".").replace(" ", "")
-            return f"{num} BYN"
+        for pat in pats:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                num = m.group(1).replace(",", ".").replace(" ", "")
+                return f"{num} {cur}"
     return None
 
 
@@ -7000,6 +7015,142 @@ async def _fetch_order_for_deep_link(order_id: str) -> Optional[dict]:
     return o
 
 
+def _site_order_pricing_hint_payload(norm: dict) -> dict:
+    """Подсказки цен/бонусов в USER_CART после перехода order_* с сайта."""
+    d = norm.get("delivery") if isinstance(norm.get("delivery"), dict) else {}
+    cc = str(d.get("country") or "by").strip().lower()
+    g_cur = _goods_currency_for_delivery_country(cc)
+    tot_raw = norm.get("final_total")
+    if tot_raw is None:
+        tot_raw = norm.get("total")
+    if tot_raw is None:
+        tot_raw = norm.get("site_grand_total_hint")
+    try:
+        tot_i = int(tot_raw) if tot_raw is not None else 0
+    except (TypeError, ValueError):
+        tot_i = 0
+    payload: Dict[str, object] = {
+        "items": list(norm.get("items") or []),
+        "delivery": d,
+        "deliveryCountry": cc,
+    }
+    if tot_i > 0:
+        payload["grandTotal"] = tot_i
+        payload["cartGrandTotal"] = tot_i
+        if g_cur == "RUB":
+            payload["grandTotalRub"] = tot_i
+        else:
+            payload["grandTotalByn"] = tot_i
+    try:
+        b_ap = int(norm.get("bonus_applied") or 0)
+    except (TypeError, ValueError):
+        b_ap = 0
+    if b_ap > 0:
+        payload["bonusApplied"] = b_ap
+        payload["bonus_applied"] = b_ap
+    try:
+        b_ps = int(norm.get("bonus_points_spent") or 0)
+    except (TypeError, ValueError):
+        b_ps = 0
+    if b_ps <= 0:
+        b_ps = b_ap
+    if b_ps > 0:
+        payload["bonusPointsSpent"] = b_ps
+        payload["bonus_points_spent"] = b_ps
+    earn = _loyalty_compute_earn_estimate(
+        tot_i, norm, cart_lines=list(norm.get("items") or [])
+    )
+    if earn is not None and int(earn) > 0:
+        payload["bonusWillEarn"] = int(earn)
+    return payload
+
+
+def _apply_site_order_norm_to_user_cart(uid: int, norm: dict) -> None:
+    lines = deepcopy(list(norm.get("items") or []))
+    if not lines:
+        return
+    d = norm.get("delivery") if isinstance(norm.get("delivery"), dict) else {}
+    cc = str(d.get("country") or "by").strip().lower()
+    if cc not in DELIVERY_OPTIONS:
+        cc = "by"
+    _remember_user_delivery_country(uid, cc)
+    _cart_set_items_uid(uid, lines)
+    _cart_apply_site_pricing_hints(uid, _site_order_pricing_hint_payload(norm))
+
+
+def _format_site_order_confirm_preview(
+    uid: int, norm: dict, products: Optional[List[dict]] = None
+) -> str:
+    d = norm.get("delivery") if isinstance(norm.get("delivery"), dict) else {}
+    cc = str(d.get("country") or "BY").strip()
+    preview = _format_login_site_cart_pending_text(uid, cc, products or [])
+    if not preview.strip():
+        return ""
+    extra: List[str] = []
+    try:
+        b_ap = int(norm.get("bonus_applied") or 0)
+    except (TypeError, ValueError):
+        b_ap = 0
+    if b_ap > 0:
+        g_cur = _goods_currency_for_delivery_country(
+            str(d.get("country") or "by").strip().lower()
+        )
+        extra.append(
+            f"⭐ Списано бонусов: {b_ap} ({_bonus_discount_label(b_ap, g_cur)})"
+        )
+    if extra:
+        preview = preview.rstrip() + "\n\n" + "\n".join(extra)
+    return preview
+
+
+async def _present_site_order_confirm_prompt(
+    msg: Message, context: ContextTypes.DEFAULT_TYPE, uid: int, norm: dict
+) -> None:
+    """Черновик с сайта: «Подтвердить заказ» / «Отменить», без мгновенной оплаты."""
+    ud = context.user_data
+    ud.pop("awaiting_payment_order_id", None)
+    ud.pop("payment_pending_method", None)
+    ud.pop("deep_link_order_session", None)
+    _apply_site_order_norm_to_user_cart(uid, norm)
+    products: List[dict] = []
+    try:
+        products = await load_products() or []
+    except Exception:
+        products = []
+    preview = _format_site_order_confirm_preview(uid, norm, products)
+    if not preview.strip():
+        await msg.reply_text(
+            "Не удалось показать состав заказа. Попробуйте снова с сайта.",
+            reply_markup=REPLY_KB,
+        )
+        return
+    SITE_LOGIN_PENDING_ORDER[int(uid)] = preview
+    meta: Dict[str, object] = {
+        "loyalty_hint": deepcopy(norm),
+        "external_id": str(norm.get("external_id") or "").strip(),
+    }
+    try:
+        b_ap = int(norm.get("bonus_applied") or 0)
+    except (TypeError, ValueError):
+        b_ap = 0
+    if b_ap > 0:
+        meta["bonus_applied"] = b_ap
+    try:
+        b_ps = int(norm.get("bonus_points_spent") or 0)
+    except (TypeError, ValueError):
+        b_ps = 0
+    if b_ps <= 0:
+        b_ps = b_ap
+    if b_ps > 0:
+        meta["bonus_points_spent"] = b_ps
+    ud["pending_site_order_meta"] = meta
+    body = f"{START_ORDER_FROM_SITE_HEADER}\n\n{preview}"
+    if len(body) > 4000:
+        body = body[:3990] + "…"
+    await msg.reply_text(body, reply_markup=_kb_site_order_confirm_cancel())
+    await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
+
+
 def _site_status_from_bot_status(status: str) -> Optional[str]:
     return {
         "new": "new",
@@ -7384,92 +7535,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await _send_start_intro_with_site_button(msg, uid, context.user_data)
                 return
             await _maybe_thank_first_telegram_auth(msg, uid)
-            d_order = order.get("delivery") if isinstance(order.get("delivery"), dict) else {}
-            _remember_user_delivery_country(uid, str(d_order.get("country") or ""))
-            lines = deepcopy(list(order.get("items") or []))
-            drec = deepcopy(d_order)
-            try:
-                d_amt = int(drec.get("amount") if drec.get("amount") is not None else 0)
-            except (TypeError, ValueError):
-                d_amt = 0
-            goods_total, _ = _cart_totals(list(lines))
-            try:
-                total = int(order.get("final_total") if order.get("final_total") is not None else order.get("total") or 0)
-            except (TypeError, ValueError):
-                total = 0
-            if total <= 0:
-                total = int(goods_total) + int(d_amt)
-                try:
-                    total = max(0, total - int(order.get("bonus_applied") or 0))
-                except (TypeError, ValueError):
-                    pass
-            try:
-                dl_bonus_applied = int(order.get("bonus_applied") or 0)
-            except (TypeError, ValueError):
-                dl_bonus_applied = 0
-            try:
-                dl_bonus_points_spent = int(order.get("bonus_points_spent") or 0)
-            except (TypeError, ValueError):
-                dl_bonus_points_spent = 0
-            if dl_bonus_points_spent <= 0:
-                dl_bonus_points_spent = dl_bonus_applied
-            oid_new = await _notify_admin_new_order(
-                context,
-                msg.from_user,
-                list(lines),
-                int(total),
-                deepcopy(drec),
-                loyalty_hint_dict=order,
-                bonus_applied=int(dl_bonus_applied),
-                bonus_points_spent=int(dl_bonus_points_spent),
-            )
-            if oid_new is None:
-                await msg.reply_text(
-                    "Не удалось передать заказ администратору. Попробуйте открыть заказ с сайта ещё раз.",
-                    reply_markup=REPLY_KB,
-                )
-                return
-            order_rec = {
-                "id": str(oid_new),
-                "external_id": str(order.get("external_id") or oid),
-                "items": deepcopy(list(lines)),
-                "total": int(total),
-                "total_goods": int(goods_total),
-                "delivery": deepcopy(drec),
-                "status": "В обработке",
-            }
-            if int(dl_bonus_applied) > 0:
-                order_rec["bonus_applied"] = int(dl_bonus_applied)
-                ORDERS[int(oid_new)]["bonus_applied"] = int(dl_bonus_applied)
-            if int(dl_bonus_points_spent) > 0:
-                order_rec["bonus_points_spent"] = int(dl_bonus_points_spent)
-                ORDERS[int(oid_new)]["bonus_points_spent"] = int(dl_bonus_points_spent)
-            USER_ORDERS.setdefault(uid, []).append(order_rec)
-            ORDERS[int(oid_new)]["clear_cart_on_paid"] = True
-            ORDERS[int(oid_new)]["total_goods"] = int(goods_total)
-            if order_rec.get("external_id"):
-                ORDERS[int(oid_new)]["external_id"] = str(order_rec["external_id"])
-            save_state()
-            context.user_data.pop("deep_link_order_session", None)
-            context.user_data["awaiting_payment_order_id"] = int(oid_new)
-            context.user_data.pop("payment_pending_method", None)
-            preview = _format_user_order_detail(str(oid_new), order_rec)
-            body = f"📦 Ваш заказ уже записан в боте:\nID заказа: {order_rec['external_id']}\n\n{preview.split(chr(10), 2)[2] if preview.startswith('📦 Заказ') and len(preview.split(chr(10), 2)) > 2 else preview}"
-            if len(body) > 4000:
-                body = body[:3990] + "…"
-            await msg.reply_text(body, reply_markup=REPLY_KB)
-            pay_cur_dl = _order_line_currency_from_delivery(drec)
-            lo_est_dl = (ORDERS.get(int(oid_new)) or {}).get("loyalty_earn_estimate")
-            await msg.reply_text(
-                _payment_intro_text(int(total), pay_cur_dl, loyalty_earn_estimate=lo_est_dl),
-                reply_markup=_kb_payment_methods_with_back(),
-            )
-            await msg.reply_text(
-                "Полную коллекцию можно открыть на сайте:",
-                reply_markup=_illucards_site_open_markup(uid),
-            )
-            await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
-            users_touch(uid, "payment")
+            await _present_site_order_confirm_prompt(msg, context, uid, order)
             return
         if first.lower() == "login":
             un = (msg.from_user.username or "").strip()
@@ -7501,23 +7567,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         body = f"{START_ORDER_FROM_SITE_HEADER}\n\n{preview}"
         if len(body) > 4000:
             body = body[:3990] + "…"
-        await msg.reply_text(
-            body,
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "✅ Подтвердить и отправить",
-                            callback_data="confirm_order",
-                        ),
-                        InlineKeyboardButton(
-                            "❌ Отменить",
-                            callback_data="cancel_order",
-                        ),
-                    ],
-                ],
-            ),
-        )
+        await msg.reply_text(body, reply_markup=_kb_site_order_confirm_cancel())
         await msg.reply_text(
             "Полную коллекцию можно открыть на сайте:",
             reply_markup=_illucards_site_open_markup(uid),
@@ -7625,28 +7675,72 @@ async def on_deep_link_confirm_order(
             total = int(site_gt)
         else:
             total = int(goods_total)
+        meta = ud.get("pending_site_order_meta")
+        dl_bonus_applied = 0
+        dl_bonus_points_spent = 0
         lo_hint = None
-        pe = _cart_get_site_loyalty_pending_earn(uid_cb)
-        if pe is not None and int(pe) > 0:
-            lo_hint = {"bonusWillEarn": int(pe)}
+        ext_id = ""
+        if isinstance(meta, dict):
+            try:
+                dl_bonus_applied = int(meta.get("bonus_applied") or 0)
+            except (TypeError, ValueError):
+                dl_bonus_applied = 0
+            try:
+                dl_bonus_points_spent = int(meta.get("bonus_points_spent") or 0)
+            except (TypeError, ValueError):
+                dl_bonus_points_spent = 0
+            if dl_bonus_points_spent <= 0:
+                dl_bonus_points_spent = dl_bonus_applied
+            lh = meta.get("loyalty_hint")
+            if isinstance(lh, dict):
+                lo_hint = lh
+                ext_id = str(meta.get("external_id") or lh.get("external_id") or "").strip()
+                try:
+                    ft = lh.get("final_total")
+                    if ft is None:
+                        ft = lh.get("total")
+                    if ft is not None and int(ft) > 0:
+                        total = int(ft)
+                except (TypeError, ValueError):
+                    pass
+        if lo_hint is None:
+            pe = _cart_get_site_loyalty_pending_earn(uid_cb)
+            if pe is not None and int(pe) > 0:
+                lo_hint = {"bonusWillEarn": int(pe)}
         oid = await _notify_admin_new_order(
-            context, u, list(lines), int(total), deepcopy(drec), loyalty_hint_dict=lo_hint
+            context,
+            u,
+            list(lines),
+            int(total),
+            deepcopy(drec),
+            loyalty_hint_dict=lo_hint,
+            bonus_applied=int(dl_bonus_applied),
+            bonus_points_spent=int(dl_bonus_points_spent),
         )
         if oid is None:
             await _notify_callback_issue(q, context)
             return
-        USER_ORDERS.setdefault(uid_cb, []).append(
-            {
-                "id": str(oid),
-                "items": deepcopy(list(lines)),
-                "total": int(total),
-                "total_goods": int(goods_total),
-                "delivery": deepcopy(drec),
-                "status": "В обработке",
-            }
-        )
+        order_rec = {
+            "id": str(oid),
+            "items": deepcopy(list(lines)),
+            "total": int(total),
+            "total_goods": int(goods_total),
+            "delivery": deepcopy(drec),
+            "status": "В обработке",
+        }
+        if ext_id:
+            order_rec["external_id"] = ext_id
+            ORDERS[int(oid)]["external_id"] = ext_id
+        if int(dl_bonus_applied) > 0:
+            order_rec["bonus_applied"] = int(dl_bonus_applied)
+            ORDERS[int(oid)]["bonus_applied"] = int(dl_bonus_applied)
+        if int(dl_bonus_points_spent) > 0:
+            order_rec["bonus_points_spent"] = int(dl_bonus_points_spent)
+            ORDERS[int(oid)]["bonus_points_spent"] = int(dl_bonus_points_spent)
+        USER_ORDERS.setdefault(uid_cb, []).append(order_rec)
         ORDERS[int(oid)]["clear_cart_on_paid"] = True
         ORDERS[int(oid)]["total_goods"] = int(goods_total)
+        ud.pop("pending_site_order_meta", None)
         save_state()
         ud["awaiting_payment_order_id"] = int(oid)
         ud.pop("payment_pending_method", None)
@@ -7686,6 +7780,7 @@ async def on_deep_link_cancel_order(
         await _answer_order_callback_stale(q)
         return
     ud.pop("pending_order", None)
+    ud.pop("pending_site_order_meta", None)
     if uid_cb:
         SITE_LOGIN_PENDING_ORDER.pop(uid_cb, None)
     await q.answer()
