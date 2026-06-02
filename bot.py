@@ -1053,13 +1053,34 @@ async def _notify_callback_issue(
                 pass
 
 
-async def _answer_order_callback_stale(q: Optional[CallbackQuery]) -> None:
+async def _callback_ack(
+    q: Optional[CallbackQuery],
+    text: str = "",
+    *,
+    show_alert: bool = False,
+) -> bool:
+    """Снять loading на inline-кнопке (один answer на callback)."""
+    if not q:
+        return False
+    try:
+        await q.answer(
+            text=text or None,
+            show_alert=bool(show_alert and text),
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _answer_order_callback_stale(
+    q: Optional[CallbackQuery], *, acked: bool = False
+) -> None:
     if not q:
         return
-    try:
-        await q.answer(MSG_CALLBACK_STALE_ORDER, show_alert=True)
-    except Exception:
-        pass
+    if acked and q.message:
+        await q.message.reply_text(MSG_CALLBACK_STALE_ORDER)
+        return
+    await _callback_ack(q, MSG_CALLBACK_STALE_ORDER, show_alert=True)
 
 
 def _cleanup_expired_login_codes() -> None:
@@ -7668,13 +7689,11 @@ async def on_deep_link_confirm_order(
         return
     if (q.data or "").strip() != "confirm_order":
         return
+    acked = await _callback_ack(q)
+    log = logging.getLogger(__name__)
     ud = context.user_data
     u = q.from_user
     uid_cb = int(u.id) if u else 0
-    try:
-        await q.answer()
-    except Exception:
-        pass
     order_text = (ud.get("pending_order") or "").strip()
     if not order_text and uid_cb:
         order_text = _get_site_pending_preview(uid_cb)
@@ -7687,8 +7706,11 @@ async def on_deep_link_confirm_order(
             products_peek = []
         order_text = _format_login_site_cart_pending_text(uid_cb, cc_peek, products_peek)
     if not order_text and not lines_peek:
-        await _answer_order_callback_stale(q)
+        await _answer_order_callback_stale(q, acked=acked)
         return
+    oid: Optional[int] = None
+    total = 0
+    pay_cur = "BYN"
     if uid_cb:
         ap = _user_state_get(uid_cb, "awaiting_proof")
         if ap is not None:
@@ -7699,10 +7721,10 @@ async def on_deep_link_confirm_order(
             if not po or int(po.get("user_id") or 0) != int(uid_cb) or po.get("paid"):
                 _user_state_pop(uid_cb, "awaiting_proof")
             else:
-                try:
-                    await q.answer(MSG_PAY_NEED_PROOF_FIRST, show_alert=True)
-                except Exception:
-                    pass
+                if acked and q.message:
+                    await q.message.reply_text(MSG_PAY_NEED_PROOF_FIRST)
+                else:
+                    await _callback_ack(q, MSG_PAY_NEED_PROOF_FIRST, show_alert=True)
                 return
         pend = ud.get("awaiting_payment_order_id")
         if pend is not None:
@@ -7714,14 +7736,14 @@ async def on_deep_link_confirm_order(
                 ud.pop("awaiting_payment_order_id", None)
                 ud.pop("payment_pending_method", None)
             else:
-                try:
-                    await q.answer(MSG_PAY_FINISH_CURRENT, show_alert=True)
-                except Exception:
-                    pass
+                if acked and q.message:
+                    await q.message.reply_text(MSG_PAY_FINISH_CURRENT)
+                else:
+                    await _callback_ack(q, MSG_PAY_FINISH_CURRENT, show_alert=True)
                 return
         lines = _cart_get_lines_uid(uid_cb, ud)
         if not lines:
-            await _answer_order_callback_stale(q)
+            await _answer_order_callback_stale(q, acked=acked)
             return
         cc = str(USER_PREF_DELIVERY_COUNTRY.get(uid_cb) or "by").strip().lower()
         if cc not in DELIVERY_OPTIONS:
@@ -7802,46 +7824,51 @@ async def on_deep_link_confirm_order(
         if oid is None:
             await _notify_callback_issue(q, context)
             return
-        order_rec = {
-            "id": str(oid),
-            "items": deepcopy(list(lines)),
-            "total": int(total),
-            "total_goods": int(goods_total),
-            "delivery": deepcopy(drec),
-            "status": "В обработке",
-        }
-        if ext_id:
-            order_rec["external_id"] = ext_id
-            ORDERS[int(oid)]["external_id"] = ext_id
-        if int(dl_bonus_applied) > 0:
-            order_rec["bonus_applied"] = int(dl_bonus_applied)
-            ORDERS[int(oid)]["bonus_applied"] = int(dl_bonus_applied)
-        if int(dl_bonus_points_spent) > 0:
-            order_rec["bonus_points_spent"] = int(dl_bonus_points_spent)
-            ORDERS[int(oid)]["bonus_points_spent"] = int(dl_bonus_points_spent)
-        USER_ORDERS.setdefault(uid_cb, []).append(order_rec)
-        ORDERS[int(oid)]["clear_cart_on_paid"] = True
-        ORDERS[int(oid)]["total_goods"] = int(goods_total)
-        save_state()
-        ud["awaiting_payment_order_id"] = int(oid)
-        ud.pop("payment_pending_method", None)
+    else:
+        await _answer_order_callback_stale(q, acked=acked)
+        return
+    order_rec = {
+        "id": str(oid),
+        "items": deepcopy(list(lines)),
+        "total": int(total),
+        "total_goods": int(goods_total),
+        "delivery": deepcopy(drec),
+        "status": "В обработке",
+    }
+    if ext_id:
+        order_rec["external_id"] = ext_id
+        ORDERS[int(oid)]["external_id"] = ext_id
+    if int(dl_bonus_applied) > 0:
+        order_rec["bonus_applied"] = int(dl_bonus_applied)
+        ORDERS[int(oid)]["bonus_applied"] = int(dl_bonus_applied)
+    if int(dl_bonus_points_spent) > 0:
+        order_rec["bonus_points_spent"] = int(dl_bonus_points_spent)
+        ORDERS[int(oid)]["bonus_points_spent"] = int(dl_bonus_points_spent)
+    USER_ORDERS.setdefault(uid_cb, []).append(order_rec)
+    ORDERS[int(oid)]["clear_cart_on_paid"] = True
+    ORDERS[int(oid)]["total_goods"] = int(goods_total)
+    save_state()
+    ud["awaiting_payment_order_id"] = int(oid)
+    ud.pop("payment_pending_method", None)
     ud.pop("pending_order", None)
-    if uid_cb:
-        _clear_site_pending_order(uid_cb, ud)
+    _clear_site_pending_order(uid_cb, ud)
     try:
         await q.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    await q.message.reply_text(ORDER_AUTO_ACK)
-    if uid_cb:
+    try:
+        await q.message.reply_text(ORDER_AUTO_ACK)
         lo_est = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
         await q.message.reply_text(
-            _payment_intro_text(
-                int(total), pay_cur, loyalty_earn_estimate=lo_est
-            ),
+            _payment_intro_text(int(total), pay_cur, loyalty_earn_estimate=lo_est),
             reply_markup=_kb_payment_methods_with_back(),
         )
         users_touch(uid_cb, "payment")
+    except Exception:
+        log.exception("confirm_order follow-up uid=%s oid=%s", uid_cb, oid)
+        await q.message.reply_text(
+            "Заказ создан, но не удалось открыть оплату. Нажмите «📋 Мои заказы» или /start."
+        )
 
 
 async def on_deep_link_cancel_order(
@@ -7851,18 +7878,15 @@ async def on_deep_link_cancel_order(
         return
     if (q.data or "").strip() != "cancel_order":
         return
+    acked = await _callback_ack(q)
     ud = context.user_data
     u = q.from_user
     uid_cb = int(u.id) if u else 0
-    try:
-        await q.answer()
-    except Exception:
-        pass
     has_ud = bool((ud.get("pending_order") or "").strip())
     has_site = bool(uid_cb and _get_site_pending_preview(uid_cb))
     has_cart = bool(uid_cb and _cart_get_lines_uid(uid_cb, ud))
     if not has_ud and not has_site and not has_cart:
-        await _answer_order_callback_stale(q)
+        await _answer_order_callback_stale(q, acked=acked)
         return
     ud.pop("pending_order", None)
     if uid_cb:
@@ -10711,6 +10735,13 @@ def main() -> None:
     app.add_handler(CommandHandler("swipe", send_tinder_mode))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("say", admin_say_cmd))
+    # Сначала confirm/cancel заказа с сайта — сразу answer(), иначе в Telegram крутится loading.
+    app.add_handler(
+        CallbackQueryHandler(on_deep_link_confirm_order, pattern=re.compile(r"^confirm_order$"))
+    )
+    app.add_handler(
+        CallbackQueryHandler(on_deep_link_cancel_order, pattern=re.compile(r"^cancel_order$"))
+    )
     app.add_handler(
         CallbackQueryHandler(
             on_admin_panel_action,
@@ -10764,12 +10795,6 @@ def main() -> None:
             on_deep_link_structured_cancel,
             pattern=re.compile(r"^dlca:[a-fA-F0-9]{16}$"),
         )
-    )
-    app.add_handler(
-        CallbackQueryHandler(on_deep_link_confirm_order, pattern=re.compile(r"^confirm_order$"))
-    )
-    app.add_handler(
-        CallbackQueryHandler(on_deep_link_cancel_order, pattern=re.compile(r"^cancel_order$"))
     )
     app.add_handler(
         CallbackQueryHandler(
