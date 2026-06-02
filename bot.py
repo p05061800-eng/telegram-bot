@@ -955,6 +955,24 @@ _SITE_CONFIRM_CALLBACKS = frozenset(
     {"confirm_order", "site_confirm", "order_confirm"}
 )
 _SITE_CANCEL_CALLBACKS = frozenset({"cancel_order", "site_cancel", "order_cancel"})
+# Сайт часто шлёт confirm_order:<uuid> (до 64 байт), бот раньше ждал только confirm_order.
+_RE_SITE_ORDER_BUTTON = re.compile(
+    r"^(?P<kind>confirm_order|cancel_order|site_confirm|order_confirm|site_cancel|order_cancel)"
+    r"(?P<suffix>[:_](?P<oid>.+))?$",
+    re.IGNORECASE,
+)
+_RE_SITE_ORDER_SHORT_BUTTON = re.compile(
+    r"^(?P<action>confirm|cancel)[:_](?P<oid>[a-zA-Z0-9-]{8,})$",
+    re.IGNORECASE,
+)
+_RE_ORDER_ID_IN_MESSAGE = re.compile(
+    r"ID\s+заказа:\s*([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})",
+    re.IGNORECASE,
+)
+MSG_SITE_ORDER_LOAD_FAIL = (
+    "Не удалось подтянуть заказ с сайта. Проверьте ILLUCARDS_ORDER_UPDATE_SECRET на Render "
+    "и откройте заказ снова: /start order_<номер> или ссылка с сайта."
+)
 MSG_ORDER_SUBMIT_ADMIN_FAIL = (
     "Не удалось отправить заказ администратору. Попробуйте позже или напишите в «Связь»."
 )
@@ -7749,21 +7767,163 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_start_intro_with_site_button(msg, uid, context.user_data)
 
 
-async def on_deep_link_confirm_order(
-    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _parse_site_order_callback_data(data: str) -> Optional[Tuple[str, Optional[str]]]:
+    """(action confirm|cancel, external_id или None) из callback_data кнопки сайта/бота."""
+    d = (data or "").strip()
+    if not d:
+        return None
+    m = _RE_SITE_ORDER_BUTTON.match(d)
+    if m:
+        kind = (m.group("kind") or "").lower()
+        oid = (m.group("oid") or "").strip() or None
+        if kind.startswith("confirm") or kind in ("site_confirm", "order_confirm"):
+            return ("confirm", oid)
+        return ("cancel", oid)
+    m2 = _RE_SITE_ORDER_SHORT_BUTTON.match(d)
+    if m2:
+        return (str(m2.group("action") or "").lower(), (m2.group("oid") or "").strip() or None)
+    if d in _SITE_CONFIRM_CALLBACKS:
+        return ("confirm", None)
+    if d in _SITE_CANCEL_CALLBACKS:
+        return ("cancel", None)
+    return _parse_site_order_callback_loose(d)
+
+
+def _parse_site_order_callback_loose(data: str) -> Optional[Tuple[str, Optional[str]]]:
+    """Если сайт прислал нестандартный callback, но в нём есть confirm/cancel и UUID заказа."""
+    d = (data or "").strip()
+    if not d or not re.search(r"confirm|cancel", d, re.IGNORECASE):
+        return None
+    uid_m = re.search(
+        r"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})",
+        d,
+        re.IGNORECASE,
+    )
+    oid = (uid_m.group(1) or "").strip() if uid_m else None
+    low = d.lower()
+    if "cancel" in low and "confirm" not in low:
+        return ("cancel", oid)
+    if "confirm" in low:
+        return ("confirm", oid)
+    return None
+
+
+def _extract_order_id_from_telegram_message(text: str) -> Optional[str]:
+    m = _RE_ORDER_ID_IN_MESSAGE.search(str(text or ""))
+    return (m.group(1) or "").strip() if m else None
+
+
+async def _hydrate_site_order_for_uid(
+    uid: int,
+    external_id: str,
+    user_data: dict,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """Подтянуть заказ с сайта в корзину и черновик (кнопки сайта с ID в callback или в тексте)."""
+    ext = str(external_id or "").strip()
+    if not uid or not ext:
+        return False
+    norm = await _fetch_order_for_deep_link(ext)
+    if not norm or not norm.get("items"):
+        return False
+    _apply_site_order_norm_to_user_cart(uid, norm)
+    try:
+        products = await _get_products(context)
+    except Exception:
+        products = []
+    preview = _format_site_order_confirm_preview(uid, norm, products)
+    meta: Dict[str, object] = {
+        "external_id": ext,
+        "loyalty_hint": deepcopy(norm),
+        "items": deepcopy(list(norm.get("items") or [])),
+    }
+    try:
+        b_ap = int(norm.get("bonus_applied") or 0)
+    except (TypeError, ValueError):
+        b_ap = 0
+    if b_ap > 0:
+        meta["bonus_applied"] = b_ap
+    try:
+        b_ps = int(norm.get("bonus_points_spent") or 0)
+    except (TypeError, ValueError):
+        b_ps = 0
+    if b_ps <= 0:
+        b_ps = b_ap
+    if b_ps > 0:
+        meta["bonus_points_spent"] = b_ps
+    if not preview.strip():
+        cc = str(USER_PREF_DELIVERY_COUNTRY.get(uid) or "by")
+        preview = _format_login_site_cart_pending_text(uid, cc, products)
+    if preview.strip():
+        _persist_site_pending_order(uid, preview, meta, user_data)
+    return bool(_cart_get_lines_uid(uid, user_data))
+
+
+async def _run_site_cancel_order(
+    q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, *, acked: bool
+) -> None:
+    ud = context.user_data
+    uid_cb = int(q.from_user.id) if q.from_user else 0
+    has_ud = bool((ud.get("pending_order") or "").strip())
+    has_site = bool(uid_cb and _get_site_pending_preview(uid_cb))
+    has_cart = bool(uid_cb and _cart_get_lines_uid(uid_cb, ud))
+    if not has_ud and not has_site and not has_cart:
+        await _answer_order_callback_stale(q, acked=acked)
+        return
+    ud.pop("pending_order", None)
+    if uid_cb:
+        _clear_site_pending_order(uid_cb, ud)
+    try:
+        await q.message.edit_text(MSG_ORDER_PREVIEW_CANCELLED, reply_markup=None)
+    except Exception:
+        await q.message.reply_text(MSG_ORDER_PREVIEW_CANCELLED)
+
+
+async def on_site_order_button_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Подтвердить/отменить: confirm_order, confirm_order:<uuid>, кнопки с сайта."""
     q = update.callback_query
     if not q or not q.data or not q.message:
         return
-    if (q.data or "").strip() not in _SITE_CONFIRM_CALLBACKS:
+    parsed = _parse_site_order_callback_data(q.data) or _parse_site_order_callback_loose(
+        q.data or ""
+    )
+    if not parsed:
         return
-    acked = await _callback_ack(q)
     log = logging.getLogger(__name__)
-    try:
-        await _run_site_confirm_order(q, context, acked=acked, log=log)
-    except Exception:
-        log.exception("confirm_order failed uid=%s", q.from_user.id if q.from_user else 0)
-        if q.message:
-            await q.message.reply_text(MSG_CONFIRM_ORDER_ERROR)
+    log.info("site order button uid=%s data=%r", q.from_user.id if q.from_user else 0, q.data)
+    action, ext_id = parsed
+    acked = await _callback_ack(q)
+    uid = int(q.from_user.id) if q.from_user else 0
+    if uid and action == "confirm":
+        if not ext_id:
+            ext_id = _extract_order_id_from_telegram_message(
+                q.message.text or q.message.caption or ""
+            )
+        if ext_id and not _cart_get_lines_uid(uid, context.user_data):
+            ok = await _hydrate_site_order_for_uid(
+                uid, ext_id, context.user_data, context
+            )
+            if not ok:
+                log.warning(
+                    "site order hydrate failed uid=%s ext_id=%s cb=%r",
+                    uid,
+                    ext_id,
+                    q.data,
+                )
+                if q.message:
+                    await q.message.reply_text(MSG_SITE_ORDER_LOAD_FAIL)
+                return
+    if action == "confirm":
+        try:
+            await _run_site_confirm_order(q, context, acked=acked, log=log)
+        except Exception:
+            log.exception("confirm_order failed uid=%s data=%r", uid, q.data)
+            if q.message:
+                await q.message.reply_text(MSG_CONFIRM_ORDER_ERROR)
+    else:
+        await _run_site_cancel_order(q, context, acked=acked)
 
 
 async def _run_site_confirm_order(
@@ -7962,32 +8122,6 @@ async def _run_site_confirm_order(
     log.info("confirm_order ok uid=%s oid=%s total=%s", uid_cb, oid, total)
 
 
-async def on_deep_link_cancel_order(
-    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    if not q or not q.data or not q.message:
-        return
-    if (q.data or "").strip() not in _SITE_CANCEL_CALLBACKS:
-        return
-    acked = await _callback_ack(q)
-    ud = context.user_data
-    u = q.from_user
-    uid_cb = int(u.id) if u else 0
-    has_ud = bool((ud.get("pending_order") or "").strip())
-    has_site = bool(uid_cb and _get_site_pending_preview(uid_cb))
-    has_cart = bool(uid_cb and _cart_get_lines_uid(uid_cb, ud))
-    if not has_ud and not has_site and not has_cart:
-        await _answer_order_callback_stale(q, acked=acked)
-        return
-    ud.pop("pending_order", None)
-    if uid_cb:
-        _clear_site_pending_order(uid_cb, ud)
-    try:
-        await q.message.edit_text(MSG_ORDER_PREVIEW_CANCELLED, reply_markup=None)
-    except Exception:
-        await q.message.reply_text(MSG_ORDER_PREVIEW_CANCELLED)
-
-
 async def on_callback_query_unhandled(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -8003,12 +8137,14 @@ async def on_callback_query_unhandled(
         data,
         q.message.message_id if q.message else None,
     )
+    parsed = _parse_site_order_callback_data(data) or _parse_site_order_callback_loose(data)
+    if parsed:
+        await on_site_order_button_callback(update, context)
+        return
     await _callback_ack(q)
     if not q.message:
         return
     low = data.lower()
-    if low in _SITE_CONFIRM_CALLBACKS or low in _SITE_CANCEL_CALLBACKS:
-        return
     if re.search(r"(confirm|cancel|order)", low):
         await q.message.reply_text(MSG_CALLBACK_UNKNOWN_ORDER_BUTTON)
 
@@ -10857,17 +10993,15 @@ def main() -> None:
     app.add_handler(CommandHandler("swipe", send_tinder_mode))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("say", admin_say_cmd))
-    # Сначала confirm/cancel заказа с сайта — сразу answer(), иначе в Telegram крутится loading.
+    # Сначала confirm/cancel заказа (в т.ч. confirm_order:<uuid> с сайта).
     app.add_handler(
         CallbackQueryHandler(
-            on_deep_link_confirm_order,
-            pattern=re.compile(r"^(confirm_order|site_confirm|order_confirm)$"),
-        )
-    )
-    app.add_handler(
-        CallbackQueryHandler(
-            on_deep_link_cancel_order,
-            pattern=re.compile(r"^(cancel_order|site_cancel|order_cancel)$"),
+            on_site_order_button_callback,
+            pattern=re.compile(
+                r"^(?P<kind>confirm_order|cancel_order|site_confirm|order_confirm|site_cancel|order_cancel)"
+                r"([:_].+)?$|^(?P<action>confirm|cancel)[:_][a-zA-Z0-9-]{8,}$",
+                re.IGNORECASE,
+            ),
         )
     )
     app.add_handler(
