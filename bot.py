@@ -749,6 +749,7 @@ async def track_user_activity(
         epoch = context.application.bot_data.get("deploy_epoch")
         if epoch is not None and context.user_data.get("_deploy_seen_epoch") != epoch:
             _apply_post_deploy_session_reset(uid, context.user_data)
+            _restore_site_pending_to_user_data(uid, context.user_data)
             context.user_data["_deploy_seen_epoch"] = epoch
         users_touch(uid, activity_only=True)
         _register_login_username(uid, getattr(u, "username", None))
@@ -1386,7 +1387,7 @@ async def _http_verify_code(request: web.Request) -> web.Response:
         _format_login_site_cart_pending_text(uid, del_cc, products) if uid else ""
     )
     if bot and uid and preview:
-        SITE_LOGIN_PENDING_ORDER[uid] = preview
+        _persist_site_pending_order(uid, preview)
         try:
             # await, а не create_task: иначе клиент может сразу уйти с страницы и задача не успевает.
             await _send_site_login_cart_order_message(bot, uid, preview)
@@ -3909,6 +3910,74 @@ def _cart_clear_uid(user_id: int) -> None:
     save_state()
 
 
+def _persist_site_pending_order(
+    uid: int, preview: str, meta: Optional[dict] = None, user_data: Optional[dict] = None
+) -> None:
+    """Черновик для confirm_order/cancel_order — в память и в USER_CART (переживает рестарт)."""
+    if not uid or not str(preview or "").strip():
+        return
+    p = str(preview).strip()
+    SITE_LOGIN_PENDING_ORDER[int(uid)] = p
+    rec = _ensure_user_cart(int(uid))
+    rec["site_pending_preview"] = p
+    if isinstance(meta, dict) and meta:
+        rec["site_pending_meta"] = deepcopy(meta)
+        if user_data is not None:
+            user_data["pending_site_order_meta"] = deepcopy(meta)
+    save_state()
+
+
+def _get_site_pending_preview(uid: int) -> str:
+    p = (SITE_LOGIN_PENDING_ORDER.get(int(uid)) or "").strip()
+    if p:
+        return p
+    rec = USER_CART.get(int(uid))
+    if isinstance(rec, dict):
+        return str(rec.get("site_pending_preview") or "").strip()
+    return ""
+
+
+def _get_site_pending_meta(uid: int, user_data: Optional[dict] = None) -> Optional[dict]:
+    if user_data is not None:
+        m = user_data.get("pending_site_order_meta")
+        if isinstance(m, dict) and m:
+            return m
+    rec = USER_CART.get(int(uid))
+    if isinstance(rec, dict):
+        m = rec.get("site_pending_meta")
+        if isinstance(m, dict) and m:
+            return m
+    return None
+
+
+def _clear_site_pending_order(uid: int, user_data: Optional[dict] = None) -> None:
+    SITE_LOGIN_PENDING_ORDER.pop(int(uid), None)
+    rec = USER_CART.get(int(uid))
+    if isinstance(rec, dict):
+        rec.pop("site_pending_preview", None)
+        rec.pop("site_pending_meta", None)
+    if user_data is not None:
+        user_data.pop("pending_site_order_meta", None)
+    save_state()
+
+
+def _rebuild_site_login_pending_from_carts() -> None:
+    """После load_state: восстановить SITE_LOGIN_PENDING_ORDER из сохранённой корзины."""
+    SITE_LOGIN_PENDING_ORDER.clear()
+    for uid, rec in USER_CART.items():
+        if not isinstance(rec, dict):
+            continue
+        p = str(rec.get("site_pending_preview") or "").strip()
+        if p:
+            SITE_LOGIN_PENDING_ORDER[int(uid)] = p
+
+
+def _restore_site_pending_to_user_data(uid: int, user_data: dict) -> None:
+    meta = _get_site_pending_meta(uid, user_data)
+    if meta:
+        user_data["pending_site_order_meta"] = deepcopy(meta)
+
+
 def _favorites_get_refs_uid(user_id: int, user_data: Optional[dict] = None) -> List[str]:
     uid = int(user_id or 0)
     if not uid:
@@ -5089,7 +5158,7 @@ async def _maybe_prompt_site_cart_confirmation(
     if not uid:
         return False
     lines = _cart_get_lines_uid(uid, user_data)
-    preview = (SITE_LOGIN_PENDING_ORDER.get(int(uid)) or "").strip()
+    preview = _get_site_pending_preview(int(uid))
     if not preview and lines:
         cc = str(USER_PREF_DELIVERY_COUNTRY.get(int(uid)) or "by")
         try:
@@ -5097,12 +5166,14 @@ async def _maybe_prompt_site_cart_confirmation(
         except Exception:
             products = []
         preview = _format_login_site_cart_pending_text(int(uid), cc, products)
-        if preview:
-            SITE_LOGIN_PENDING_ORDER[int(uid)] = preview
     if not lines:
         return False
     if not preview:
         return False
+    meta = _get_site_pending_meta(int(uid), user_data)
+    _persist_site_pending_order(
+        int(uid), preview, meta if isinstance(meta, dict) else None, user_data
+    )
     await _send_site_cart_confirm_prompt(
         bot, int(uid), preview, intro_kind=intro_kind
     )
@@ -7124,7 +7195,6 @@ async def _present_site_order_confirm_prompt(
             reply_markup=REPLY_KB,
         )
         return
-    SITE_LOGIN_PENDING_ORDER[int(uid)] = preview
     meta: Dict[str, object] = {
         "loyalty_hint": deepcopy(norm),
         "external_id": str(norm.get("external_id") or "").strip(),
@@ -7143,7 +7213,7 @@ async def _present_site_order_confirm_prompt(
         b_ps = b_ap
     if b_ps > 0:
         meta["bonus_points_spent"] = b_ps
-    ud["pending_site_order_meta"] = meta
+    _persist_site_pending_order(int(uid), preview, meta, ud)
     body = f"{START_ORDER_FROM_SITE_HEADER}\n\n{preview}"
     if len(body) > 4000:
         body = body[:3990] + "…"
@@ -7601,10 +7671,22 @@ async def on_deep_link_confirm_order(
     ud = context.user_data
     u = q.from_user
     uid_cb = int(u.id) if u else 0
+    try:
+        await q.answer()
+    except Exception:
+        pass
     order_text = (ud.get("pending_order") or "").strip()
     if not order_text and uid_cb:
-        order_text = (SITE_LOGIN_PENDING_ORDER.get(uid_cb) or "").strip()
-    if not order_text:
+        order_text = _get_site_pending_preview(uid_cb)
+    lines_peek = _cart_get_lines_uid(uid_cb, ud) if uid_cb else []
+    if not order_text and lines_peek:
+        cc_peek = str(USER_PREF_DELIVERY_COUNTRY.get(uid_cb) or "by").strip()
+        try:
+            products_peek = await _get_products(context)
+        except Exception:
+            products_peek = []
+        order_text = _format_login_site_cart_pending_text(uid_cb, cc_peek, products_peek)
+    if not order_text and not lines_peek:
         await _answer_order_callback_stale(q)
         return
     if uid_cb:
@@ -7675,7 +7757,7 @@ async def on_deep_link_confirm_order(
             total = int(site_gt)
         else:
             total = int(goods_total)
-        meta = ud.get("pending_site_order_meta")
+        meta = _get_site_pending_meta(uid_cb, ud)
         dl_bonus_applied = 0
         dl_bonus_points_spent = 0
         lo_hint = None
@@ -7740,14 +7822,12 @@ async def on_deep_link_confirm_order(
         USER_ORDERS.setdefault(uid_cb, []).append(order_rec)
         ORDERS[int(oid)]["clear_cart_on_paid"] = True
         ORDERS[int(oid)]["total_goods"] = int(goods_total)
-        ud.pop("pending_site_order_meta", None)
         save_state()
         ud["awaiting_payment_order_id"] = int(oid)
         ud.pop("payment_pending_method", None)
     ud.pop("pending_order", None)
     if uid_cb:
-        SITE_LOGIN_PENDING_ORDER.pop(uid_cb, None)
-    await q.answer()
+        _clear_site_pending_order(uid_cb, ud)
     try:
         await q.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -7774,16 +7854,19 @@ async def on_deep_link_cancel_order(
     ud = context.user_data
     u = q.from_user
     uid_cb = int(u.id) if u else 0
+    try:
+        await q.answer()
+    except Exception:
+        pass
     has_ud = bool((ud.get("pending_order") or "").strip())
-    has_site = bool(uid_cb and (SITE_LOGIN_PENDING_ORDER.get(uid_cb) or "").strip())
-    if not has_ud and not has_site:
+    has_site = bool(uid_cb and _get_site_pending_preview(uid_cb))
+    has_cart = bool(uid_cb and _cart_get_lines_uid(uid_cb, ud))
+    if not has_ud and not has_site and not has_cart:
         await _answer_order_callback_stale(q)
         return
     ud.pop("pending_order", None)
-    ud.pop("pending_site_order_meta", None)
     if uid_cb:
-        SITE_LOGIN_PENDING_ORDER.pop(uid_cb, None)
-    await q.answer()
+        _clear_site_pending_order(uid_cb, ud)
     try:
         await q.message.edit_text(MSG_ORDER_PREVIEW_CANCELLED, reply_markup=None)
     except Exception:
@@ -8366,6 +8449,10 @@ async def on_order_status_buttons(
     if not m:
         return
     if not is_admin(q.from_user.id):
+        try:
+            await q.answer("Эта кнопка только для администратора.", show_alert=True)
+        except Exception:
+            pass
         return
     action, oid_s = m.group(1), m.group(2)
     try:
@@ -10533,13 +10620,13 @@ async def login_http_api_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> Non
 async def post_init(application: Application) -> None:
     log = logging.getLogger(__name__)
     load_state()
+    _rebuild_site_login_pending_from_carts()
     application.bot_data["deploy_epoch"] = time.time_ns()
     n_sl = len(SITE_LOGIN_PENDING_ORDER)
     n_lc = len(LOGIN_CODES)
-    SITE_LOGIN_PENDING_ORDER.clear()
     LOGIN_CODES.clear()
     log.info(
-        "Рестарт процесса: deploy_epoch=%s; сброшены SITE_LOGIN_PENDING_ORDER=%d, LOGIN_CODES=%d",
+        "Рестарт процесса: deploy_epoch=%s; восстановлено черновиков заказа=%d, сброшено LOGIN_CODES=%d",
         application.bot_data["deploy_epoch"],
         n_sl,
         n_lc,
