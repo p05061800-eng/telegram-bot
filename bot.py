@@ -944,6 +944,17 @@ MSG_CALLBACK_STALE_ORDER = (
     "Кнопка от старого сообщения или сессия заказа уже неактивна. "
     "Отправьте /start или откройте ссылку с сайта ещё раз."
 )
+MSG_CALLBACK_UNKNOWN_ORDER_BUTTON = (
+    "Эта кнопка не распознана ботом (устаревшее сообщение или другой формат с сайта). "
+    "Откройте заказ снова: ссылка с сайта или /start."
+)
+MSG_CONFIRM_ORDER_ERROR = (
+    "Не удалось подтвердить заказ. Попробуйте /start или откройте заказ с сайта ещё раз."
+)
+_SITE_CONFIRM_CALLBACKS = frozenset(
+    {"confirm_order", "site_confirm", "order_confirm"}
+)
+_SITE_CANCEL_CALLBACKS = frozenset({"cancel_order", "site_cancel", "order_cancel"})
 MSG_ORDER_SUBMIT_ADMIN_FAIL = (
     "Не удалось отправить заказ администратору. Попробуйте позже или напишите в «Связь»."
 )
@@ -3941,10 +3952,14 @@ def _persist_site_pending_order(
     SITE_LOGIN_PENDING_ORDER[int(uid)] = p
     rec = _ensure_user_cart(int(uid))
     rec["site_pending_preview"] = p
-    if isinstance(meta, dict) and meta:
-        rec["site_pending_meta"] = deepcopy(meta)
+    meta_out: dict = deepcopy(meta) if isinstance(meta, dict) else {}
+    lines_snap = _cart_get_lines_uid(int(uid), user_data)
+    if lines_snap and not meta_out.get("items"):
+        meta_out["items"] = deepcopy(lines_snap)
+    if meta_out:
+        rec["site_pending_meta"] = meta_out
         if user_data is not None:
-            user_data["pending_site_order_meta"] = deepcopy(meta)
+            user_data["pending_site_order_meta"] = deepcopy(meta_out)
     save_state()
 
 
@@ -3997,6 +4012,53 @@ def _restore_site_pending_to_user_data(uid: int, user_data: dict) -> None:
     meta = _get_site_pending_meta(uid, user_data)
     if meta:
         user_data["pending_site_order_meta"] = deepcopy(meta)
+
+
+async def _restore_cart_lines_for_confirm(
+    uid: int,
+    user_data: Optional[dict],
+    context: ContextTypes.DEFAULT_TYPE,
+) -> List[dict]:
+    """Вернуть позиции корзины для confirm_order (из USER_CART, meta или API заказа)."""
+    if not uid:
+        return []
+    lines = list(_cart_get_lines_uid(uid, user_data))
+    if lines:
+        return lines
+    meta = _get_site_pending_meta(uid, user_data)
+    raw_items: List[dict] = []
+    ext_id = ""
+    if isinstance(meta, dict):
+        ri = meta.get("items")
+        if isinstance(ri, list):
+            raw_items = [x for x in ri if isinstance(x, dict)]
+        ext_id = str(meta.get("external_id") or "").strip()
+        lh = meta.get("loyalty_hint")
+        if not ext_id and isinstance(lh, dict):
+            ext_id = str(lh.get("external_id") or "").strip()
+    if raw_items:
+        cc = str(USER_PREF_DELIVERY_COUNTRY.get(uid) or "by").strip().lower()
+        if cc not in DELIVERY_OPTIONS:
+            cc = "by"
+        _apply_site_order_norm_to_user_cart(
+            uid, {"items": deepcopy(raw_items), "delivery": {"country": cc}}
+        )
+        return list(_cart_get_lines_uid(uid, user_data))
+    if ext_id:
+        norm = await _fetch_order_for_deep_link(ext_id)
+        if norm and norm.get("items"):
+            _apply_site_order_norm_to_user_cart(uid, norm)
+            try:
+                products = await _get_products(context)
+            except Exception:
+                products = []
+            preview = _format_site_order_confirm_preview(uid, norm, products)
+            if preview:
+                _persist_site_pending_order(
+                    uid, preview, _get_site_pending_meta(uid, user_data), user_data
+                )
+            return list(_cart_get_lines_uid(uid, user_data))
+    return []
 
 
 def _favorites_get_refs_uid(user_id: int, user_data: Optional[dict] = None) -> List[str]:
@@ -5192,9 +5254,11 @@ async def _maybe_prompt_site_cart_confirmation(
     if not preview:
         return False
     meta = _get_site_pending_meta(int(uid), user_data)
-    _persist_site_pending_order(
-        int(uid), preview, meta if isinstance(meta, dict) else None, user_data
-    )
+    if not isinstance(meta, dict):
+        meta = {}
+    if lines and not meta.get("items"):
+        meta["items"] = deepcopy(lines)
+    _persist_site_pending_order(int(uid), preview, meta, user_data)
     await _send_site_cart_confirm_prompt(
         bot, int(uid), preview, intro_kind=intro_kind
     )
@@ -7234,6 +7298,9 @@ async def _present_site_order_confirm_prompt(
         b_ps = b_ap
     if b_ps > 0:
         meta["bonus_points_spent"] = b_ps
+    norm_items = norm.get("items")
+    if isinstance(norm_items, list) and norm_items:
+        meta["items"] = deepcopy(list(norm_items))
     _persist_site_pending_order(int(uid), preview, meta, ud)
     body = f"{START_ORDER_FROM_SITE_HEADER}\n\n{preview}"
     if len(body) > 4000:
@@ -7687,10 +7754,25 @@ async def on_deep_link_confirm_order(
     q = update.callback_query
     if not q or not q.data or not q.message:
         return
-    if (q.data or "").strip() != "confirm_order":
+    if (q.data or "").strip() not in _SITE_CONFIRM_CALLBACKS:
         return
     acked = await _callback_ack(q)
     log = logging.getLogger(__name__)
+    try:
+        await _run_site_confirm_order(q, context, acked=acked, log=log)
+    except Exception:
+        log.exception("confirm_order failed uid=%s", q.from_user.id if q.from_user else 0)
+        if q.message:
+            await q.message.reply_text(MSG_CONFIRM_ORDER_ERROR)
+
+
+async def _run_site_confirm_order(
+    q: CallbackQuery,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    acked: bool,
+    log: logging.Logger,
+) -> None:
     ud = context.user_data
     u = q.from_user
     uid_cb = int(u.id) if u else 0
@@ -7698,6 +7780,8 @@ async def on_deep_link_confirm_order(
     if not order_text and uid_cb:
         order_text = _get_site_pending_preview(uid_cb)
     lines_peek = _cart_get_lines_uid(uid_cb, ud) if uid_cb else []
+    if uid_cb and not lines_peek:
+        lines_peek = await _restore_cart_lines_for_confirm(uid_cb, ud, context)
     if not order_text and lines_peek:
         cc_peek = str(USER_PREF_DELIVERY_COUNTRY.get(uid_cb) or "by").strip()
         try:
@@ -7741,8 +7825,14 @@ async def on_deep_link_confirm_order(
                 else:
                     await _callback_ack(q, MSG_PAY_FINISH_CURRENT, show_alert=True)
                 return
-        lines = _cart_get_lines_uid(uid_cb, ud)
+        lines = await _restore_cart_lines_for_confirm(uid_cb, ud, context)
         if not lines:
+            log.warning(
+                "confirm_order: no cart lines uid=%s preview=%s meta_items=%s",
+                uid_cb,
+                bool(_get_site_pending_preview(uid_cb)),
+                bool((_get_site_pending_meta(uid_cb, ud) or {}).get("items")),
+            )
             await _answer_order_callback_stale(q, acked=acked)
             return
         cc = str(USER_PREF_DELIVERY_COUNTRY.get(uid_cb) or "by").strip().lower()
@@ -7869,6 +7959,7 @@ async def on_deep_link_confirm_order(
         await q.message.reply_text(
             "Заказ создан, но не удалось открыть оплату. Нажмите «📋 Мои заказы» или /start."
         )
+    log.info("confirm_order ok uid=%s oid=%s total=%s", uid_cb, oid, total)
 
 
 async def on_deep_link_cancel_order(
@@ -7876,7 +7967,7 @@ async def on_deep_link_cancel_order(
     q = update.callback_query
     if not q or not q.data or not q.message:
         return
-    if (q.data or "").strip() != "cancel_order":
+    if (q.data or "").strip() not in _SITE_CANCEL_CALLBACKS:
         return
     acked = await _callback_ack(q)
     ud = context.user_data
@@ -7895,6 +7986,31 @@ async def on_deep_link_cancel_order(
         await q.message.edit_text(MSG_ORDER_PREVIEW_CANCELLED, reply_markup=None)
     except Exception:
         await q.message.reply_text(MSG_ORDER_PREVIEW_CANCELLED)
+
+
+async def on_callback_query_unhandled(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Любой callback без хендлера — снять loading и подсказать, если похоже на заказ с сайта."""
+    q = update.callback_query
+    if not q:
+        return
+    data = (q.data or "").strip()
+    uid = int(q.from_user.id) if q.from_user else 0
+    logging.getLogger(__name__).warning(
+        "unhandled callback_query uid=%s data=%r chat_msg=%s",
+        uid,
+        data,
+        q.message.message_id if q.message else None,
+    )
+    await _callback_ack(q)
+    if not q.message:
+        return
+    low = data.lower()
+    if low in _SITE_CONFIRM_CALLBACKS or low in _SITE_CANCEL_CALLBACKS:
+        return
+    if re.search(r"(confirm|cancel|order)", low):
+        await q.message.reply_text(MSG_CALLBACK_UNKNOWN_ORDER_BUTTON)
 
 
 async def on_deep_link_structured_submit(
@@ -9164,6 +9280,7 @@ async def on_cart_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             ud.pop("payment_pending_method", None)
     if uid:
         _cart_clear_uid(uid)
+        _clear_site_pending_order(uid, ud)
     if uid:
         users_touch(uid, "cart")
     await q.answer(MSG_CART_CLEARED_TOAST, show_alert=False)
@@ -9538,6 +9655,7 @@ async def on_send_order_to_admin(
         return
     if (q.data or "").strip() != "ta:0":
         return
+    acked = await _callback_ack(q)
     ud = context.user_data
     uid_chk = q.from_user.id if q.from_user else 0
     ap = _user_state_get(uid_chk, "awaiting_proof")
@@ -9550,10 +9668,10 @@ async def on_send_order_to_admin(
         if po is None or int(po.get("user_id") or 0) != int(uid_chk) or po.get("paid"):
             _user_state_pop(uid_chk, "awaiting_proof")
         elif po is not None and not po.get("paid"):
-            try:
-                await q.answer(MSG_PAY_NEED_PROOF_FIRST, show_alert=True)
-            except Exception:
-                pass
+            if acked and q.message:
+                await q.message.reply_text(MSG_PAY_NEED_PROOF_FIRST)
+            else:
+                await _callback_ack(q, MSG_PAY_NEED_PROOF_FIRST, show_alert=True)
             return
     pend = ud.get("awaiting_payment_order_id")
     if pend is not None:
@@ -9566,17 +9684,22 @@ async def on_send_order_to_admin(
             ud.pop("awaiting_payment_order_id", None)
             ud.pop("payment_pending_method", None)
         elif po is not None and not po.get("paid"):
-            try:
-                await q.answer(MSG_PAY_FINISH_CURRENT, show_alert=True)
-            except Exception:
-                pass
+            if acked and q.message:
+                await q.message.reply_text(MSG_PAY_FINISH_CURRENT)
+            else:
+                await _callback_ack(q, MSG_PAY_FINISH_CURRENT, show_alert=True)
             return
     lines: Optional[List[dict]] = ud.get("order_checkout")
     if not lines:
         # Восстанавливаемся после устаревшей сессии: берём актуальные позиции из корзины.
-        fallback_lines = _cart_get_lines_uid(uid_chk, context.user_data) if uid_chk else []
+        fallback_lines = (
+            await _restore_cart_lines_for_confirm(uid_chk, context.user_data, context)
+            if uid_chk
+            else []
+        )
         if not fallback_lines:
-            await q.answer()
+            if not acked:
+                await _callback_ack(q)
             await q.message.reply_text(
                 "Корзина пустая или шаг оформления устарел. Добавьте карточки и попробуйте снова.",
                 reply_markup=_kb_cart([]),
@@ -9585,7 +9708,6 @@ async def on_send_order_to_admin(
         lines = deepcopy(fallback_lines)
         ud["order_checkout"] = deepcopy(lines)
     if not ud.get("delivery_country"):
-        await q.answer()
         await q.message.reply_text(
             "Нужно заново выбрать страну доставки перед подтверждением заказа 👇",
             reply_markup=_kb_delivery_country_with_back(),
@@ -10737,10 +10859,16 @@ def main() -> None:
     app.add_handler(CommandHandler("say", admin_say_cmd))
     # Сначала confirm/cancel заказа с сайта — сразу answer(), иначе в Telegram крутится loading.
     app.add_handler(
-        CallbackQueryHandler(on_deep_link_confirm_order, pattern=re.compile(r"^confirm_order$"))
+        CallbackQueryHandler(
+            on_deep_link_confirm_order,
+            pattern=re.compile(r"^(confirm_order|site_confirm|order_confirm)$"),
+        )
     )
     app.add_handler(
-        CallbackQueryHandler(on_deep_link_cancel_order, pattern=re.compile(r"^cancel_order$"))
+        CallbackQueryHandler(
+            on_deep_link_cancel_order,
+            pattern=re.compile(r"^(cancel_order|site_cancel|order_cancel)$"),
+        )
     )
     app.add_handler(
         CallbackQueryHandler(
@@ -10859,6 +10987,7 @@ def main() -> None:
         )
     )
     app.add_handler(CallbackQueryHandler(on_pick_category, pattern=re.compile(r"^c:(\d+|all)$")))
+    app.add_handler(CallbackQueryHandler(on_callback_query_unhandled), group=99)
     app.add_handler(MessageHandler(filters.PHOTO, on_user_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
