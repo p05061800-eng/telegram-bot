@@ -42,7 +42,6 @@ from telegram import (
 from telegram.error import Conflict
 from telegram.ext import (
     Application,
-    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -4434,6 +4433,33 @@ def _payment_intro_text(
     return body
 
 
+def _payment_step_message_text(
+    total: int,
+    currency: str = "BYN",
+    *,
+    loyalty_earn_estimate: Optional[int] = None,
+) -> str:
+    return (
+        f"{ORDER_AUTO_ACK}\n\n"
+        f"{_payment_intro_text(int(total), currency, loyalty_earn_estimate=loyalty_earn_estimate)}"
+    )
+
+
+async def _reply_payment_step(
+    msg: Message,
+    total: int,
+    currency: str = "BYN",
+    *,
+    loyalty_earn_estimate: Optional[int] = None,
+) -> None:
+    await msg.reply_text(
+        _payment_step_message_text(
+            int(total), currency, loyalty_earn_estimate=loyalty_earn_estimate
+        ),
+        reply_markup=_kb_payment_methods(),
+    )
+
+
 def _format_delivery_block(d: Optional[dict]) -> str:
     if not d or not isinstance(d, dict):
         return ""
@@ -5900,15 +5926,8 @@ def _kb_order_preview_actions(uid: int, user_data: dict) -> InlineKeyboardMarkup
 
 
 def _kb_payment_methods_with_back() -> InlineKeyboardMarkup:
-    rows = list(_kb_payment_methods().inline_keyboard)
-    rows.append(
-        [
-            InlineKeyboardButton(
-                "◀️ К подтверждению заказа", callback_data="chk:pay_to_preview"
-            )
-        ]
-    )
-    return InlineKeyboardMarkup(rows)
+    """Только способы оплаты (без «назад к подтверждению» — шаг уже пройден)."""
+    return _kb_payment_methods()
 
 
 def _kb_paid_confirm_with_back(total_label: str) -> InlineKeyboardMarkup:
@@ -7671,11 +7690,9 @@ async def _create_order_from_synced_site_cart(
     SITE_LOGIN_PENDING_ORDER.pop(uid, None)
     context.user_data["awaiting_payment_order_id"] = int(oid)
     context.user_data.pop("payment_pending_method", None)
-    await msg.reply_text(ORDER_AUTO_ACK, reply_markup=REPLY_KB)
     lo_est = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
-    await msg.reply_text(
-        _payment_intro_text(int(total), pay_cur, loyalty_earn_estimate=lo_est),
-        reply_markup=_kb_payment_methods_with_back(),
+    await _reply_payment_step(
+        msg, int(total), pay_cur, loyalty_earn_estimate=lo_est
     )
     users_touch(uid, "payment")
     return True
@@ -7894,6 +7911,16 @@ def _parse_site_order_callback_loose(data: str) -> Optional[Tuple[str, Optional[
     return None
 
 
+class SiteOrderButtonFilter(filters.UpdateFilter):
+    """Callback «Подтвердить/Отменить» заказ (в т.ч. с сайта по подписи кнопки)."""
+
+    def filter(self, update: Update) -> bool:
+        q = update.callback_query
+        if not q or not q.data or not q.message:
+            return False
+        return _resolve_site_order_action(q) is not None
+
+
 def _extract_order_id_from_telegram_message(text: str) -> Optional[str]:
     m = _RE_ORDER_ID_IN_MESSAGE.search(str(text or ""))
     return (m.group(1) or "").strip() if m else None
@@ -7965,20 +7992,6 @@ async def _run_site_cancel_order(
         await q.message.reply_text(MSG_ORDER_PREVIEW_CANCELLED)
 
 
-async def on_site_order_button_try(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Первый callback-хендлер: кнопки заказа с сайта (любой callback_data + подпись кнопки)."""
-    q = update.callback_query
-    if not q or not q.data or not q.message:
-        return
-    parsed = _resolve_site_order_action(q)
-    if not parsed:
-        return
-    await on_site_order_button_callback(update, context, parsed=parsed)
-    raise ApplicationHandlerStop
-
-
 async def on_site_order_button_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -7993,6 +8006,13 @@ async def on_site_order_button_callback(
         parsed = _resolve_site_order_action(q)
     if not parsed:
         return
+    ud = context.user_data
+    cqid = str(getattr(q, "id", "") or "")
+    if cqid and ud.get(f"_handled_cq_{cqid}"):
+        await _callback_ack(q)
+        return
+    if cqid:
+        ud[f"_handled_cq_{cqid}"] = time.time()
     log = logging.getLogger(__name__)
     log.info("site order button uid=%s data=%r", q.from_user.id if q.from_user else 0, q.data)
     action, ext_id = parsed
@@ -8209,11 +8229,12 @@ async def _run_site_confirm_order(
     except Exception:
         pass
     try:
-        await q.message.reply_text(ORDER_AUTO_ACK)
         lo_est = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
-        await q.message.reply_text(
-            _payment_intro_text(int(total), pay_cur, loyalty_earn_estimate=lo_est),
-            reply_markup=_kb_payment_methods_with_back(),
+        await _reply_payment_step(
+            q.message,
+            int(total),
+            pay_cur,
+            loyalty_earn_estimate=lo_est,
         )
         users_touch(uid_cb, "payment")
     except Exception:
@@ -8239,10 +8260,6 @@ async def on_callback_query_unhandled(
         data,
         q.message.message_id if q.message else None,
     )
-    parsed = _resolve_site_order_action(q)
-    if parsed:
-        await on_site_order_button_callback(update, context, parsed=parsed)
-        return
     await _callback_ack(q)
     if not q.message:
         return
@@ -8381,9 +8398,8 @@ async def on_deep_link_structured_submit(
         pass
     tot = int(order_rec["total"])
     lo_est_dl = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
-    await q.message.reply_text(
-        _payment_intro_text(tot, pay_cur_dl, loyalty_earn_estimate=lo_est_dl),
-        reply_markup=_kb_payment_methods_with_back(),
+    await _reply_payment_step(
+        q.message, tot, pay_cur_dl, loyalty_earn_estimate=lo_est_dl
     )
     users_touch(u.id, "payment")
 
@@ -9726,7 +9742,7 @@ async def on_checkout_nav_back(
         lo_est_pm = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
         await q.message.reply_text(
             _payment_intro_text(tot, pay_cur, loyalty_earn_estimate=lo_est_pm),
-            reply_markup=_kb_payment_methods_with_back(),
+            reply_markup=_kb_payment_methods(),
         )
         return
 
@@ -10075,9 +10091,8 @@ async def on_send_order_to_admin(
     await q.answer()
     tot = int(order_rec["total"])
     lo_est_ta = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
-    await q.message.reply_text(
-        _payment_intro_text(tot, pay_cur, loyalty_earn_estimate=lo_est_ta),
-        reply_markup=_kb_payment_methods_with_back(),
+    await _reply_payment_step(
+        q.message, tot, pay_cur, loyalty_earn_estimate=lo_est_ta
     )
     users_touch(uid, "payment")
 
@@ -11094,8 +11109,9 @@ def main() -> None:
     app.add_handler(CommandHandler("swipe", send_tinder_mode))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("say", admin_say_cmd))
-    # Любой callback: если это «Подтвердить/Отменить» заказа (в т.ч. с сайта) — обработать здесь.
-    app.add_handler(CallbackQueryHandler(on_site_order_button_try, block=False))
+    app.add_handler(
+        CallbackQueryHandler(on_site_order_button_callback, SiteOrderButtonFilter())
+    )
     app.add_handler(
         CallbackQueryHandler(
             on_admin_panel_action,
