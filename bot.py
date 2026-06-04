@@ -785,6 +785,82 @@ def _user_state_set(uid: int, key: str, order_id: int) -> None:
     save_state()
 
 
+def _set_awaiting_payment_order_id(uid: int, user_data: dict, order_id: int) -> None:
+    """Сессия оплаты — в user_data и user_states (переживает деплой)."""
+    oid = int(order_id)
+    if uid and isinstance(user_data, dict):
+        user_data["awaiting_payment_order_id"] = oid
+    if uid:
+        _user_state_set(uid, "awaiting_payment_order_id", oid)
+
+
+def _clear_awaiting_payment_order_id(uid: int, user_data: Optional[dict]) -> None:
+    if isinstance(user_data, dict):
+        user_data.pop("awaiting_payment_order_id", None)
+        user_data.pop("payment_pending_method", None)
+    if uid:
+        _user_state_pop(uid, "awaiting_payment_order_id")
+
+
+def _find_latest_unpaid_order_id(uid: int) -> Optional[int]:
+    if not uid:
+        return None
+    best_oid: Optional[int] = None
+    best_ts = 0.0
+    for raw_oid, o in ORDERS.items():
+        if not isinstance(o, dict):
+            continue
+        if int(o.get("user_id") or 0) != int(uid):
+            continue
+        if o.get("paid"):
+            continue
+        try:
+            ts = float(o.get("created_at") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        try:
+            oid_i = int(raw_oid)
+        except (TypeError, ValueError):
+            continue
+        if ts >= best_ts:
+            best_ts = ts
+            best_oid = oid_i
+    return best_oid
+
+
+def _resolve_awaiting_payment_order_id(uid: int, user_data: Optional[dict]) -> Optional[int]:
+    """Активный неоплаченный заказ: user_data → user_states → последний в ORDERS."""
+    ud = user_data if isinstance(user_data, dict) else {}
+    candidates: List[int] = []
+    for raw in (ud.get("awaiting_payment_order_id"), _user_state_get(uid, "awaiting_payment_order_id")):
+        if raw is None:
+            continue
+        try:
+            candidates.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    latest = _find_latest_unpaid_order_id(uid)
+    if latest is not None:
+        candidates.append(int(latest))
+    seen: set = set()
+    for oid in reversed(candidates):
+        if oid in seen:
+            continue
+        seen.add(oid)
+        o = ORDERS.get(int(oid))
+        if not isinstance(o, dict):
+            continue
+        if int(o.get("user_id") or 0) != int(uid):
+            continue
+        if o.get("paid"):
+            continue
+        ud["awaiting_payment_order_id"] = int(oid)
+        _user_state_set(uid, "awaiting_payment_order_id", int(oid))
+        return int(oid)
+    _clear_awaiting_payment_order_id(uid, ud)
+    return None
+
+
 def _user_state_pop(uid: int, key: str) -> Optional[int]:
     if not uid:
         return None
@@ -849,6 +925,17 @@ def _apply_post_deploy_session_reset(uid: int, user_data: dict) -> None:
     _clear_checkout_delivery(user_data)
     for k in _POST_DEPLOY_USER_DATA_EPHEMERAL:
         user_data.pop(k, None)
+    pend = _user_state_get(uid, "awaiting_payment_order_id")
+    if pend is not None:
+        o = ORDERS.get(int(pend))
+        if (
+            isinstance(o, dict)
+            and int(o.get("user_id") or 0) == int(uid)
+            and not o.get("paid")
+        ):
+            user_data["awaiting_payment_order_id"] = int(pend)
+        else:
+            _user_state_pop(uid, "awaiting_payment_order_id")
     t_task = user_data.get("tinder_autoplay_task")
     if isinstance(t_task, asyncio.Task) and not t_task.done():
         try:
@@ -4203,7 +4290,20 @@ def _cart_apply_site_pricing_hints(uid: int, data: dict) -> None:
             elif inc and int(goods) > 0 and gti < int(goods) - max(50, int(goods) // 40):
                 gti = int(goods)
             b["site_cart_grand_total"] = int(gti)
-            b["site_cart_grand_currency"] = _infer_site_grand_total_currency(data)
+            line_cur = _site_cart_line_currency(
+                uid,
+                lines,
+                str(
+                    data.get("deliveryCountry")
+                    or data.get("delivery_country")
+                    or USER_PREF_DELIVERY_COUNTRY.get(int(uid))
+                    or "by"
+                ),
+            )
+            if line_cur in ("BYN", "RUB") and _site_grand_covers_goods(int(gti), int(goods)):
+                b["site_cart_grand_currency"] = line_cur
+            else:
+                b["site_cart_grand_currency"] = _infer_site_grand_total_currency(data)
     else:
         b.pop("site_cart_grand_total", None)
         b.pop("site_cart_grand_currency", None)
@@ -4349,26 +4449,72 @@ def _cart_grand_total_for_display(
     return int(exp), False
 
 
-def _site_cart_payment_currency(uid: int, lines: List[dict], delivery_cc: str) -> str:
-    """Валюта оплаты — как в превью заказа с сайта."""
-    b = USER_CART.get(int(uid))
-    if isinstance(b, dict):
-        sc = str(b.get("site_cart_grand_currency") or "").strip().upper()
-        if sc in ("BYN", "RUB"):
-            return sc
+def _site_cart_line_currency(
+    uid: int, lines: List[dict], delivery_cc: str
+) -> str:
+    """Валюта строк корзины — как в превью заказа с сайта (не site_cart_grand_currency)."""
     site_labels = {
         str(x.get("line_currency") or "").strip().upper()
         for x in lines
-        if x.get("from_site") and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
+        if x.get("from_site")
+        and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
     }
-    if len(site_labels) == 1:
+    if site_labels and all(x.get("from_site") for x in lines) and len(site_labels) == 1:
         c = site_labels.pop()
         if c in ("BYN", "RUB"):
             return c
-    cc = str(delivery_cc or "by").strip().lower()
-    if cc not in DELIVERY_OPTIONS:
-        cc = "by"
-    return _goods_currency_for_delivery_country(cc)
+    bot_code, _, _, _ = _delivery_option_for_site_code(str(delivery_cc or "by"))
+    return _goods_currency_for_delivery_country(bot_code)
+
+
+def _site_cart_checkout_finance(
+    uid: int,
+    lines: List[dict],
+    delivery_cc: str,
+    user_data: Optional[dict] = None,
+) -> dict:
+    """Итог/валюта для превью и шага оплаты — одни правила."""
+    bot_code, d_label, d_amt, d_cur = _delivery_option_for_site_code(
+        str(delivery_cc or "by")
+    )
+    goods, _ = _cart_totals(lines)
+    g_cur = _site_cart_line_currency(uid, lines, delivery_cc)
+    site_gt_raw = _cart_get_site_grand_total(uid, g_cur)
+    inc = _cart_site_delivery_included(uid)
+    exp_line = int(goods) if inc else int(goods) + int(d_amt)
+    trust_site = False
+    if site_gt_raw and int(site_gt_raw) > 0:
+        sg = int(site_gt_raw)
+        if not _site_grand_covers_goods(sg, int(goods)):
+            trust_site = False
+        elif inc:
+            trust_site = not (exp_line > 0 and sg < exp_line - max(50, exp_line // 40))
+        else:
+            trust_site = exp_line > 0 and abs(sg - exp_line) <= max(100, exp_line // 25)
+    use_site = bool(site_gt_raw and trust_site)
+    grand_show = int(site_gt_raw) if use_site else int(exp_line)
+    return {
+        "bot_code": bot_code,
+        "g_cur": g_cur,
+        "grand_show": int(grand_show),
+        "from_site": bool(use_site),
+        "goods": int(goods),
+        "d_label": d_label,
+        "d_amt": int(d_amt),
+        "d_cur": d_cur,
+        "inc": bool(inc),
+    }
+
+
+def _site_cart_payment_currency(uid: int, lines: List[dict], delivery_cc: str) -> str:
+    """Валюта оплаты — как в превью заказа с сайта."""
+    g_cur = _site_cart_line_currency(uid, lines, delivery_cc)
+    b = USER_CART.get(int(uid))
+    if isinstance(b, dict):
+        sc = str(b.get("site_cart_grand_currency") or "").strip().upper()
+        if sc in ("BYN", "RUB") and sc == g_cur:
+            return sc
+    return g_cur
 
 
 def _loyalty_hint_total_currency(lh: dict) -> str:
@@ -4396,26 +4542,22 @@ def _resolve_site_confirm_pricing(
         "amount": int(damount),
         "currency": dcur,
     }
-    pay_cur = _site_cart_payment_currency(uid, lines, cc)
-    total, from_site = _cart_grand_total_for_display(uid, ud, list(lines), pay_cur)
-    total = int(total)
+    fin = _site_cart_checkout_finance(uid, list(lines), cc, ud)
+    pay_cur = str(fin["g_cur"])
+    total = int(fin["grand_show"])
     if isinstance(meta, dict):
-        lh = meta.get("loyalty_hint")
-        if isinstance(lh, dict):
+        try:
+            b_ap = int(meta.get("bonus_applied") or 0)
+        except (TypeError, ValueError):
+            b_ap = 0
+        if b_ap <= 0:
             try:
-                ft = lh.get("final_total")
-                if ft is None:
-                    ft = lh.get("total")
-                ft_i = int(ft) if ft is not None else 0
+                b_ap = int(meta.get("bonus_points_spent") or 0)
             except (TypeError, ValueError):
-                ft_i = 0
-            ft_cur = _loyalty_hint_total_currency(lh)
-            if ft_i > 0 and ft_cur in ("BYN", "RUB") and ft_cur == pay_cur:
-                site_gt = _cart_get_site_grand_total(uid, pay_cur)
-                if site_gt and abs(int(site_gt) - ft_i) <= max(100, max(int(site_gt), ft_i) // 25):
-                    total = ft_i
-                elif not from_site:
-                    total = ft_i
+                b_ap = 0
+        if b_ap > 0:
+            disc = _bonus_discount_units(b_ap, pay_cur)
+            total = max(0, int(total) - int(disc))
     return int(total), pay_cur, drec
 
 
@@ -5230,17 +5372,15 @@ def _format_login_site_cart_pending_text(
     lines = deepcopy(_cart_get_lines_uid(uid))
     if not lines:
         return ""
-    bot_code, d_label, d_amt, d_cur = _delivery_option_for_site_code(delivery_cc)
-    goods, _ = _cart_totals(lines)
-    site_labels = {
-        str(x.get("line_currency") or "").strip().upper()
-        for x in lines
-        if x.get("from_site") and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
-    }
-    if site_labels and all(x.get("from_site") for x in lines) and len(site_labels) == 1:
-        g_cur = site_labels.pop()
-    else:
-        g_cur = _goods_currency_for_delivery_country(bot_code)
+    fin = _site_cart_checkout_finance(uid, lines, delivery_cc)
+    g_cur = fin["g_cur"]
+    goods = fin["goods"]
+    d_label = fin["d_label"]
+    d_amt = fin["d_amt"]
+    d_cur = fin["d_cur"]
+    inc = fin["inc"]
+    use_site = fin["from_site"]
+    grand_show = fin["grand_show"]
     out: List[str] = []
     for x in lines:
         name_raw = str(x.get("name") or "—")
@@ -5254,19 +5394,6 @@ def _format_login_site_cart_pending_text(
         out.append(f"• {name} — {q} шт. × {p} {xcur} = {p * q} {xcur}")
     out.append("")
     site_gt_raw = _cart_get_site_grand_total(uid, g_cur)
-    inc = _cart_site_delivery_included(uid)
-    exp_line = int(goods) if inc else int(goods) + int(d_amt)
-    trust_site = False
-    if site_gt_raw and int(site_gt_raw) > 0:
-        sg = int(site_gt_raw)
-        if not _site_grand_covers_goods(sg, int(goods)):
-            trust_site = False
-        elif inc:
-            trust_site = not (exp_line > 0 and sg < exp_line - max(50, exp_line // 40))
-        else:
-            trust_site = exp_line > 0 and abs(sg - exp_line) <= max(100, exp_line // 25)
-    use_site = bool(site_gt_raw and trust_site)
-    grand_show = int(site_gt_raw) if use_site else exp_line
     if inc and not site_gt_raw:
         out.append(f"🚚 Доставка: {d_label} (уже в сумме на сайте)")
         out.append(f"💰 Итого: {grand_show} {g_cur}")
@@ -7759,7 +7886,7 @@ async def _create_order_from_synced_site_cart(
     save_state()
     context.user_data.pop("pending_order", None)
     SITE_LOGIN_PENDING_ORDER.pop(uid, None)
-    context.user_data["awaiting_payment_order_id"] = int(oid)
+    _set_awaiting_payment_order_id(uid, context.user_data, int(oid))
     context.user_data.pop("payment_pending_method", None)
     lo_est = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
     await _reply_payment_step(
@@ -8379,7 +8506,7 @@ async def _run_site_confirm_order(
     ORDERS[int(oid)]["total_goods"] = int(goods_total)
     ORDERS[int(oid)]["payment_currency"] = str(pay_cur)
     save_state()
-    ud["awaiting_payment_order_id"] = int(oid)
+    _set_awaiting_payment_order_id(uid_cb, ud, int(oid))
     ud.pop("payment_pending_method", None)
     ud.pop("pending_order", None)
     _clear_site_pending_order(uid_cb, ud)
@@ -8561,7 +8688,7 @@ async def on_deep_link_structured_submit(
     if order_rec.get("external_id"):
         ORDERS[int(oid)]["external_id"] = str(order_rec["external_id"])
     save_state()
-    ud["awaiting_payment_order_id"] = int(oid)
+    _set_awaiting_payment_order_id(u.id if u else 0, ud, int(oid))
     ud.pop("payment_pending_method", None)
     await q.answer()
     try:
@@ -10258,8 +10385,7 @@ async def on_send_order_to_admin(
         )
         users_touch(uid, "payment")
         return
-    ud["awaiting_payment_order_id"] = int(oid)
-    ud.pop("payment_pending_method", None)
+    _set_awaiting_payment_order_id(uid, ud, int(oid))
     await q.answer()
     tot = int(order_rec["total"])
     lo_est_ta = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
@@ -10280,28 +10406,22 @@ async def on_payment_method(
         return
     uid = q.from_user.id
     ud = context.user_data
-    oid_raw = ud.get("awaiting_payment_order_id")
-    if oid_raw is None:
-        try:
-            await q.answer()
-        except Exception:
-            pass
+    oid = _resolve_awaiting_payment_order_id(uid, ud)
+    if oid is None:
+        await _callback_ack(
+            q,
+            "Сессия оплаты устарела. Откройте «📋 Мои заказы» или оформите заказ с сайта заново.",
+            show_alert=True,
+        )
         return
-    try:
-        oid = int(oid_raw)
-    except (TypeError, ValueError):
-        ud.pop("awaiting_payment_order_id", None)
-        try:
-            await q.answer()
-        except Exception:
-            pass
-        return
-    o = ORDERS.get(oid)
+    o = ORDERS.get(int(oid))
     if not o or int(o.get("user_id") or 0) != int(uid):
-        try:
-            await q.answer()
-        except Exception:
-            pass
+        _clear_awaiting_payment_order_id(uid, ud)
+        await _callback_ack(
+            q,
+            "Заказ не найден. Оформите заказ с сайта ещё раз или напишите в «Связь».",
+            show_alert=True,
+        )
         return
     if o.get("paid"):
         try:
@@ -11273,6 +11393,17 @@ def main() -> None:
 
     app.add_handler(
         TypeHandler(Update, track_user_activity, block=False),
+        group=-1,
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_payment_method,
+            pattern=re.compile(r"^pay_(card|transfer|crypto)$"),
+        ),
+        group=-1,
+    )
+    app.add_handler(
+        CallbackQueryHandler(on_payment_paid, pattern=re.compile(r"^paid$")),
         group=-1,
     )
     app.add_handler(CommandHandler("start", start))
