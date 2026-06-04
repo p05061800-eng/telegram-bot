@@ -4349,6 +4349,76 @@ def _cart_grand_total_for_display(
     return int(exp), False
 
 
+def _site_cart_payment_currency(uid: int, lines: List[dict], delivery_cc: str) -> str:
+    """Валюта оплаты — как в превью заказа с сайта."""
+    b = USER_CART.get(int(uid))
+    if isinstance(b, dict):
+        sc = str(b.get("site_cart_grand_currency") or "").strip().upper()
+        if sc in ("BYN", "RUB"):
+            return sc
+    site_labels = {
+        str(x.get("line_currency") or "").strip().upper()
+        for x in lines
+        if x.get("from_site") and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
+    }
+    if len(site_labels) == 1:
+        c = site_labels.pop()
+        if c in ("BYN", "RUB"):
+            return c
+    cc = str(delivery_cc or "by").strip().lower()
+    if cc not in DELIVERY_OPTIONS:
+        cc = "by"
+    return _goods_currency_for_delivery_country(cc)
+
+
+def _loyalty_hint_total_currency(lh: dict) -> str:
+    for key in ("currency", "totalCurrency", "grandTotalCurrency", "cartGrandTotalCurrency"):
+        c = str(lh.get(key) or "").strip().upper()
+        if c in ("BYN", "RUB"):
+            return c
+    return ""
+
+
+def _resolve_site_confirm_pricing(
+    uid: int,
+    ud: dict,
+    lines: List[dict],
+    meta: Optional[dict],
+) -> Tuple[int, str, dict]:
+    """Итог и валюта для шага оплаты — те же правила, что в превью корзины."""
+    cc = str(USER_PREF_DELIVERY_COUNTRY.get(uid) or "by").strip().lower()
+    if cc not in DELIVERY_OPTIONS:
+        cc = "by"
+    dlabel, damount, dcur = DELIVERY_OPTIONS.get(cc, DELIVERY_OPTIONS["by"])
+    drec = {
+        "country": cc,
+        "label": dlabel,
+        "amount": int(damount),
+        "currency": dcur,
+    }
+    pay_cur = _site_cart_payment_currency(uid, lines, cc)
+    total, from_site = _cart_grand_total_for_display(uid, ud, list(lines), pay_cur)
+    total = int(total)
+    if isinstance(meta, dict):
+        lh = meta.get("loyalty_hint")
+        if isinstance(lh, dict):
+            try:
+                ft = lh.get("final_total")
+                if ft is None:
+                    ft = lh.get("total")
+                ft_i = int(ft) if ft is not None else 0
+            except (TypeError, ValueError):
+                ft_i = 0
+            ft_cur = _loyalty_hint_total_currency(lh)
+            if ft_i > 0 and ft_cur in ("BYN", "RUB") and ft_cur == pay_cur:
+                site_gt = _cart_get_site_grand_total(uid, pay_cur)
+                if site_gt and abs(int(site_gt) - ft_i) <= max(100, max(int(site_gt), ft_i) // 25):
+                    total = ft_i
+                elif not from_site:
+                    total = ft_i
+    return int(total), pay_cur, drec
+
+
 ORDER_STATUS_RU: dict = {
     "new": "Новый",
     "accepted": "Принят",
@@ -8167,41 +8237,11 @@ async def _run_site_confirm_order(
             )
             await _answer_order_callback_stale(q, acked=acked)
             return
-        cc = str(USER_PREF_DELIVERY_COUNTRY.get(uid_cb) or "by").strip().lower()
-        if cc not in DELIVERY_OPTIONS:
-            cc = "by"
-        dlabel, damount, dcur = DELIVERY_OPTIONS.get(cc, DELIVERY_OPTIONS["by"])
-        drec = {
-            "country": cc,
-            "label": dlabel,
-            "amount": int(damount),
-            "currency": dcur,
-        }
-        pay_cur = "BYN" if cc == "by" and dcur == "BYN" else "RUB"
-        products_dl = await _get_products(context)
-        if products_dl and lines:
-            _reprice_lines_for_delivery(lines, products_dl, cc)
-        goods_total, _ = _cart_totals(list(lines))
-        site_gt = _cart_get_site_grand_total(uid_cb, pay_cur)
-        if site_gt and not _site_grand_covers_goods(int(site_gt), int(goods_total)):
-            site_gt = None
-        total_from_text: Optional[int] = None
-        total_text = _extract_total_from_order_text(order_text)
-        if total_text:
-            m_total = re.search(r"([0-9]+(?:[.,][0-9]+)?)", total_text)
-            if m_total:
-                try:
-                    total_from_text = int(float(m_total.group(1).replace(",", ".")))
-                except (TypeError, ValueError):
-                    total_from_text = None
-        # Для заказа «с сайта» итог считаем уже финальным (без повторного +доставки).
-        if total_from_text and total_from_text > 0:
-            total = int(total_from_text)
-        elif site_gt and site_gt > 0:
-            total = int(site_gt)
-        else:
-            total = int(goods_total)
         meta = _get_site_pending_meta(uid_cb, ud)
+        total, pay_cur, drec = _resolve_site_confirm_pricing(
+            uid_cb, ud, list(lines), meta
+        )
+        goods_total, _ = _cart_totals(list(lines))
         dl_bonus_applied = 0
         dl_bonus_points_spent = 0
         lo_hint = None
@@ -8221,14 +8261,6 @@ async def _run_site_confirm_order(
             if isinstance(lh, dict):
                 lo_hint = lh
                 ext_id = str(meta.get("external_id") or lh.get("external_id") or "").strip()
-                try:
-                    ft = lh.get("final_total")
-                    if ft is None:
-                        ft = lh.get("total")
-                    if ft is not None and int(ft) > 0:
-                        total = int(ft)
-                except (TypeError, ValueError):
-                    pass
         if lo_hint is None:
             pe = _cart_get_site_loyalty_pending_earn(uid_cb)
             if pe is not None and int(pe) > 0:
@@ -8269,6 +8301,7 @@ async def _run_site_confirm_order(
     USER_ORDERS.setdefault(uid_cb, []).append(order_rec)
     ORDERS[int(oid)]["clear_cart_on_paid"] = True
     ORDERS[int(oid)]["total_goods"] = int(goods_total)
+    ORDERS[int(oid)]["payment_currency"] = str(pay_cur)
     save_state()
     ud["awaiting_payment_order_id"] = int(oid)
     ud.pop("payment_pending_method", None)
