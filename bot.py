@@ -42,6 +42,7 @@ from telegram import (
 from telegram.error import Conflict
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -7803,23 +7804,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_start_intro_with_site_button(msg, uid, context.user_data)
 
 
-def _infer_site_order_action_from_button_label(message: Optional[Message], data: str) -> Optional[str]:
-    """Сайт может слать любой callback_data — смотрим текст нажатой inline-кнопки."""
+def _inline_buttons_flat(message: Optional[Message]) -> List[object]:
     if not message or not getattr(message, "reply_markup", None):
-        return None
+        return []
     rm = message.reply_markup
     rows = getattr(rm, "inline_keyboard", None) or []
-    want = (data or "").strip()
+    out: List[object] = []
     for row in rows:
         for btn in row:
-            if (getattr(btn, "callback_data", None) or "").strip() != want:
-                continue
-            text = str(getattr(btn, "text", None) or "")
-            low = text.lower()
-            if "отмен" in low or text.strip().startswith("❌"):
-                return "cancel"
-            if "подтверд" in low or text.strip().startswith("✅"):
-                return "confirm"
+            out.append(btn)
+    return out
+
+
+def _infer_site_order_action_from_button_label(message: Optional[Message], data: str) -> Optional[str]:
+    """Сайт может слать любой callback_data — смотрим текст нажатой inline-кнопки."""
+    want = (data or "").strip()
+    for btn in _inline_buttons_flat(message):
+        if (getattr(btn, "callback_data", None) or "").strip() != want:
+            continue
+        text = str(getattr(btn, "text", None) or "")
+        low = text.lower()
+        if "отмен" in low or "❌" in text:
+            return "cancel"
+        if "подтверд" in low or "✅" in text:
+            return "confirm"
+    return None
+
+
+def _infer_site_order_action_from_keyboard_layout(message: Optional[Message], data: str) -> Optional[str]:
+    """Две кнопки в ряд: первая — подтверждение, вторая — отмена (типичная вёрстка сайта/бота)."""
+    flat = _inline_buttons_flat(message)
+    if not flat:
+        return None
+    want = (data or "").strip()
+    idx = None
+    for i, btn in enumerate(flat):
+        if (getattr(btn, "callback_data", None) or "").strip() == want:
+            idx = i
+            break
+    if idx is None:
+        return None
+    if len(flat) == 2:
+        return "cancel" if idx == 1 else "confirm"
+    if len(flat) == 1:
+        return "confirm"
     return None
 
 
@@ -7836,6 +7864,12 @@ def _message_looks_like_order_preview(text: str) -> bool:
         "черновиком заказа",
         "шт. ×",
         " шт. × ",
+        "Вы перешли с сайта",
+        "Заказ с сайта",
+        "Нажмите «Подтвердить заказ»",
+        "подтянут в бота",
+        "Вход на сайт подтверждён",
+        "💰 Итого:",
     )
     return any(m in t for m in markers)
 
@@ -7850,6 +7884,8 @@ def _resolve_site_order_action(q: CallbackQuery) -> Optional[Tuple[str, Optional
         return parsed
     msg = q.message
     label_action = _infer_site_order_action_from_button_label(msg, data)
+    if not label_action:
+        label_action = _infer_site_order_action_from_keyboard_layout(msg, data)
     if label_action:
         ext = _extract_order_id_from_telegram_message(
             (msg.text or msg.caption or "") if msg else ""
@@ -7911,14 +7947,28 @@ def _parse_site_order_callback_loose(data: str) -> Optional[Tuple[str, Optional[
     return None
 
 
-class SiteOrderButtonFilter(filters.UpdateFilter):
-    """Callback «Подтвердить/Отменить» заказ (в т.ч. с сайта по подписи кнопки)."""
+_RE_SITE_ORDER_CB_PATTERN = re.compile(
+    r"^(?P<kind>confirm_order|cancel_order|site_confirm|order_confirm|site_cancel|order_cancel)"
+    r"([:_].+)?$|^(?P<action>confirm|cancel)[:_][\w-]{8,}$|"
+    r"^(submit_order|order_submit|checkout_confirm|confirm_checkout|checkout_cancel|cancel_checkout)$",
+    re.IGNORECASE,
+)
 
-    def filter(self, update: Update) -> bool:
-        q = update.callback_query
-        if not q or not q.data or not q.message:
-            return False
-        return _resolve_site_order_action(q) is not None
+
+async def _try_handle_site_order_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Ранний роутер: кнопки заказа с сайта (любой callback_data + подпись кнопки)."""
+    q = update.callback_query
+    if not q or not q.data or not q.message:
+        return
+    if _RE_SITE_ORDER_CB_PATTERN.match((q.data or "").strip()):
+        return
+    parsed = _resolve_site_order_action(q)
+    if not parsed:
+        return
+    await on_site_order_button_callback(update, context, parsed=parsed)
+    raise ApplicationHandlerStop
 
 
 def _extract_order_id_from_telegram_message(text: str) -> Optional[str]:
@@ -8260,10 +8310,23 @@ async def on_callback_query_unhandled(
         data,
         q.message.message_id if q.message else None,
     )
+    parsed = _resolve_site_order_action(q)
+    if parsed:
+        await on_site_order_button_callback(update, context, parsed=parsed)
+        return
     await _callback_ack(q)
     if not q.message:
         return
     if _message_looks_like_order_preview(q.message.text or q.message.caption or ""):
+        logging.getLogger(__name__).error(
+            "order preview callback still unresolved uid=%s data=%r buttons=%s",
+            uid,
+            data,
+            [
+                (getattr(b, "text", None), getattr(b, "callback_data", None))
+                for b in _inline_buttons_flat(q.message)
+            ],
+        )
         await q.message.reply_text(MSG_CALLBACK_UNKNOWN_ORDER_BUTTON)
 
 
@@ -11109,8 +11172,16 @@ def main() -> None:
     app.add_handler(CommandHandler("swipe", send_tinder_mode))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("say", admin_say_cmd))
+    # confirm_order / cancel_order — явный pattern (нельзя передавать UpdateFilter как pattern).
     app.add_handler(
-        CallbackQueryHandler(on_site_order_button_callback, SiteOrderButtonFilter())
+        CallbackQueryHandler(
+            on_site_order_button_callback,
+            pattern=_RE_SITE_ORDER_CB_PATTERN,
+        )
+    )
+    app.add_handler(
+        TypeHandler(Update, _try_handle_site_order_callback, block=False),
+        group=0,
     )
     app.add_handler(
         CallbackQueryHandler(
