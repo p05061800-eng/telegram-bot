@@ -4314,7 +4314,7 @@ def _cart_expected_grand_with_delivery(
         code = str(ud.get("delivery_country") or "").strip().lower()
         if code not in DELIVERY_OPTIONS:
             code = _cart_price_region_for_user(uid, ud)
-        _, _, d_amt, _ = DELIVERY_OPTIONS.get(code, DELIVERY_OPTIONS["by"])
+        _, d_amt, _ = DELIVERY_OPTIONS.get(code, DELIVERY_OPTIONS["by"])
     if inc:
         return max(0, int(goods))
     return max(0, int(goods) + int(d_amt))
