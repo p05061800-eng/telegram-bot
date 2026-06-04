@@ -42,6 +42,7 @@ from telegram import (
 from telegram.error import Conflict
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -945,8 +946,7 @@ MSG_CALLBACK_STALE_ORDER = (
     "Отправьте /start или откройте ссылку с сайта ещё раз."
 )
 MSG_CALLBACK_UNKNOWN_ORDER_BUTTON = (
-    "Эта кнопка не распознана ботом (устаревшее сообщение или другой формат с сайта). "
-    "Откройте заказ снова: ссылка с сайта или /start."
+    "Не удалось обработать кнопку. Откройте заказ снова с сайта или отправьте /start."
 )
 MSG_CONFIRM_ORDER_ERROR = (
     "Не удалось подтвердить заказ. Попробуйте /start или откройте заказ с сайта ещё раз."
@@ -954,7 +954,26 @@ MSG_CONFIRM_ORDER_ERROR = (
 _SITE_CONFIRM_CALLBACKS = frozenset(
     {"confirm_order", "site_confirm", "order_confirm"}
 )
-_SITE_CANCEL_CALLBACKS = frozenset({"cancel_order", "site_cancel", "order_cancel"})
+_SITE_CANCEL_CALLBACKS = frozenset(
+    {
+        "cancel_order",
+        "site_cancel",
+        "order_cancel",
+        "order_cancelled",
+        "checkout_cancel",
+        "cancel_checkout",
+    }
+)
+_SITE_CONFIRM_EXTRA = frozenset(
+    {
+        "submit_order",
+        "order_submit",
+        "checkout_confirm",
+        "confirm_checkout",
+        "order_confirmed",
+        "confirm_payment_order",
+    }
+)
 # Сайт часто шлёт confirm_order:<uuid> (до 64 байт), бот раньше ждал только confirm_order.
 _RE_SITE_ORDER_BUTTON = re.compile(
     r"^(?P<kind>confirm_order|cancel_order|site_confirm|order_confirm|site_cancel|order_cancel)"
@@ -7767,11 +7786,78 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_start_intro_with_site_button(msg, uid, context.user_data)
 
 
+def _infer_site_order_action_from_button_label(message: Optional[Message], data: str) -> Optional[str]:
+    """Сайт может слать любой callback_data — смотрим текст нажатой inline-кнопки."""
+    if not message or not getattr(message, "reply_markup", None):
+        return None
+    rm = message.reply_markup
+    rows = getattr(rm, "inline_keyboard", None) or []
+    want = (data or "").strip()
+    for row in rows:
+        for btn in row:
+            if (getattr(btn, "callback_data", None) or "").strip() != want:
+                continue
+            text = str(getattr(btn, "text", None) or "")
+            low = text.lower()
+            if "отмен" in low or text.strip().startswith("❌"):
+                return "cancel"
+            if "подтверд" in low or text.strip().startswith("✅"):
+                return "confirm"
+    return None
+
+
+def _message_looks_like_order_preview(text: str) -> bool:
+    t = str(text or "")
+    if not t.strip():
+        return False
+    markers = (
+        "ID заказа:",
+        "Итого:",
+        "Доставка:",
+        "Подтвердить заказ",
+        "состав и доставку",
+        "черновиком заказа",
+        "шт. ×",
+        " шт. × ",
+    )
+    return any(m in t for m in markers)
+
+
+def _resolve_site_order_action(q: CallbackQuery) -> Optional[Tuple[str, Optional[str]]]:
+    """confirm/cancel + external_id из callback_data, разметки кнопки или текста сообщения."""
+    data = (q.data or "").strip()
+    if not data:
+        return None
+    parsed = _parse_site_order_callback_data(data)
+    if parsed:
+        return parsed
+    msg = q.message
+    label_action = _infer_site_order_action_from_button_label(msg, data)
+    if label_action:
+        ext = _extract_order_id_from_telegram_message(
+            (msg.text or msg.caption or "") if msg else ""
+        )
+        return (label_action, ext)
+    if msg and _message_looks_like_order_preview(msg.text or msg.caption or ""):
+        low = data.lower()
+        if re.search(r"cancel|отмен|reject|decline", low):
+            ext = _extract_order_id_from_telegram_message(msg.text or msg.caption or "")
+            return ("cancel", ext)
+        if re.search(r"confirm|submit|accept|approve|pay|подтверд|оформ", low):
+            ext = _extract_order_id_from_telegram_message(msg.text or msg.caption or "")
+            return ("confirm", ext)
+    return None
+
+
 def _parse_site_order_callback_data(data: str) -> Optional[Tuple[str, Optional[str]]]:
     """(action confirm|cancel, external_id или None) из callback_data кнопки сайта/бота."""
     d = (data or "").strip()
     if not d:
         return None
+    if d in _SITE_CONFIRM_EXTRA:
+        return ("confirm", None)
+    if d in _SITE_CANCEL_CALLBACKS:
+        return ("cancel", None)
     m = _RE_SITE_ORDER_BUTTON.match(d)
     if m:
         kind = (m.group("kind") or "").lower()
@@ -7879,16 +7965,32 @@ async def _run_site_cancel_order(
         await q.message.reply_text(MSG_ORDER_PREVIEW_CANCELLED)
 
 
-async def on_site_order_button_callback(
+async def on_site_order_button_try(
     update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Первый callback-хендлер: кнопки заказа с сайта (любой callback_data + подпись кнопки)."""
+    q = update.callback_query
+    if not q or not q.data or not q.message:
+        return
+    parsed = _resolve_site_order_action(q)
+    if not parsed:
+        return
+    await on_site_order_button_callback(update, context, parsed=parsed)
+    raise ApplicationHandlerStop
+
+
+async def on_site_order_button_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    parsed: Optional[Tuple[str, Optional[str]]] = None,
 ) -> None:
     """Подтвердить/отменить: confirm_order, confirm_order:<uuid>, кнопки с сайта."""
     q = update.callback_query
     if not q or not q.data or not q.message:
         return
-    parsed = _parse_site_order_callback_data(q.data) or _parse_site_order_callback_loose(
-        q.data or ""
-    )
+    if parsed is None:
+        parsed = _resolve_site_order_action(q)
     if not parsed:
         return
     log = logging.getLogger(__name__)
@@ -8137,15 +8239,14 @@ async def on_callback_query_unhandled(
         data,
         q.message.message_id if q.message else None,
     )
-    parsed = _parse_site_order_callback_data(data) or _parse_site_order_callback_loose(data)
+    parsed = _resolve_site_order_action(q)
     if parsed:
-        await on_site_order_button_callback(update, context)
+        await on_site_order_button_callback(update, context, parsed=parsed)
         return
     await _callback_ack(q)
     if not q.message:
         return
-    low = data.lower()
-    if re.search(r"(confirm|cancel|order)", low):
+    if _message_looks_like_order_preview(q.message.text or q.message.caption or ""):
         await q.message.reply_text(MSG_CALLBACK_UNKNOWN_ORDER_BUTTON)
 
 
@@ -10993,17 +11094,8 @@ def main() -> None:
     app.add_handler(CommandHandler("swipe", send_tinder_mode))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("say", admin_say_cmd))
-    # Сначала confirm/cancel заказа (в т.ч. confirm_order:<uuid> с сайта).
-    app.add_handler(
-        CallbackQueryHandler(
-            on_site_order_button_callback,
-            pattern=re.compile(
-                r"^(?P<kind>confirm_order|cancel_order|site_confirm|order_confirm|site_cancel|order_cancel)"
-                r"([:_].+)?$|^(?P<action>confirm|cancel)[:_][a-zA-Z0-9-]{8,}$",
-                re.IGNORECASE,
-            ),
-        )
-    )
+    # Любой callback: если это «Подтвердить/Отменить» заказа (в т.ч. с сайта) — обработать здесь.
+    app.add_handler(CallbackQueryHandler(on_site_order_button_try, block=False))
     app.add_handler(
         CallbackQueryHandler(
             on_admin_panel_action,
