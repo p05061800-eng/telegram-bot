@@ -7925,6 +7925,8 @@ def _message_looks_like_order_preview(text: str) -> bool:
     t = str(text or "")
     if not t.strip():
         return False
+    if _message_looks_like_payment_step(t):
+        return False
     markers = (
         "ID заказа:",
         "Итого:",
@@ -7944,10 +7946,78 @@ def _message_looks_like_order_preview(text: str) -> bool:
     return any(m in t for m in markers)
 
 
+def _message_looks_like_payment_step(text: str) -> bool:
+    """Шаг выбора способа оплаты (не превью заказа с сайта)."""
+    t = str(text or "")
+    if not t.strip():
+        return False
+    markers = (
+        "Выберите способ оплаты",
+        PAY_FLOW_STEPS,
+        "👇 Нажмите кнопку ниже",
+        "💳 Карта · 📱 Перевод",
+        ORDER_AUTO_ACK,
+    )
+    return any(m in t for m in markers)
+
+
+_BOT_CHECKOUT_CALLBACK_EXACT = frozenset(
+    {"pay_card", "pay_transfer", "pay_crypto", "paid"}
+)
+_BOT_CHECKOUT_CALLBACK_PREFIXES = (
+    "pay_",
+    "chk:",
+    "bo:",
+    "co:",
+    "dl:",
+    "ta:",
+    "vc:",
+    "ic:",
+    "dc:",
+    "rm:",
+    "cz:",
+    "m:",
+    "c:",
+    "j:",
+    "hp:",
+    "pop:",
+    "ccur:",
+    "accept_",
+    "cancel_",
+    "sent_",
+    "done_",
+    "delmsg_",
+    "oam:",
+    "user_order_",
+    "uos:",
+    "open_order_",
+    "sup:",
+    "adm:",
+    "confirm_payment_",
+    "reject_payment_",
+    "rcpt_",
+    "dlco:",
+    "dlca:",
+)
+
+
+def _is_bot_checkout_payment_callback(data: str) -> bool:
+    """Кнопки оплаты и чекаута бота — не путать с confirm/cancel заказа с сайта."""
+    d = (data or "").strip()
+    if not d:
+        return False
+    if d in _BOT_CHECKOUT_CALLBACK_EXACT:
+        return True
+    low = d.lower()
+    return any(low.startswith(p) for p in _BOT_CHECKOUT_CALLBACK_PREFIXES)
+
+
 def _resolve_site_order_action(q: CallbackQuery) -> Optional[Tuple[str, Optional[str]]]:
     """confirm/cancel + external_id из callback_data, разметки кнопки или текста сообщения."""
     data = (q.data or "").strip()
     if not data:
+        return None
+    if _is_bot_checkout_payment_callback(data):
         return None
     parsed = _parse_site_order_callback_data(data)
     if parsed:
@@ -7961,13 +8031,16 @@ def _resolve_site_order_action(q: CallbackQuery) -> Optional[Tuple[str, Optional
             (msg.text or msg.caption or "") if msg else ""
         )
         return (label_action, ext)
-    if msg and _message_looks_like_order_preview(msg.text or msg.caption or ""):
+    msg_text = (msg.text or msg.caption or "") if msg else ""
+    if msg and _message_looks_like_payment_step(msg_text):
+        return None
+    if msg and _message_looks_like_order_preview(msg_text):
         low = data.lower()
         if re.search(r"cancel|отмен|reject|decline", low):
-            ext = _extract_order_id_from_telegram_message(msg.text or msg.caption or "")
+            ext = _extract_order_id_from_telegram_message(msg_text)
             return ("cancel", ext)
-        if re.search(r"confirm|submit|accept|approve|pay|подтверд|оформ", low):
-            ext = _extract_order_id_from_telegram_message(msg.text or msg.caption or "")
+        if re.search(r"confirm|submit|accept|approve|подтверд|оформ", low):
+            ext = _extract_order_id_from_telegram_message(msg_text)
             return ("confirm", ext)
     return None
 
@@ -8032,7 +8105,10 @@ async def _try_handle_site_order_callback(
     q = update.callback_query
     if not q or not q.data or not q.message:
         return
-    if _RE_SITE_ORDER_CB_PATTERN.match((q.data or "").strip()):
+    data = (q.data or "").strip()
+    if _is_bot_checkout_payment_callback(data):
+        return
+    if _RE_SITE_ORDER_CB_PATTERN.match(data):
         return
     parsed = _resolve_site_order_action(q)
     if not parsed:
