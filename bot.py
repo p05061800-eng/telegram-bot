@@ -1007,6 +1007,13 @@ MSG_CALLBACK_CATEGORY_INVALID = "Такой категории нет. Откр�
 MSG_CART_CLEARED_TOAST = "Корзина очищена."
 MSG_PAY_NEED_PROOF_FIRST = "Сначала пришлите фото чека оплаты."
 MSG_PAY_FINISH_CURRENT = "Сначала завершите оплату по текущему заказу."
+MSG_PAY_ALREADY_OPEN = (
+    "Оплата уже открыта — выберите способ оплаты в сообщении выше "
+    "или нажмите «❌ Отменить оплату»."
+)
+MSG_PAY_CANCELLED = (
+    "Оплата отменена. Можете снова подтвердить заказ или изменить корзину на сайте."
+)
 MSG_ORDER_STATUS_UPDATED = "Статус заказа обновлён."
 MSG_ORDER_ALREADY_PAID_TOAST = "Заказ уже отмечен как оплаченный."
 MSG_PAYMENT_CAPTION_CONFIRMED = "\n\nОплата подтверждена."
@@ -2726,6 +2733,13 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
     if lines or _sync_explicit_clear(data, "clearCart", "clear_cart"):
         _cart_set_items_uid(uid, lines)
     _cart_apply_site_pricing_hints(uid, data)
+    pts, disc = _site_bonus_from_sources(uid, data if isinstance(data, dict) else None)
+    if pts > 0 or disc > 0:
+        crec = _ensure_user_cart(uid)
+        if pts > 0:
+            crec["site_bonus_points_spent"] = int(pts)
+        if disc > 0:
+            crec["site_bonus_applied"] = int(disc)
     _apply_optional_favorites_from_site_payload(uid, data, products)
     note_loy = _apply_site_loyalty_from_sync(uid, data)
     bot_loy = request.app.get("bot")
@@ -4525,6 +4539,128 @@ def _loyalty_hint_total_currency(lh: dict) -> str:
     return ""
 
 
+_SITE_BONUS_SPENT_KEYS = (
+    "bonusPointsSpent",
+    "bonus_points_spent",
+    "pointsSpent",
+    "points_spent",
+    "bonusesSpent",
+    "bonuses_spent",
+)
+_SITE_BONUS_APPLIED_KEYS = (
+    "bonusApplied",
+    "bonus_applied",
+    "bonusDiscount",
+    "bonus_discount",
+)
+
+
+def _site_bonus_from_sources(
+    uid: int, meta: Optional[dict] = None
+) -> Tuple[int, int]:
+    """(списано бонусов, скидка в валюте заказа если сайт передал сумму)."""
+    sources: List[dict] = []
+    if isinstance(meta, dict):
+        sources.append(meta)
+    b = USER_CART.get(int(uid))
+    if isinstance(b, dict):
+        sources.append(b)
+    pts: Optional[int] = None
+    disc: Optional[int] = None
+    for src in sources:
+        if pts is None:
+            pts = _loyalty_find_int(src, _SITE_BONUS_SPENT_KEYS, 2)
+        if disc is None:
+            disc = _loyalty_find_int(src, _SITE_BONUS_APPLIED_KEYS, 2)
+    b = USER_CART.get(int(uid))
+    if isinstance(b, dict):
+        if pts is None:
+            try:
+                v = int(b.get("site_bonus_points_spent") or 0)
+            except (TypeError, ValueError):
+                v = 0
+            if v > 0:
+                pts = v
+        if disc is None:
+            try:
+                v = int(b.get("site_bonus_applied") or 0)
+            except (TypeError, ValueError):
+                v = 0
+            if v > 0:
+                disc = v
+    points = max(0, int(pts or 0))
+    discount = max(0, int(disc or 0))
+    return points, discount
+
+
+def _site_final_total_from_sources(
+    uid: int, meta: Optional[dict], pay_cur: str
+) -> Optional[int]:
+    """Итог с сайта после бонусов (finalTotal / cartGrandTotalRub и т.д.)."""
+    cur = str(pay_cur or "").strip().upper()
+    sources: List[dict] = []
+    if isinstance(meta, dict):
+        sources.append(meta)
+    b = USER_CART.get(int(uid))
+    if isinstance(b, dict):
+        sources.append(b)
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        if cur == "RUB":
+            for key in (
+                "cartGrandTotalRub",
+                "grandTotalRub",
+                "finalTotalRub",
+                "final_total_rub",
+                "totalRub",
+            ):
+                if key not in src:
+                    continue
+                v = _coerce_card_price_int(src.get(key))
+                if v > 0:
+                    return int(v)
+        if cur == "BYN":
+            for key in (
+                "cartGrandTotalByn",
+                "grandTotalByn",
+                "finalTotalByn",
+                "final_total_byn",
+                "totalByn",
+            ):
+                if key not in src:
+                    continue
+                v = _coerce_card_price_int(src.get(key))
+                if v > 0:
+                    return int(v)
+        for key in ("finalTotal", "final_total", "cartGrandTotal", "grandTotal"):
+            if key not in src:
+                continue
+            v = _coerce_card_price_int(src.get(key))
+            if v <= 0:
+                continue
+            hint_cur = _loyalty_hint_total_currency(src) or _infer_site_grand_total_currency(
+                src
+            )
+            if not hint_cur or hint_cur == cur:
+                return int(v)
+    return None
+
+
+def _merge_site_bonus_into_meta(uid: int, meta: Optional[dict]) -> dict:
+    out = deepcopy(meta) if isinstance(meta, dict) else {}
+    pts, disc = _site_bonus_from_sources(uid, out)
+    if pts > 0:
+        out["bonus_points_spent"] = int(pts)
+    if disc > 0:
+        out["bonus_applied"] = int(disc)
+    return out
+
+
+def _user_has_unpaid_order(uid: int) -> bool:
+    return _find_latest_unpaid_order_id(int(uid)) is not None
+
+
 def _resolve_site_confirm_pricing(
     uid: int,
     ud: dict,
@@ -4544,19 +4680,18 @@ def _resolve_site_confirm_pricing(
     }
     fin = _site_cart_checkout_finance(uid, list(lines), cc, ud)
     pay_cur = str(fin["g_cur"])
-    total = int(fin["grand_show"])
-    if isinstance(meta, dict):
-        try:
-            b_ap = int(meta.get("bonus_applied") or 0)
-        except (TypeError, ValueError):
-            b_ap = 0
-        if b_ap <= 0:
-            try:
-                b_ap = int(meta.get("bonus_points_spent") or 0)
-            except (TypeError, ValueError):
-                b_ap = 0
-        if b_ap > 0:
-            disc = _bonus_discount_units(b_ap, pay_cur)
+    goods = int(fin["goods"])
+    final_total = _site_final_total_from_sources(uid, meta, pay_cur)
+    if final_total and int(final_total) > 0 and _site_grand_covers_goods(int(final_total), goods):
+        total = int(final_total)
+    elif fin["from_site"]:
+        total = int(fin["grand_show"])
+    else:
+        total = int(fin["grand_show"])
+        pts, disc = _site_bonus_from_sources(uid, meta)
+        if disc <= 0 and pts > 0:
+            disc = _bonus_discount_units(pts, pay_cur)
+        if disc > 0:
             total = max(0, int(total) - int(disc))
     return int(total), pay_cur, drec
 
@@ -4906,6 +5041,7 @@ def _kb_payment_methods() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📱 Перевод", callback_data="pay_transfer"),
             ],
             [InlineKeyboardButton("₿ Крипта", callback_data="pay_crypto")],
+            [InlineKeyboardButton("❌ Отменить оплату", callback_data="pay_cancel")],
         ]
     )
 
@@ -5380,7 +5516,8 @@ def _format_login_site_cart_pending_text(
     d_cur = fin["d_cur"]
     inc = fin["inc"]
     use_site = fin["from_site"]
-    grand_show = fin["grand_show"]
+    meta = _merge_site_bonus_into_meta(uid, _get_site_pending_meta(uid))
+    grand_show, pay_cur, _ = _resolve_site_confirm_pricing(uid, {}, lines, meta)
     out: List[str] = []
     for x in lines:
         name_raw = str(x.get("name") or "—")
@@ -5393,10 +5530,17 @@ def _format_login_site_cart_pending_text(
         xcur = lc if lc in ("BYN", "RUB") else g_cur
         out.append(f"• {name} — {q} шт. × {p} {xcur} = {p * q} {xcur}")
     out.append("")
+    pts, disc = _site_bonus_from_sources(uid, meta)
+    if pts > 0 or disc > 0:
+        b_show = pts if pts > 0 else disc
+        out.append(f"⭐ Списано бонусов: {b_show}")
+        if disc > 0:
+            out.append(f"⭐ Скидка бонусами: {disc} {pay_cur}")
+        out.append("")
     site_gt_raw = _cart_get_site_grand_total(uid, g_cur)
     if inc and not site_gt_raw:
         out.append(f"🚚 Доставка: {d_label} (уже в сумме на сайте)")
-        out.append(f"💰 Итого: {grand_show} {g_cur}")
+        out.append(f"💰 Итого: {grand_show} {pay_cur}")
     elif use_site:
         out.append(f"🚚 Доставка: {d_label} (+{d_amt} {d_cur})")
         out.append(f"💰 Итого: {grand_show} {g_cur} (как на сайте)")
@@ -5409,7 +5553,7 @@ def _format_login_site_cart_pending_text(
     else:
         out.append(f"🚚 Доставка: {d_label} (+{d_amt} {d_cur})")
         out.append(f"💰 Товары: {goods} {g_cur}; доставка: {d_amt} {d_cur}")
-        out.append(f"💰 Итого: {grand_show} {g_cur}")
+        out.append(f"💰 Итого: {grand_show} {pay_cur}")
     foot_pv = _loyalty_cart_footer_lines(uid)
     if foot_pv:
         out.append("")
@@ -5479,7 +5623,7 @@ def _schedule_site_cart_confirm_prompt(bot, uid: int, *, intro_kind: str = "veri
     async def _job() -> None:
         if _user_state_get(int(uid), "awaiting_proof") is not None:
             return
-        if _user_state_get(int(uid), "awaiting_payment_order_id") is not None:
+        if _user_has_unpaid_order(int(uid)):
             return
         await _maybe_prompt_site_cart_confirmation(
             bot, int(uid), None, intro_kind=intro_kind
@@ -5501,6 +5645,8 @@ async def _maybe_prompt_site_cart_confirmation(
     """Если есть корзина с сайта — отправить превью с кнопками подтверждения."""
     if not uid:
         return False
+    if _user_has_unpaid_order(int(uid)):
+        return False
     lines = _cart_get_lines_uid(uid, user_data)
     preview = _get_site_pending_preview(int(uid))
     if not preview and lines:
@@ -5514,9 +5660,7 @@ async def _maybe_prompt_site_cart_confirmation(
         return False
     if not preview:
         return False
-    meta = _get_site_pending_meta(int(uid), user_data)
-    if not isinstance(meta, dict):
-        meta = {}
+    meta = _merge_site_bonus_into_meta(int(uid), _get_site_pending_meta(int(uid), user_data))
     if lines and not meta.get("items"):
         meta["items"] = deepcopy(lines)
     _persist_site_pending_order(int(uid), preview, meta, user_data)
@@ -8089,7 +8233,7 @@ def _message_looks_like_payment_step(text: str) -> bool:
 
 
 _BOT_CHECKOUT_CALLBACK_EXACT = frozenset(
-    {"pay_card", "pay_transfer", "pay_crypto", "paid"}
+    {"pay_card", "pay_transfer", "pay_crypto", "pay_cancel", "paid"}
 )
 _BOT_CHECKOUT_CALLBACK_PREFIXES = (
     "pay_",
@@ -8426,9 +8570,9 @@ async def _run_site_confirm_order(
                 ud.pop("payment_pending_method", None)
             else:
                 if acked and q.message:
-                    await q.message.reply_text(MSG_PAY_FINISH_CURRENT)
+                    await q.message.reply_text(MSG_PAY_ALREADY_OPEN)
                 else:
-                    await _callback_ack(q, MSG_PAY_FINISH_CURRENT, show_alert=True)
+                    await _callback_ack(q, MSG_PAY_ALREADY_OPEN, show_alert=True)
                 return
         lines = await _restore_cart_lines_for_confirm(uid_cb, ud, context)
         if not lines:
@@ -10395,6 +10539,39 @@ async def on_send_order_to_admin(
     users_touch(uid, "payment")
 
 
+async def on_payment_cancel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """pay_cancel — отмена шага оплаты, возврат корзины."""
+    q = update.callback_query
+    if not q or not q.from_user or not q.message:
+        return
+    if (q.data or "").strip() != "pay_cancel":
+        return
+    uid = int(q.from_user.id)
+    ud = context.user_data
+    await _callback_ack(q)
+    oid = _resolve_awaiting_payment_order_id(uid, ud)
+    if oid is not None:
+        o = ORDERS.get(int(oid))
+        if (
+            isinstance(o, dict)
+            and int(o.get("user_id") or 0) == int(uid)
+            and not o.get("paid")
+            and not o.get("payment_proof_submitted")
+        ):
+            o["status"] = "canceled"
+            _void_unpaid_pending_order_and_restore_checkout(uid, ud)
+    _clear_awaiting_payment_order_id(uid, ud)
+    save_state()
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await q.message.reply_text(MSG_PAY_CANCELLED, reply_markup=REPLY_KB)
+    users_touch(uid, "payment_cancel")
+
+
 async def on_payment_method(
     update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """pay_card | pay_transfer | pay_crypto — реквизиты и кнопка «Я оплатил»."""
@@ -11393,6 +11570,13 @@ def main() -> None:
 
     app.add_handler(
         TypeHandler(Update, track_user_activity, block=False),
+        group=-1,
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_payment_cancel,
+            pattern=re.compile(r"^pay_cancel$"),
+        ),
         group=-1,
     )
     app.add_handler(
