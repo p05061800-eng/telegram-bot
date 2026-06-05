@@ -1230,12 +1230,10 @@ async def _callback_ack(
 async def _answer_order_callback_stale(
     q: Optional[CallbackQuery], *, acked: bool = False
 ) -> None:
+    """Снять loading; без текста про «устаревшую кнопку» — только тихий ack."""
     if not q:
         return
-    if acked and q.message:
-        await q.message.reply_text(MSG_CALLBACK_STALE_ORDER)
-        return
-    await _callback_ack(q, MSG_CALLBACK_STALE_ORDER, show_alert=True)
+    await _callback_ack(q)
 
 
 def _cleanup_expired_login_codes() -> None:
@@ -8587,7 +8585,12 @@ def _infer_site_order_action_from_button_label(message: Optional[Message], data:
         low = text.lower()
         if "отмен" in low or "❌" in text:
             return "cancel"
-        if "подтверд" in low or "✅" in text:
+        # «Оплатить + 1200 RUB» — шаг оплаты, не confirm заказа с сайта.
+        if "оплат" in low and ("+" in text or "руб" in low or "byn" in low):
+            return None
+        if "подтверд" in low and "заказ" in low:
+            return "confirm"
+        if "подтверд" in low and "оплат" not in low:
             return "confirm"
     return None
 
@@ -8604,6 +8607,9 @@ def _infer_site_order_action_from_keyboard_layout(message: Optional[Message], da
             idx = i
             break
     if idx is None:
+        return None
+    btn_text = str(getattr(flat[idx], "text", None) or "").lower()
+    if _is_bot_checkout_payment_callback(want) or "оплат" in btn_text:
         return None
     if len(flat) == 2:
         return "cancel" if idx == 1 else "confirm"
@@ -8699,6 +8705,12 @@ def _is_bot_checkout_payment_callback(data: str) -> bool:
     if not d:
         return False
     if d in _BOT_CHECKOUT_CALLBACK_EXACT:
+        return True
+    if (
+        _RE_PAY_METHOD_CB.match(d)
+        or _RE_PAY_CANCEL_CB.match(d)
+        or _RE_PAID_CB.match(d)
+    ):
         return True
     low = d.lower()
     return any(low.startswith(p) for p in _BOT_CHECKOUT_CALLBACK_PREFIXES)
@@ -11126,22 +11138,36 @@ async def on_payment_method(
 async def on_payment_paid(
     update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """paid — подтверждение оплаты клиентом."""
+    log = logging.getLogger(__name__)
     q = update.callback_query
     if not q or not q.from_user or not q.data or not q.message:
         return
     if not _RE_PAID_CB.match((q.data or "").strip()):
         return
-    uid = q.from_user.id
-    ud = context.user_data
+    uid = int(q.from_user.id)
+    ud = context.user_data if isinstance(context.user_data, dict) else {}
     await _callback_ack(q)
     msg_txt = (q.message.text or q.message.caption or "") if q.message else ""
     oid = _resolve_payment_order_id(
         uid, ud, callback_data=q.data, message_text=msg_txt
     )
     if oid is None:
+        oid_cb = _oid_from_pay_callback(q.data)
+        if oid_cb is not None:
+            oid = int(oid_cb)
+            _bind_payment_order_session(uid, ud, oid)
+    if oid is None:
+        await q.message.reply_text(
+            "Не удалось открыть шаг со скрином. Нажмите «✅ Оплатить» на свежем сообщении с реквизитами.",
+            reply_markup=REPLY_KB,
+        )
         return
-    o = _ensure_order_in_orders(int(oid), int(uid))
-    if not o or int(o.get("user_id") or 0) != int(uid):
+    o = _resolve_proof_order_record(uid, int(oid), ud)
+    if not o or int(o.get("user_id") or 0) != uid:
+        await q.message.reply_text(
+            "Заказ не найден. Нажмите «✅ Оплатить» на сообщении с реквизитами ещё раз.",
+            reply_markup=REPLY_KB,
+        )
         return
     _refresh_unpaid_order_payment(
         o,
@@ -11299,8 +11325,18 @@ async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "photo",
             cap_log or "[фото]",
         )
-    if uid and _ensure_awaiting_proof_session(uid, ud) is not None:
-        await on_payment_proof_photo(update, context)
+    proof_oid = _ensure_awaiting_proof_session(uid, ud)
+    if uid and proof_oid is not None:
+        try:
+            await on_payment_proof_photo(update, context)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "on_payment_proof_photo uid=%s oid=%s", uid, proof_oid
+            )
+            try:
+                await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
+            except Exception:
+                pass
         return
     pp_oid = _user_state_get(uid, "postpaid_thread_oid")
     if uid and pp_oid is not None and not is_admin(uid):
@@ -12232,7 +12268,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_pick_category, pattern=re.compile(r"^c:(\d+|all)$")))
     app.add_handler(CallbackQueryHandler(on_callback_query_unhandled), group=99)
     app.add_handler(
-        MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_user_photo)
+        MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_user_photo),
+        group=-1,
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
