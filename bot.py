@@ -4688,14 +4688,20 @@ def _parse_grand_total_from_preview_text(text: str) -> Optional[Tuple[int, str]]
 
 def _order_payment_display(o: dict) -> Tuple[int, str]:
     """Сумма и валюта для шага оплаты — как сохранено в заказе при подтверждении."""
-    cur = _payment_currency_for_order(o)
+    pay_cur = str(o.get("payment_currency") or "").strip().upper()
+    if pay_cur not in ("BYN", "RUB"):
+        pay_cur = _payment_currency_for_order(o)
     try:
         stored = int(o.get("total") or 0)
     except (TypeError, ValueError):
         stored = 0
+    if stored > 0 and o.get("payment_total_locked"):
+        return int(stored), pay_cur
+    if stored > 0 and pay_cur in ("BYN", "RUB"):
+        return int(stored), pay_cur
     if stored > 0:
-        return int(stored), cur
-    return int(_order_resolved_grand_total(o)), cur
+        return int(stored), pay_cur
+    return int(_order_resolved_grand_total(o)), pay_cur
 
 
 def _user_has_unpaid_order(uid: int) -> bool:
@@ -4710,7 +4716,7 @@ def _resolve_site_confirm_pricing(
 ) -> Tuple[int, str, dict]:
     """Итог и валюта для шага оплаты — те же правила, что в превью корзины."""
     meta_m = _merge_site_bonus_into_meta(uid, meta if isinstance(meta, dict) else {})
-    cc = str(USER_PREF_DELIVERY_COUNTRY.get(uid) or "by").strip().lower()
+    cc = _cart_price_region_for_user(uid, ud)
     if cc not in DELIVERY_OPTIONS:
         cc = "by"
     dlabel, damount, dcur = DELIVERY_OPTIONS.get(cc, DELIVERY_OPTIONS["by"])
@@ -4868,12 +4874,132 @@ def _payment_currency_for_order(o: dict) -> str:
     return _goods_currency_for_delivery_country(cc)
 
 
+def _refresh_unpaid_order_payment(
+    o: dict,
+    uid: int,
+    ud: dict,
+    *,
+    preview_text: Optional[str] = None,
+    lines: Optional[List[dict]] = None,
+    meta: Optional[dict] = None,
+) -> Tuple[int, str]:
+    """Подтянуть итог/валюту оплаты из текущего превью (не из устаревшего ORDERS)."""
+    if not isinstance(o, dict):
+        return 0, "BYN"
+    total = 0
+    pay_cur = "BYN"
+    parsed: Optional[Tuple[int, str]] = None
+    for src in (preview_text, _get_site_pending_preview(uid)):
+        parsed = _parse_grand_total_from_preview_text(str(src or ""))
+        if parsed:
+            break
+    if parsed:
+        total, pay_cur = int(parsed[0]), str(parsed[1])
+    else:
+        meta_m = _merge_site_bonus_into_meta(uid, meta if isinstance(meta, dict) else {})
+        try:
+            locked = int(meta_m.get("preview_pay_total") or 0)
+        except (TypeError, ValueError):
+            locked = 0
+        locked_cur = str(meta_m.get("preview_pay_currency") or "").strip().upper()
+        if locked > 0 and locked_cur in ("BYN", "RUB"):
+            total, pay_cur = int(locked), locked_cur
+        elif lines:
+            total, pay_cur, drec = _resolve_site_confirm_pricing(
+                uid, ud, list(lines), meta_m
+            )
+            o["delivery"] = deepcopy(drec)
+            goods, _ = _cart_totals(list(lines))
+            o["items"] = deepcopy(list(lines))
+            o["total_goods"] = int(goods)
+        if isinstance(meta_m, dict):
+            try:
+                b_ap = int(meta_m.get("bonus_applied") or 0)
+            except (TypeError, ValueError):
+                b_ap = 0
+            if b_ap > 0:
+                o["bonus_applied"] = int(b_ap)
+            try:
+                b_ps = int(meta_m.get("bonus_points_spent") or 0)
+            except (TypeError, ValueError):
+                b_ps = 0
+            if b_ps > 0:
+                o["bonus_points_spent"] = int(b_ps)
+    if total > 0:
+        o["total"] = int(total)
+        o["payment_currency"] = str(pay_cur)
+        o["payment_total_locked"] = True
+    return int(o.get("total") or 0), str(o.get("payment_currency") or pay_cur)
+
+
+def _ensure_order_in_orders(oid: int, uid: int) -> Optional[dict]:
+    """ORDERS после рестарта: восстановить запись из USER_ORDERS по id."""
+    try:
+        oid_i = int(oid)
+        uid_i = int(uid)
+    except (TypeError, ValueError):
+        return None
+    o = ORDERS.get(oid_i)
+    if isinstance(o, dict) and int(o.get("user_id") or 0) == uid_i:
+        return o
+    for rec in USER_ORDERS.get(uid_i) or []:
+        if not isinstance(rec, dict):
+            continue
+        try:
+            rid = int(str(rec.get("id") or "0"))
+        except (TypeError, ValueError):
+            continue
+        if rid != oid_i:
+            continue
+        rebuilt: dict = {
+            "user_id": uid_i,
+            "items": deepcopy(list(rec.get("items") or [])),
+            "total": int(rec.get("total") or 0),
+            "delivery": deepcopy(rec.get("delivery") if isinstance(rec.get("delivery"), dict) else {}),
+            "status": "new",
+            "created_at": time.time(),
+            "paid": False,
+            "payment_proof_submitted": False,
+            "clear_cart_on_paid": True,
+        }
+        if rec.get("total_goods") is not None:
+            try:
+                rebuilt["total_goods"] = int(rec.get("total_goods"))
+            except (TypeError, ValueError):
+                pass
+        pc = str(rec.get("payment_currency") or "").strip().upper()
+        if pc in ("BYN", "RUB"):
+            rebuilt["payment_currency"] = pc
+        if rec.get("bonus_applied") is not None:
+            try:
+                rebuilt["bonus_applied"] = int(rec.get("bonus_applied"))
+            except (TypeError, ValueError):
+                pass
+        if rec.get("bonus_points_spent") is not None:
+            try:
+                rebuilt["bonus_points_spent"] = int(rec.get("bonus_points_spent"))
+            except (TypeError, ValueError):
+                pass
+        if rec.get("loyalty_earn_estimate") is not None:
+            try:
+                rebuilt["loyalty_earn_estimate"] = int(rec.get("loyalty_earn_estimate"))
+            except (TypeError, ValueError):
+                pass
+        ORDERS[oid_i] = rebuilt
+        return rebuilt
+    return o if isinstance(o, dict) else None
+
+
 async def _resend_active_payment_step(
     q: CallbackQuery,
     uid: int,
     ud: dict,
     oid: int,
     o: dict,
+    *,
+    preview_text: Optional[str] = None,
+    lines: Optional[List[dict]] = None,
+    meta: Optional[dict] = None,
 ) -> None:
     """Свежее сообщение с кнопками оплаты (в т.ч. «Отменить») для активного заказа."""
     if not q.message:
@@ -4882,7 +5008,9 @@ async def _resend_active_payment_step(
         await q.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    pay_cur = _payment_currency_for_order(o)
+    _refresh_unpaid_order_payment(
+        o, uid, ud, preview_text=preview_text, lines=lines, meta=meta
+    )
     tot, pay_cur = _order_payment_display(o)
     lo_est = o.get("loyalty_earn_estimate")
     body = (
@@ -5172,7 +5300,7 @@ def _resolve_payment_order_id(
     ):
         if oid_raw is None:
             continue
-        o = ORDERS.get(int(oid_raw))
+        o = _ensure_order_in_orders(int(oid_raw), int(uid))
         if (
             isinstance(o, dict)
             and int(o.get("user_id") or 0) == int(uid)
@@ -8706,11 +8834,15 @@ async def _run_site_confirm_order(
     order_text = (ud.get("pending_order") or "").strip()
     if not order_text and uid_cb:
         order_text = _get_site_pending_preview(uid_cb)
+    if q.message:
+        msg_from_btn = (q.message.text or q.message.caption or "").strip()
+        if msg_from_btn and _message_looks_like_order_preview(msg_from_btn):
+            order_text = msg_from_btn
     lines_peek = _cart_get_lines_uid(uid_cb, ud) if uid_cb else []
     if uid_cb and not lines_peek:
         lines_peek = await _restore_cart_lines_for_confirm(uid_cb, ud, context)
     if not order_text and lines_peek:
-        cc_peek = str(USER_PREF_DELIVERY_COUNTRY.get(uid_cb) or "by").strip()
+        cc_peek = _cart_price_region_for_user(uid_cb, ud)
         try:
             products_peek = await _get_products(context)
         except Exception:
@@ -8739,11 +8871,25 @@ async def _run_site_confirm_order(
                 return
         pend = _resolve_awaiting_payment_order_id(uid_cb, ud)
         if pend is not None:
-            po = ORDERS.get(int(pend))
+            po = _ensure_order_in_orders(int(pend), uid_cb) or ORDERS.get(int(pend))
             if not po or int(po.get("user_id") or 0) != int(uid_cb) or po.get("paid"):
                 _clear_awaiting_payment_order_id(uid_cb, ud)
             else:
-                await _resend_active_payment_step(q, uid_cb, ud, int(pend), po)
+                lines_peek = await _restore_cart_lines_for_confirm(uid_cb, ud, context)
+                meta_peek = _merge_site_bonus_into_meta(
+                    uid_cb, _get_site_pending_meta(uid_cb, ud)
+                )
+                await _resend_active_payment_step(
+                    q,
+                    uid_cb,
+                    ud,
+                    int(pend),
+                    po,
+                    preview_text=order_text,
+                    lines=lines_peek,
+                    meta=meta_peek,
+                )
+                save_state()
                 return
         lines = await _restore_cart_lines_for_confirm(uid_cb, ud, context)
         if not lines:
@@ -8823,6 +8969,7 @@ async def _run_site_confirm_order(
     ORDERS[int(oid)]["clear_cart_on_paid"] = True
     ORDERS[int(oid)]["total_goods"] = int(goods_total)
     ORDERS[int(oid)]["payment_currency"] = str(pay_cur)
+    ORDERS[int(oid)]["payment_total_locked"] = True
     save_state()
     _set_awaiting_payment_order_id(uid_cb, ud, int(oid))
     ud.pop("payment_pending_method", None)
@@ -10548,7 +10695,26 @@ async def on_send_order_to_admin(
         if po is None or int(po.get("user_id") or 0) != int(uid_chk) or po.get("paid"):
             _clear_awaiting_payment_order_id(uid_chk, ud)
         elif po is not None and not po.get("paid"):
-            await _resend_active_payment_step(q, int(uid_chk), ud, int(pend), po)
+            po = _ensure_order_in_orders(int(pend), int(uid_chk)) or po
+            lines_peek = (
+                await _restore_cart_lines_for_confirm(uid_chk, ud, context)
+                if uid_chk
+                else []
+            )
+            meta_peek = _merge_site_bonus_into_meta(
+                uid_chk, _get_site_pending_meta(uid_chk, ud)
+            )
+            await _resend_active_payment_step(
+                q,
+                int(uid_chk),
+                ud,
+                int(pend),
+                po,
+                preview_text=_get_site_pending_preview(uid_chk),
+                lines=lines_peek,
+                meta=meta_peek,
+            )
+            save_state()
             return
     lines: Optional[List[dict]] = ud.get("order_checkout")
     if not lines:
@@ -10725,7 +10891,7 @@ async def on_payment_cancel(
         uid, ud, callback_data=q.data, message_text=msg_txt
     )
     if oid is not None:
-        o = ORDERS.get(int(oid))
+        o = _ensure_order_in_orders(int(oid), int(uid))
         if (
             isinstance(o, dict)
             and int(o.get("user_id") or 0) == int(uid)
@@ -10766,7 +10932,7 @@ async def on_payment_method(
             reply_markup=REPLY_KB,
         )
         return
-    o = ORDERS.get(int(oid))
+    o = _ensure_order_in_orders(int(oid), int(uid))
     if not o or int(o.get("user_id") or 0) != int(uid):
         _clear_awaiting_payment_order_id(uid, ud)
         await q.message.reply_text(
@@ -10774,6 +10940,15 @@ async def on_payment_method(
             reply_markup=REPLY_KB,
         )
         return
+    _refresh_unpaid_order_payment(
+        o,
+        int(uid),
+        ud,
+        preview_text=_get_site_pending_preview(int(uid)),
+        lines=_cart_get_lines_uid(int(uid), ud),
+        meta=_get_site_pending_meta(int(uid), ud),
+    )
+    save_state()
     if o.get("paid"):
         return
     if o.get("payment_proof_submitted") and not o.get("paid"):
@@ -10820,9 +10995,18 @@ async def on_payment_paid(
     )
     if oid is None:
         return
-    o = ORDERS.get(oid)
+    o = _ensure_order_in_orders(int(oid), int(uid))
     if not o or int(o.get("user_id") or 0) != int(uid):
         return
+    _refresh_unpaid_order_payment(
+        o,
+        int(uid),
+        ud,
+        preview_text=_get_site_pending_preview(int(uid)),
+        lines=_cart_get_lines_uid(int(uid), ud),
+        meta=_get_site_pending_meta(int(uid), ud),
+    )
+    save_state()
     if o.get("paid"):
         await q.message.reply_text(MSG_ORDER_ALREADY_PAID_TOAST, reply_markup=REPLY_KB)
         return
