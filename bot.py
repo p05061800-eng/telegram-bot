@@ -938,6 +938,17 @@ def _apply_post_deploy_session_reset(uid: int, user_data: dict) -> None:
             user_data["awaiting_payment_order_id"] = int(pend)
         else:
             _user_state_pop(uid, "awaiting_payment_order_id")
+    proof = _user_state_get(uid, "awaiting_proof")
+    if proof is not None:
+        po = ORDERS.get(int(proof))
+        if (
+            isinstance(po, dict)
+            and int(po.get("user_id") or 0) == int(uid)
+            and not po.get("paid")
+        ):
+            pass
+        else:
+            _user_state_pop(uid, "awaiting_proof")
     t_task = user_data.get("tinder_autoplay_task")
     if isinstance(t_task, asyncio.Task) and not t_task.done():
         try:
@@ -5317,6 +5328,66 @@ def _stub_order_for_payment_step(oid: int, uid: int, message_text: str) -> dict:
         "payment_currency": str(pay_cur),
         "payment_total_locked": bool(int(total) > 0),
     }
+
+
+def _image_file_id_from_message(msg: Optional[Message]) -> Optional[str]:
+    """file_id фото или картинки, присланной как документ."""
+    if not msg:
+        return None
+    if msg.photo:
+        return str(msg.photo[-1].file_id)
+    doc = msg.document
+    if doc and str(doc.mime_type or "").lower().startswith("image/"):
+        return str(doc.file_id)
+    return None
+
+
+def _resolve_proof_order_record(
+    uid: int, oid: int, ud: Optional[dict] = None
+) -> Optional[dict]:
+    """Заказ для чека: ORDERS → USER_ORDERS → минимальная запись."""
+    try:
+        oid_i = int(oid)
+        uid_i = int(uid)
+    except (TypeError, ValueError):
+        return None
+    o = _ensure_order_in_orders(oid_i, uid_i)
+    if isinstance(o, dict) and int(o.get("user_id") or 0) == uid_i:
+        if isinstance(ud, dict):
+            pm = ud.get("payment_pending_method")
+            if pm and not o.get("payment_pending_method"):
+                o["payment_pending_method"] = pm
+        return o
+    stub: dict = {
+        "user_id": uid_i,
+        "items": [],
+        "total": 0,
+        "delivery": {},
+        "status": "new",
+        "created_at": time.time(),
+        "paid": False,
+        "payment_proof_submitted": False,
+        "clear_cart_on_paid": True,
+    }
+    if isinstance(ud, dict):
+        pm = ud.get("payment_pending_method")
+        if pm:
+            stub["payment_pending_method"] = pm
+    ORDERS[oid_i] = stub
+    return stub
+
+
+def _ensure_awaiting_proof_session(uid: int, ud: Optional[dict] = None) -> Optional[int]:
+    """awaiting_proof: user_states → активный неоплаченный заказ."""
+    ap = _user_state_get(uid, "awaiting_proof")
+    if ap is not None:
+        return int(ap)
+    ud_d = ud if isinstance(ud, dict) else {}
+    oid = _resolve_awaiting_payment_order_id(uid, ud_d)
+    if oid is not None:
+        _user_state_bucket(uid)["awaiting_proof"] = int(oid)
+        return int(oid)
+    return None
 
 
 def _bind_payment_order_session(uid: int, ud: dict, oid: int) -> None:
@@ -11118,6 +11189,12 @@ async def on_payment_paid(
     await q.message.reply_text(
         PAY_PROOF_REQUEST, reply_markup=_kb_proof_step_back()
     )
+    try:
+        save_state()
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "on_payment_paid save_state uid=%s oid=%s", uid, oid
+        )
 
 
 async def _send_or_edit_admin_payment_proof(
@@ -11208,11 +11285,12 @@ async def _forward_support_photo_to_admin(
 
 
 async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Фото: скрин оплаты (awaiting_proof), данные к заказу после оплаты (postpaid_thread), иначе «Связь»."""
+    """Фото/картинка: скрин оплаты (awaiting_proof), postpaid_thread, иначе «Связь»."""
     msg = update.effective_message
-    if not msg or not msg.photo:
+    if not msg or not _image_file_id_from_message(msg):
         return
     uid = msg.from_user.id if msg.from_user else 0
+    ud = context.user_data if isinstance(context.user_data, dict) else {}
     if uid:
         cap_log = (msg.caption or "").strip()
         _remember_user_message(
@@ -11221,7 +11299,7 @@ async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "photo",
             cap_log or "[фото]",
         )
-    if uid and _user_state_get(uid, "awaiting_proof") is not None:
+    if uid and _ensure_awaiting_proof_session(uid, ud) is not None:
         await on_payment_proof_photo(update, context)
         return
     pp_oid = _user_state_get(uid, "postpaid_thread_oid")
@@ -11258,45 +11336,73 @@ async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         else:
             await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
         return
+    if uid:
+        try:
+            await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
+        except Exception:
+            pass
 
 
 async def on_payment_proof_photo(
     update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Фото-скрин оплаты при awaiting_proof; оплата у заказа — после подтверждения админом."""
+    log = logging.getLogger(__name__)
     msg = update.effective_message
-    if not msg or not msg.photo:
+    file_id = _image_file_id_from_message(msg)
+    if not msg or not file_id:
         return
-    ud = context.user_data
+    ud = context.user_data if isinstance(context.user_data, dict) else {}
     uid = msg.from_user.id if msg.from_user else 0
-    oid_raw = _user_state_get(uid, "awaiting_proof")
-    if oid_raw is None:
-        return
     if not uid:
+        return
+    oid_raw = _ensure_awaiting_proof_session(uid, ud)
+    if oid_raw is None:
+        await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
         return
     try:
         oid = int(oid_raw)
     except (TypeError, ValueError):
         _user_state_pop(uid, "awaiting_proof")
+        await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
         return
-    o = ORDERS.get(oid)
+    o = _resolve_proof_order_record(uid, oid, ud)
     if not o or int(o.get("user_id") or 0) != int(uid):
         _user_state_pop(uid, "awaiting_proof")
+        await msg.reply_text(
+            "Не удалось привязать чек к заказу. Нажмите «✅ Оплатить» на шаге оплаты и пришлите скрин снова.",
+            reply_markup=REPLY_KB,
+        )
         return
     if o.get("paid"):
         _user_state_pop(uid, "awaiting_proof")
         await msg.reply_text(MSG_ORDER_ALREADY_PAID_SKIP_PROOF)
         return
+    if o.get("payment_proof_submitted") and not o.get("paid"):
+        await msg.reply_text(PAY_PROOF_WAIT)
+        return
     _clear_crypto_auto_watch(o, uid)
-    file_id = msg.photo[-1].file_id
     cap = _format_payment_proof_caption(oid, o, uid)
-    ok = await _send_or_edit_admin_payment_proof(context, oid, o, file_id, cap)
+    try:
+        ok = await _send_or_edit_admin_payment_proof(context, oid, o, file_id, cap)
+    except Exception:
+        log.exception("payment_proof_photo admin send uid=%s oid=%s", uid, oid)
+        ok = False
     if not ok:
         await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL)
         return
     o["payment_proof_submitted"] = True
     o["proof_file_id"] = file_id
     _user_state_pop(uid, "awaiting_proof")
-    await msg.reply_text(PAY_PROOF_WAIT)
+    _clear_awaiting_payment_order_id(uid, ud)
+    try:
+        save_state()
+    except Exception:
+        log.exception("payment_proof_photo save_state uid=%s oid=%s", uid, oid)
+    await msg.reply_text(
+        "✅ Скрин получен и передан администратору.\n\n" + PAY_PROOF_WAIT,
+        reply_markup=REPLY_KB,
+    )
+    log.info("payment_proof_photo ok uid=%s oid=%s", uid, oid)
 
 
 async def on_admin_confirm_payment(
@@ -12125,7 +12231,9 @@ def main() -> None:
     )
     app.add_handler(CallbackQueryHandler(on_pick_category, pattern=re.compile(r"^c:(\d+|all)$")))
     app.add_handler(CallbackQueryHandler(on_callback_query_unhandled), group=99)
-    app.add_handler(MessageHandler(filters.PHOTO, on_user_photo))
+    app.add_handler(
+        MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_user_photo)
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     # Краткие сбои Telegram / наложение деплоев: повторить bootstrap (delete_webhook и т.д.).
