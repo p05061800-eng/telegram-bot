@@ -841,6 +841,17 @@ def _proof_order_owned_by_user(uid: int, oid: int) -> bool:
         if existing.get("paid"):
             return False
         return True
+    for raw in (
+        _user_state_get(uid_i, "awaiting_proof"),
+        _user_state_get(uid_i, "awaiting_payment_order_id"),
+    ):
+        if raw is None:
+            continue
+        try:
+            if int(raw) == oid_i:
+                return True
+        except (TypeError, ValueError):
+            continue
     o = _ensure_order_in_orders(oid_i, uid_i)
     return (
         isinstance(o, dict)
@@ -11586,6 +11597,31 @@ async def _forward_support_photo_to_admin(
             return False
 
 
+_PROOF_MEDIA_FILTER = (
+    filters.PHOTO | filters.Document.ALL | filters.ANIMATION | filters.VIDEO
+)
+
+
+async def route_customer_media_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Явный роутер фото/картинок — MessageHandler иногда не срабатывает на Render."""
+    msg = update.message
+    if not msg or not msg.from_user:
+        return
+    if not _image_file_id_from_message(msg):
+        return
+    logging.getLogger(__name__).info(
+        "media_route uid=%s msg_id=%s photo=%s doc=%s",
+        msg.from_user.id,
+        msg.message_id,
+        bool(msg.photo),
+        bool(msg.document),
+    )
+    await on_user_photo(update, context)
+    raise ApplicationHandlerStop
+
+
 async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Фото/картинка: скрин оплаты (awaiting_proof), postpaid_thread, иначе «Связь»."""
     log = logging.getLogger(__name__)
@@ -11634,8 +11670,33 @@ async def _on_user_photo_body(
             )
         return
     proof_oid = _resolve_proof_order_id_for_photo(uid, ud) if uid else None
-    if uid and proof_oid is not None and file_id_peek:
-        await on_payment_proof_photo(update, context)
+    if uid and file_id_peek:
+        if proof_oid is not None:
+            await on_payment_proof_photo(update, context)
+            return
+        sess_raw = (
+            _user_state_get(uid, "awaiting_proof")
+            or ud.get("awaiting_proof")
+            or _user_state_get(uid, "awaiting_payment_order_id")
+            or ud.get("awaiting_payment_order_id")
+        )
+        if sess_raw is not None:
+            try:
+                if isinstance(ud, dict):
+                    ud["awaiting_proof"] = int(sess_raw)
+                _user_state_set(uid, "awaiting_proof", int(sess_raw), persist=False)
+            except (TypeError, ValueError):
+                pass
+            else:
+                await on_payment_proof_photo(update, context)
+                return
+        if _find_latest_unpaid_order_id(uid) is not None:
+            await on_payment_proof_photo(update, context)
+            return
+        await msg.reply_text(
+            "Сначала нажмите «✅ Оплатить» на сообщении с реквизитами, затем пришлите скрин.",
+            reply_markup=REPLY_KB,
+        )
         return
     pp_oid = _user_state_get(uid, "postpaid_thread_oid")
     if uid and pp_oid is not None and not is_admin(uid):
@@ -11671,8 +11732,6 @@ async def _on_user_photo_body(
         else:
             await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
         return
-    if uid:
-        await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
 
 
 async def on_payment_flow_non_text(
@@ -11683,6 +11742,7 @@ async def on_payment_flow_non_text(
     if not msg or not msg.from_user or msg.text:
         return
     if _image_file_id_from_message(msg):
+        await on_user_photo(update, context)
         return
     uid = int(msg.from_user.id)
     ud = context.user_data if isinstance(context.user_data, dict) else {}
@@ -11692,11 +11752,6 @@ async def on_payment_flow_non_text(
         "Пришлите скрин оплаты как фото или картинку (PNG/JPG), не стикер и не PDF.",
         reply_markup=REPLY_KB,
     )
-
-
-_PROOF_MEDIA_FILTER = (
-    filters.PHOTO | filters.Document.ALL | filters.ANIMATION | filters.VIDEO
-)
 
 
 async def on_payment_proof_photo(
@@ -11716,6 +11771,10 @@ async def on_payment_proof_photo(
     uid = msg.from_user.id if msg.from_user else 0
     if not uid:
         return
+    try:
+        await msg.reply_text("⏳ Получили скрин, передаём администратору…", reply_markup=REPLY_KB)
+    except Exception:
+        log.exception("payment_proof_photo early ack uid=%s", uid)
     oid_raw = _resolve_proof_order_id_for_photo(uid, ud)
     if oid_raw is None:
         await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
@@ -11761,7 +11820,7 @@ async def on_payment_proof_photo(
         await msg.reply_text(PAY_PROOF_WAIT)
         return
     await msg.reply_text(
-        "✅ Скрин получен и передан администратору.\n\n" + PAY_PROOF_WAIT,
+        "✅ Скрин передан администратору.\n\n" + PAY_PROOF_WAIT,
         reply_markup=REPLY_KB,
     )
     _clear_crypto_auto_watch(o, uid, persist=False)
@@ -11792,6 +11851,10 @@ async def on_payment_proof_photo(
         _set_awaiting_proof_session(uid, ud, int(oid))
         await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
         return
+    try:
+        await msg.reply_text("✅ " + PAY_PROOF_WAIT, reply_markup=REPLY_KB)
+    except Exception:
+        pass
     uname = getattr(msg.from_user, "username", None) if msg.from_user else None
     try:
         _remember_user_message(
@@ -12475,6 +12538,10 @@ def main() -> None:
 
     app.add_handler(
         TypeHandler(Update, track_user_activity, block=False),
+        group=-1,
+    )
+    app.add_handler(
+        TypeHandler(Update, route_customer_media_message, block=False),
         group=-1,
     )
     app.add_handler(
