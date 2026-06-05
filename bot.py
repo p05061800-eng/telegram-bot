@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-06-proof-v7"
+BOT_BUILD_ID = "2026-06-06-proof-v8"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -11754,12 +11754,34 @@ async def on_payment_paid(
         )
 
 
+def _admin_target_chat_ids() -> set:
+    ids: set = set()
+    for raw in _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else []):
+        if isinstance(raw, int) and int(raw) > 0:
+            ids.add(int(raw))
+    return ids
+
+
+def _proof_stored_in_current_admin_chat(o: dict) -> bool:
+    """Чек уже лежит у текущего админа (не у прошлого chat_id)."""
+    cid = o.get("payment_proof_admin_chat_id")
+    mid = o.get("payment_proof_admin_message_id")
+    if cid is None or mid is None:
+        return False
+    try:
+        return int(cid) in _admin_target_chat_ids()
+    except (TypeError, ValueError):
+        return False
+
+
 async def _send_or_edit_admin_payment_proof(
     context: ContextTypes.DEFAULT_TYPE,
     order_id: int,
     o: dict,
     file_id: str,
     caption: str,
+    *,
+    customer_msg: Optional[Message] = None,
 ) -> bool:
     """Сообщение админу со скрином и кнопками подтверждения; при повторной отправке — edit."""
     log = logging.getLogger(__name__)
@@ -11771,6 +11793,7 @@ async def _send_or_edit_admin_payment_proof(
     if not targets:
         log.error("payment proof: admin targets empty order_id=%s", order_id)
         return False
+    target_ids = _admin_target_chat_ids()
     folder_cid, folder_mid = await _ensure_customer_admin_folder(
         context,
         cust_uid,
@@ -11780,21 +11803,37 @@ async def _send_or_edit_admin_payment_proof(
     mid = o.get("payment_proof_admin_message_id")
     if cid is not None and mid is not None:
         try:
-            await context.bot.edit_message_media(
-                chat_id=int(cid),
-                message_id=int(mid),
-                media=InputMediaPhoto(media=file_id, caption=caption),
-                reply_markup=kb,
-            )
+            cid_i = int(cid)
+        except (TypeError, ValueError):
+            cid_i = None
+        if cid_i is None or cid_i not in target_ids:
             log.info(
-                "payment proof edited admin chat=%s msg=%s order_id=%s",
+                "payment proof stale admin chat=%s targets=%s order_id=%s — resend",
                 cid,
-                mid,
+                sorted(target_ids),
                 order_id,
             )
-            return True
-        except Exception as e:
-            log.info("payment proof edit_media order_id=%s: %s", order_id, e)
+            o.pop("payment_proof_admin_chat_id", None)
+            o.pop("payment_proof_admin_message_id", None)
+        else:
+            try:
+                await context.bot.edit_message_media(
+                    chat_id=cid_i,
+                    message_id=int(mid),
+                    media=InputMediaPhoto(media=file_id, caption=caption),
+                    reply_markup=kb,
+                )
+                log.info(
+                    "payment proof edited admin chat=%s msg=%s order_id=%s",
+                    cid_i,
+                    mid,
+                    order_id,
+                )
+                return True
+            except Exception as e:
+                log.info("payment proof edit_media order_id=%s: %s", order_id, e)
+                o.pop("payment_proof_admin_chat_id", None)
+                o.pop("payment_proof_admin_message_id", None)
     sent = None
     for tgt in targets:
         for with_reply in (True, False):
@@ -11857,6 +11896,36 @@ async def _send_or_edit_admin_payment_proof(
             except Exception:
                 log.exception(
                     "payment proof fallback target=%s order_id=%s uid=%s",
+                    tgt,
+                    order_id,
+                    cust_uid,
+                )
+    if sent is None and customer_msg is not None:
+        for tgt in targets:
+            try:
+                fwd = await context.bot.forward_message(
+                    chat_id=tgt,
+                    from_chat_id=int(customer_msg.chat_id),
+                    message_id=int(customer_msg.message_id),
+                )
+                await context.bot.send_message(
+                    chat_id=tgt,
+                    text=caption[:4090],
+                    reply_markup=kb,
+                    reply_to_message_id=int(fwd.message_id),
+                )
+                sent = fwd
+                log.info(
+                    "payment proof forward target=%s order_id=%s uid=%s msg=%s",
+                    tgt,
+                    order_id,
+                    cust_uid,
+                    fwd.message_id,
+                )
+                break
+            except Exception:
+                log.exception(
+                    "payment proof forward target=%s order_id=%s uid=%s",
                     tgt,
                     order_id,
                     cust_uid,
@@ -12084,6 +12153,11 @@ async def on_payment_proof_photo(
         return
     oid_raw = _resolve_proof_order_id_for_photo(uid, ud)
     if oid_raw is None:
+        latest = _find_latest_unpaid_order_id(uid)
+        if latest is not None:
+            _set_awaiting_proof_session(uid, ud, int(latest))
+            oid_raw = int(latest)
+    if oid_raw is None:
         await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
         return
     try:
@@ -12123,9 +12197,23 @@ async def on_payment_proof_photo(
         o.get("payment_proof_submitted")
         and not o.get("paid")
         and o.get("payment_proof_admin_message_id")
+        and _proof_stored_in_current_admin_chat(o)
     ):
         await msg.reply_text(PAY_PROOF_WAIT)
         return
+    if (
+        o.get("payment_proof_submitted")
+        and not o.get("paid")
+        and not _proof_stored_in_current_admin_chat(o)
+    ):
+        log.info(
+            "payment proof resend to current admin uid=%s oid=%s old_chat=%s",
+            uid,
+            oid,
+            o.get("payment_proof_admin_chat_id"),
+        )
+        o.pop("payment_proof_admin_chat_id", None)
+        o.pop("payment_proof_admin_message_id", None)
     _clear_crypto_auto_watch(o, uid, persist=False)
     try:
         await msg.reply_text(
@@ -12146,7 +12234,9 @@ async def on_payment_proof_photo(
     ok = False
     try:
         ok = await asyncio.wait_for(
-            _send_or_edit_admin_payment_proof(context, oid, o, file_id, cap),
+            _send_or_edit_admin_payment_proof(
+                context, oid, o, file_id, cap, customer_msg=msg
+            ),
             timeout=25.0,
         )
     except asyncio.TimeoutError:
