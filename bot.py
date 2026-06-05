@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-06-admin-6625567547"
+BOT_BUILD_ID = "2026-06-06-orders-v6"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -1151,7 +1151,12 @@ MSG_CALLBACK_STALE_ORDER = (
     "Отправьте /start или откройте ссылку с сайта ещё раз."
 )
 MSG_CALLBACK_UNKNOWN_ORDER_BUTTON = (
-    "Не удалось обработать кнопку. Откройте заказ снова с сайта или отправьте /start."
+    "Не удалось обработать кнопку. Откройте /admin → «Новые заказы» "
+    "или попросите клиента оформить заказ заново."
+)
+MSG_ADMIN_ORDER_STALE = (
+    "Заказ #{oid} не найден в памяти бота (после перезапуска).\n\n"
+    "Откройте /admin → «Новые заказы» или попросите клиента оформить заказ заново."
 )
 MSG_CONFIRM_ORDER_ERROR = (
     "Не удалось подтвердить заказ. Попробуйте /start или откройте заказ с сайта ещё раз."
@@ -5065,6 +5070,115 @@ def _restore_order_by_id(oid: int) -> Optional[dict]:
     return None
 
 
+_RE_ADMIN_CARD_ORDER_ID = re.compile(
+    r"(?:📦\s*Заказ\s*#|Чек\s+оплаты\s*·\s*Заказ\s*#|Заказ\s*#)(\d+)",
+    re.IGNORECASE,
+)
+_RE_ADMIN_CARD_USER_ID = re.compile(r"🆔\s*id:\s*(\d+)", re.IGNORECASE)
+_RE_ADMIN_CARD_PAY_TOTAL = re.compile(
+    r"💰\s*К\s*оплате:\s*(\d+)\s*(BYN|RUB)", re.IGNORECASE
+)
+_RE_ADMIN_CARD_STATUS = re.compile(r"📊\s*Статус:\s*(.+)", re.IGNORECASE)
+_RE_ADMIN_CARD_USERNAME = re.compile(r"👤\s*Пользователь:\s*(@?\S+)", re.IGNORECASE)
+
+
+def _message_looks_like_admin_order_card(text: str) -> bool:
+    t = str(text or "")
+    return bool(_RE_ADMIN_CARD_ORDER_ID.search(t) and _RE_ADMIN_CARD_USER_ID.search(t))
+
+
+def _admin_status_key_from_ru(label: str) -> str:
+    s = str(label or "").strip().lower()
+    for ru, key in (
+        ("новый", "new"),
+        ("принят", "accepted"),
+        ("отправлен", "shipped"),
+        ("заверш", "done"),
+        ("отмен", "canceled"),
+    ):
+        if ru in s:
+            return key
+    return "new"
+
+
+def _rebuild_order_from_admin_card_text(oid: int, text: str) -> Optional[dict]:
+    """Восстановить заказ из текста карточки админа после рестарта бота."""
+    t = str(text or "")
+    if not _message_looks_like_admin_order_card(t):
+        return None
+    uid_m = _RE_ADMIN_CARD_USER_ID.search(t)
+    if not uid_m:
+        return None
+    try:
+        uid_i = int(uid_m.group(1))
+    except (TypeError, ValueError):
+        return None
+    uname = ""
+    un_m = _RE_ADMIN_CARD_USERNAME.search(t)
+    if un_m:
+        uname = str(un_m.group(1) or "").strip().lstrip("@")
+    total = 0
+    pay_cur = "BYN"
+    pay_m = _RE_ADMIN_CARD_PAY_TOTAL.search(t)
+    if pay_m:
+        try:
+            total = int(pay_m.group(1))
+        except (TypeError, ValueError):
+            pass
+        pay_cur = str(pay_m.group(2) or "BYN").upper()
+    st = "new"
+    st_m = _RE_ADMIN_CARD_STATUS.search(t)
+    if st_m:
+        st = _admin_status_key_from_ru(st_m.group(1))
+    is_proof = "📸" in t and "Чек оплаты" in t
+    rebuilt: dict = {
+        "user_id": uid_i,
+        "username": uname,
+        "items": [],
+        "total": total,
+        "payment_currency": pay_cur,
+        "delivery": {},
+        "status": st,
+        "created_at": time.time(),
+        "paid": False,
+        "payment_proof_submitted": is_proof,
+        "clear_cart_on_paid": True,
+    }
+    ORDERS[int(oid)] = rebuilt
+    return rebuilt
+
+
+def _restore_order_for_admin(q: CallbackQuery, oid: int) -> Optional[dict]:
+    """ORDERS / USER_ORDERS или текст карточки в чате админа."""
+    o = _restore_order_by_id(oid)
+    if o:
+        return o
+    msg = q.message
+    if not msg:
+        return None
+    text = (msg.text or msg.caption or "").strip()
+    o = _rebuild_order_from_admin_card_text(oid, text)
+    if not o:
+        return None
+    o["admin_chat_id"] = int(msg.chat_id)
+    o["admin_message_id"] = int(msg.message_id)
+    if "📸" in text and "Чек оплаты" in text:
+        o["payment_proof_submitted"] = True
+        o["payment_proof_admin_chat_id"] = int(msg.chat_id)
+        o["payment_proof_admin_message_id"] = int(msg.message_id)
+    save_state()
+    return o
+
+
+async def _reply_admin_order_stale(q: CallbackQuery, oid: int) -> None:
+    try:
+        await q.answer("Заказ не найден", show_alert=True)
+    except Exception:
+        pass
+    if q.message:
+        await q.message.reply_text(MSG_ADMIN_ORDER_STALE.format(oid=int(oid)))
+
+
 def _ensure_order_in_orders(oid: int, uid: int) -> Optional[dict]:
     """ORDERS после рестарта: восстановить запись из USER_ORDERS по id."""
     try:
@@ -5277,10 +5391,10 @@ def _format_payment_proof_caption(order_id: int, o: dict, uid: int) -> str:
 
 
 def _admin_order_notify_targets() -> List[object]:
-    """Куда слать заказы и чеки — только из env, без захардкоженного id."""
+    """Куда слать заказы и чеки — из env (ORDER_NOTIFY, ADMIN_ID, ADMIN_CHAT)."""
     out: List[object] = []
     seen: set = set()
-    for raw in (ORDER_NOTIFY_TARGET, _resolve_admin_chat_id()):
+    for raw in (ORDER_NOTIFY_TARGET, ADMIN_ID, _resolve_admin_chat_id()):
         if raw is None or raw == "" or raw == 0:
             continue
         if isinstance(raw, int):
@@ -8926,6 +9040,8 @@ def _message_looks_like_order_preview(text: str) -> bool:
     t = str(text or "")
     if not t.strip():
         return False
+    if _message_looks_like_admin_order_card(t):
+        return False
     if _message_looks_like_payment_step(t):
         return False
     markers = (
@@ -9476,7 +9592,7 @@ async def on_callback_query_unhandled(
     if not q.message:
         return
     if re.match(
-        r"^(accept|sent|cancel|done|delmsg|confirm_payment|reject_payment|oam:rep)_",
+        r"^(accept|sent|cancel|done|delmsg|confirm_payment|reject_payment|oam:rep)[:_]",
         data,
     ):
         return
@@ -9977,19 +10093,17 @@ async def on_admin_open_order(
     except ValueError:
         await q.answer()
         return
-    o = _restore_order_by_id(oid)
+    o = _restore_order_for_admin(q, oid)
     if not o:
-        try:
-            await q.answer("Заказ не найден", show_alert=False)
-        except Exception:
-            pass
-        return
+        await _reply_admin_order_stale(q, oid)
+        raise ApplicationHandlerStop
     await q.answer()
     st = str(o.get("status") or "new")
     await q.message.reply_text(
         _format_admin_order_detail_text(oid, o),
         reply_markup=_kb_order_admin_actions(oid, st),
     )
+    raise ApplicationHandlerStop
 
 
 async def on_order_admin_action(
@@ -10008,13 +10122,10 @@ async def on_order_admin_action(
     except ValueError:
         await q.answer()
         return
-    o = _restore_order_by_id(oid)
+    o = _restore_order_for_admin(q, oid)
     if not o:
-        try:
-            await q.answer("Заказ не найден", show_alert=False)
-        except Exception:
-            pass
-        return
+        await _reply_admin_order_stale(q, oid)
+        raise ApplicationHandlerStop
     context.user_data.pop("reply_support_user_id", None)
     context.user_data["reply_to"] = oid
     await q.answer()
@@ -10022,6 +10133,7 @@ async def on_order_admin_action(
     if cust:
         await _send_customer_plain(context.bot, cust, ADMIN_TYPING_NOTICE)
     await q.message.reply_text(MSG_REPLY_MODE_ACTIVE)
+    raise ApplicationHandlerStop
 
 
 async def on_support_reply_activate(
@@ -10115,16 +10227,13 @@ async def on_order_status_buttons(
     except ValueError:
         await q.answer()
         return
-    o = _restore_order_by_id(oid)
+    o = _restore_order_for_admin(q, oid)
     if not o:
-        try:
-            await q.answer("Заказ не найден", show_alert=False)
-        except Exception:
-            pass
-        return
+        await _reply_admin_order_stale(q, oid)
+        raise ApplicationHandlerStop
     if action == "delmsg":
         await _admin_delete_order_chat_message(context, q, oid)
-        return
+        raise ApplicationHandlerStop
     want = {
         "accept": "accepted",
         "sent": "shipped",
@@ -10156,6 +10265,7 @@ async def on_order_status_buttons(
     notice = _format_customer_order_status_notice(oid, str(o.get("status") or ""))
     await _notify_order_customer(context, o, notice)
     await _refresh_admin_order_message(context, oid)
+    raise ApplicationHandlerStop
 
 
 async def catalog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -11911,6 +12021,13 @@ async def on_payment_proof_photo(
         return
     _clear_crypto_auto_watch(o, uid, persist=False)
     try:
+        await msg.reply_text(
+            "⏳ Получили скрин, передаём администратору…",
+            reply_markup=REPLY_KB,
+        )
+    except Exception:
+        log.exception("payment_proof_photo ack uid=%s oid=%s", uid, oid)
+    try:
         cap = _format_payment_proof_caption(oid, o, uid)
     except Exception:
         log.exception("payment_proof_photo caption uid=%s oid=%s", uid, oid)
@@ -11974,10 +12091,10 @@ async def on_admin_confirm_payment(
     except ValueError:
         await q.answer()
         return
-    o = _restore_order_by_id(oid)
+    o = _restore_order_for_admin(q, oid)
     if not o:
-        await q.answer()
-        return
+        await _reply_admin_order_stale(q, oid)
+        raise ApplicationHandlerStop
     if o.get("paid"):
         try:
             await q.answer()
@@ -12019,6 +12136,8 @@ async def on_admin_confirm_payment(
             context.bot, cust, _postpaid_shipping_prompt_for_order(o)
         )
         _user_state_set(cust, "postpaid_thread_oid", int(oid))
+    save_state()
+    raise ApplicationHandlerStop
 
 
 async def on_receipt_callback(
@@ -12069,10 +12188,10 @@ async def on_admin_reject_payment(
     except ValueError:
         await q.answer()
         return
-    o = _restore_order_by_id(oid)
+    o = _restore_order_for_admin(q, oid)
     if not o:
-        await q.answer()
-        return
+        await _reply_admin_order_stale(q, oid)
+        raise ApplicationHandlerStop
     if o.get("paid"):
         try:
             await q.answer()
@@ -12109,6 +12228,8 @@ async def on_admin_reject_payment(
         )
     except Exception:
         pass
+    save_state()
+    raise ApplicationHandlerStop
 
 
 def _norm_search(s: str) -> str:
