@@ -824,7 +824,33 @@ def _clear_awaiting_payment_order_id(
         _user_state_pop(uid, "awaiting_payment_order_id", persist=persist)
 
 
+def _proof_order_owned_by_user(uid: int, oid: int) -> bool:
+    """Чек только к своему неоплаченному заказу — не к чужому клиенту."""
+    try:
+        uid_i = int(uid)
+        oid_i = int(oid)
+    except (TypeError, ValueError):
+        return False
+    if uid_i <= 0 or oid_i <= 0:
+        return False
+    existing = ORDERS.get(oid_i)
+    if isinstance(existing, dict):
+        owner = int(existing.get("user_id") or 0)
+        if owner not in (0, uid_i):
+            return False
+        if existing.get("paid"):
+            return False
+        return True
+    o = _ensure_order_in_orders(oid_i, uid_i)
+    return (
+        isinstance(o, dict)
+        and int(o.get("user_id") or 0) == uid_i
+        and not o.get("paid")
+    )
+
+
 def _find_latest_unpaid_order_id(uid: int) -> Optional[int]:
+    """Последний неоплаченный заказ только этого Telegram user_id."""
     if not uid:
         return None
     best_oid: Optional[int] = None
@@ -5189,7 +5215,12 @@ def _format_payment_proof_caption(order_id: int, o: dict, uid: int) -> str:
     pm_ru = {"card": "💳 Карта", "transfer": "📱 Перевод", "crypto": "₿ Крипта"}.get(
         pm, "—"
     )
-    head = f"📸 Чек оплаты · Заказ #{order_id}\n👤 id: {uid} · способ: {pm_ru}\n\n"
+    un = str(o.get("username") or "").strip().lstrip("@")
+    who = f"@{un}" if un else f"id {uid}"
+    head = (
+        f"📸 Чек оплаты · Заказ #{order_id}\n"
+        f"👤 Клиент: {who} · 🆔 {uid} · способ: {pm_ru}\n\n"
+    )
     cap = head + body
     if len(cap) <= 1024:
         return cap
@@ -5424,6 +5455,11 @@ def _resolve_proof_order_record(
         uid_i = int(uid)
     except (TypeError, ValueError):
         return None
+    existing = ORDERS.get(oid_i)
+    if isinstance(existing, dict):
+        owner = int(existing.get("user_id") or 0)
+        if owner not in (0, uid_i):
+            return None
     o = _ensure_order_in_orders(oid_i, uid_i)
     if isinstance(o, dict) and int(o.get("user_id") or 0) == uid_i:
         if isinstance(ud, dict):
@@ -5431,6 +5467,8 @@ def _resolve_proof_order_record(
             if pm and not o.get("payment_pending_method"):
                 o["payment_pending_method"] = pm
         return o
+    if isinstance(existing, dict) and int(existing.get("user_id") or 0) not in (0, uid_i):
+        return None
     stub: dict = {
         "user_id": uid_i,
         "items": [],
@@ -5453,8 +5491,30 @@ def _resolve_proof_order_record(
 def _resolve_proof_order_id_for_photo(
     uid: int, ud: Optional[dict] = None
 ) -> Optional[int]:
-    """Заказ для чека: awaiting_proof → awaiting_payment → последний неоплаченный."""
-    return _ensure_awaiting_proof_session(uid, ud)
+    """Заказ для чека: сессия клиента → его неоплаченный заказ (не чужой)."""
+    ud_d = ud if isinstance(ud, dict) else {}
+    seen: set = set()
+    for raw in (
+        _user_state_get(uid, "awaiting_proof"),
+        ud_d.get("awaiting_proof"),
+        _user_state_get(uid, "awaiting_payment_order_id"),
+        ud_d.get("awaiting_payment_order_id"),
+    ):
+        if raw is None:
+            continue
+        try:
+            oid_i = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if oid_i in seen:
+            continue
+        seen.add(oid_i)
+        if _proof_order_owned_by_user(uid, oid_i):
+            return oid_i
+    latest = _find_latest_unpaid_order_id(uid)
+    if latest is not None and _proof_order_owned_by_user(uid, int(latest)):
+        return int(latest)
+    return None
 
 
 def _ensure_awaiting_proof_session(uid: int, ud: Optional[dict] = None) -> Optional[int]:
@@ -5486,14 +5546,10 @@ def _ensure_awaiting_proof_session(uid: int, ud: Optional[dict] = None) -> Optio
         if oid_i in seen:
             continue
         seen.add(oid_i)
-        po = _ensure_order_in_orders(oid_i, int(uid))
-        if (
-            isinstance(po, dict)
-            and int(po.get("user_id") or 0) == int(uid)
-            and not po.get("paid")
-        ):
-            _user_state_set(uid, "awaiting_proof", oid_i, persist=False)
-            return oid_i
+        if not _proof_order_owned_by_user(uid, oid_i):
+            continue
+        _user_state_set(uid, "awaiting_proof", oid_i, persist=False)
+        return oid_i
     return None
 
 
@@ -5813,7 +5869,7 @@ async def _forward_postpaid_client_payload_to_admin(
             return False
 
 
-def _kb_payment_admin_review(order_id: int) -> InlineKeyboardMarkup:
+def _kb_payment_admin_review(order_id: int, uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
@@ -5828,8 +5884,59 @@ def _kb_payment_admin_review(order_id: int) -> InlineKeyboardMarkup:
                     callback_data=f"reject_payment_{order_id}",
                 ),
             ],
+            [
+                InlineKeyboardButton(
+                    "📁 Папка клиента",
+                    callback_data=f"adm_user_all_{int(uid)}",
+                ),
+            ],
         ]
     )
+
+
+async def _ensure_customer_admin_folder(
+    context: ContextTypes.DEFAULT_TYPE, uid: int, username: Optional[str] = None
+) -> Tuple[Optional[int], Optional[int]]:
+    """Заголовок «папки» клиента у админа — все чеки reply в один тред."""
+    try:
+        uid_i = int(uid)
+    except (TypeError, ValueError):
+        return None, None
+    if uid_i <= 0:
+        return None, None
+    row = users_ensure(uid_i)
+    cid = row.get("admin_folder_chat_id")
+    mid = row.get("admin_folder_message_id")
+    if cid is not None and mid is not None:
+        try:
+            return int(cid), int(mid)
+        except (TypeError, ValueError):
+            pass
+    name = _user_display_name(uid_i, username)
+    text = (
+        f"📁 Клиент: {name}\n"
+        f"🆔 id: {uid_i}\n\n"
+        "Ниже — чеки оплаты и сообщения только этого покупателя."
+    )
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📋 Заказы и переписка", callback_data=f"adm_user_all_{uid_i}")]]
+    )
+    log = logging.getLogger(__name__)
+    for tgt in _admin_order_notify_targets() or [int(ADMIN_ID)]:
+        try:
+            sent = await context.bot.send_message(
+                chat_id=tgt,
+                text=text,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            row["admin_folder_chat_id"] = int(sent.chat_id)
+            row["admin_folder_message_id"] = int(sent.message_id)
+            log.info("admin customer folder uid=%s chat=%s msg=%s", uid_i, sent.chat_id, sent.message_id)
+            return int(sent.chat_id), int(sent.message_id)
+        except Exception:
+            log.exception("admin customer folder create uid=%s target=%s", uid_i, tgt)
+    return None, None
 
 
 def _user_data_for(application: Application, user_id: int) -> dict:
@@ -9614,7 +9721,14 @@ def _format_admin_customer_detail(uid: int, section: str = "all") -> str:
             except (TypeError, ValueError):
                 ts = 0.0
             tss = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts > 0 else "—"
-            parts.append(f"#{oid} — {tot} {cur} — {st_ru} — {tss}")
+            proof_mark = "—"
+            if o.get("paid"):
+                proof_mark = "✅ оплачен"
+            elif o.get("payment_proof_submitted"):
+                proof_mark = "📸 чек получен"
+            else:
+                proof_mark = "⏳ ждём чек"
+            parts.append(f"#{oid} — {tot} {cur} — {st_ru} — {tss} — {proof_mark}")
     parts.extend(["", _format_user_messages_for_admin(uid)])
     body = "\n".join(parts)
     if len(body) > 4090:
@@ -11367,7 +11481,13 @@ async def _send_or_edit_admin_payment_proof(
 ) -> bool:
     """Сообщение админу со скрином и кнопками подтверждения; при повторной отправке — edit."""
     log = logging.getLogger(__name__)
-    kb = _kb_payment_admin_review(order_id)
+    cust_uid = int(o.get("user_id") or 0)
+    kb = _kb_payment_admin_review(order_id, cust_uid)
+    folder_cid, folder_mid = await _ensure_customer_admin_folder(
+        context,
+        cust_uid,
+        str(o.get("username") or "").strip() or None,
+    )
     cid = o.get("payment_proof_admin_chat_id")
     mid = o.get("payment_proof_admin_message_id")
     if cid is not None and mid is not None:
@@ -11391,22 +11511,33 @@ async def _send_or_edit_admin_payment_proof(
     sent = None
     for tgt in targets:
         try:
-            sent = await context.bot.send_photo(
-                chat_id=tgt,
-                photo=file_id,
-                caption=caption,
-                reply_markup=kb,
-            )
+            kw: dict = {
+                "chat_id": tgt,
+                "photo": file_id,
+                "caption": caption,
+                "reply_markup": kb,
+            }
+            if (
+                folder_cid is not None
+                and folder_mid is not None
+                and int(folder_cid) == int(tgt)
+            ):
+                kw["reply_to_message_id"] = int(folder_mid)
+            sent = await context.bot.send_photo(**kw)
             log.info(
-                "payment proof sent admin target=%s order_id=%s msg=%s",
+                "payment proof sent admin target=%s order_id=%s uid=%s msg=%s",
                 tgt,
                 order_id,
+                cust_uid,
                 sent.message_id,
             )
             break
         except Exception:
             log.exception(
-                "скрин оплаты → admin target=%s order_id=%s", tgt, order_id
+                "скрин оплаты → admin target=%s order_id=%s uid=%s",
+                tgt,
+                order_id,
+                cust_uid,
             )
     if sent is None:
         return False
@@ -11481,7 +11612,7 @@ async def _on_user_photo_body(
     uid = msg.from_user.id if msg.from_user else 0
     ud = context.user_data if isinstance(context.user_data, dict) else {}
     file_id_peek = _image_file_id_from_message(msg)
-    proof_peek = _ensure_awaiting_proof_session(uid, ud) if uid else None
+    proof_peek = _resolve_proof_order_id_for_photo(uid, ud) if uid else None
     log.info(
         "user_photo uid=%s proof_oid=%s has_file=%s photo=%s doc=%s",
         uid,
@@ -11502,23 +11633,9 @@ async def _on_user_photo_body(
                 reply_markup=REPLY_KB,
             )
         return
-    proof_oid = proof_peek
-    if proof_oid is None and uid:
-        proof_oid = _find_latest_unpaid_order_id(uid)
+    proof_oid = _resolve_proof_order_id_for_photo(uid, ud) if uid else None
     if uid and proof_oid is not None and file_id_peek:
         await on_payment_proof_photo(update, context)
-        if uid:
-            try:
-                cap_log = (msg.caption or "").strip()
-                _remember_user_message(
-                    uid,
-                    getattr(msg.from_user, "username", None) if msg.from_user else None,
-                    "photo",
-                    cap_log or "[фото]",
-                    persist=False,
-                )
-            except Exception:
-                log.exception("remember photo after proof uid=%s", uid)
         return
     pp_oid = _user_state_get(uid, "postpaid_thread_oid")
     if uid and pp_oid is not None and not is_admin(uid):
@@ -11611,6 +11728,15 @@ async def on_payment_proof_photo(
             ud.pop("awaiting_proof", None)
         await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
         return
+    if not _proof_order_owned_by_user(uid, oid):
+        _user_state_pop(uid, "awaiting_proof", persist=False)
+        if isinstance(ud, dict):
+            ud.pop("awaiting_proof", None)
+        await msg.reply_text(
+            "Этот чек не привязан к вашему заказу. Нажмите «✅ Оплатить» и пришлите скрин снова.",
+            reply_markup=REPLY_KB,
+        )
+        return
     o = _resolve_proof_order_record(uid, oid, ud)
     if not o or int(o.get("user_id") or 0) != int(uid):
         _user_state_pop(uid, "awaiting_proof", persist=False)
@@ -11666,6 +11792,17 @@ async def on_payment_proof_photo(
         _set_awaiting_proof_session(uid, ud, int(oid))
         await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
         return
+    uname = getattr(msg.from_user, "username", None) if msg.from_user else None
+    try:
+        _remember_user_message(
+            uid,
+            uname,
+            "photo",
+            f"📸 Чек оплаты заказ #{oid}",
+            persist=False,
+        )
+    except Exception:
+        log.exception("remember payment proof uid=%s oid=%s", uid, oid)
     try:
         save_state()
     except Exception:
