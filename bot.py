@@ -127,6 +127,7 @@ def _ensure_flask_health_server_thread() -> None:
 
 # Админ-панель (/admin) и /say — основной id; дополнительные через TELEGRAM_ADMIN_IDS (через запятую)
 ADMIN_ID = 711309799
+BOT_BUILD_ID = "2026-06-06-proof-v4"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -768,6 +769,21 @@ async def track_user_activity(
         users_touch(uid, activity_only=True)
         _register_login_username(uid, getattr(u, "username", None))
         _sync_user_delivery_country_to_user_data(uid, context.user_data)
+        msg = update.message
+        if (
+            msg
+            and not is_admin(uid)
+            and _image_file_id_from_message(msg)
+            and _user_wants_proof_upload(
+                uid,
+                context.user_data if isinstance(context.user_data, dict) else {},
+                msg,
+            )
+        ):
+            ack_key = f"proof_ack:{msg.chat_id}:{msg.message_id}"
+            if not context.application.bot_data.get(ack_key):
+                context.application.bot_data[ack_key] = True
+                asyncio.create_task(_send_proof_received_ack(msg))
     except Exception:
         logging.getLogger(__name__).exception("USERS touch")
 
@@ -5568,8 +5584,45 @@ def _set_awaiting_proof_session(uid: int, ud: dict, oid: int) -> None:
     oid_i = int(oid)
     if isinstance(ud, dict):
         ud["awaiting_proof"] = oid_i
+    _user_state_bucket(uid)["proof_deadline"] = int(time.time()) + 7200
     _user_state_set(uid, "awaiting_proof", oid_i)
     _bind_payment_order_session(uid, ud, oid_i)
+
+
+def _is_reply_to_proof_request(msg: Optional[Message]) -> bool:
+    if not msg or not msg.reply_to_message:
+        return False
+    t = (msg.reply_to_message.text or msg.reply_to_message.caption or "").lower()
+    return "отправьте скрин" in t or "скрин оплаты" in t
+
+
+def _user_wants_proof_upload(uid: int, ud: dict, msg: Optional[Message]) -> bool:
+    if _user_state_get(uid, "awaiting_proof") is not None:
+        return True
+    if _user_state_get(uid, "awaiting_payment_order_id") is not None:
+        return True
+    if isinstance(ud, dict) and (
+        ud.get("awaiting_proof") or ud.get("awaiting_payment_order_id")
+    ):
+        return True
+    dl = _user_state_get(uid, "proof_deadline")
+    if dl is not None and int(dl) > int(time.time()):
+        return True
+    if _find_latest_unpaid_order_id(uid) is not None:
+        return True
+    if _is_reply_to_proof_request(msg):
+        return True
+    return False
+
+
+async def _send_proof_received_ack(msg: Message) -> None:
+    try:
+        await msg.reply_text(
+            "⏳ Получили скрин, передаём администратору…",
+            reply_markup=REPLY_KB,
+        )
+    except Exception:
+        logging.getLogger(__name__).exception("proof_ack reply failed")
 
 
 def _bind_payment_order_session(uid: int, ud: dict, oid: int) -> None:
@@ -11771,10 +11824,6 @@ async def on_payment_proof_photo(
     uid = msg.from_user.id if msg.from_user else 0
     if not uid:
         return
-    try:
-        await msg.reply_text("⏳ Получили скрин, передаём администратору…", reply_markup=REPLY_KB)
-    except Exception:
-        log.exception("payment_proof_photo early ack uid=%s", uid)
     oid_raw = _resolve_proof_order_id_for_photo(uid, ud)
     if oid_raw is None:
         await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
@@ -12453,11 +12502,19 @@ async def post_init(application: Application) -> None:
     n_lc = len(LOGIN_CODES)
     LOGIN_CODES.clear()
     log.info(
-        "Рестарт процесса: deploy_epoch=%s; восстановлено черновиков заказа=%d, сброшено LOGIN_CODES=%d",
+        "Рестарт процесса: build=%s deploy_epoch=%s; восстановлено черновиков заказа=%d, сброшено LOGIN_CODES=%d",
+        BOT_BUILD_ID,
         application.bot_data["deploy_epoch"],
         n_sl,
         n_lc,
     )
+    try:
+        await application.bot.send_message(
+            int(ADMIN_ID),
+            f"🟢 Бот перезапущен · {BOT_BUILD_ID}",
+        )
+    except Exception:
+        log.exception("startup notify admin build=%s", BOT_BUILD_ID)
     # Иначе Telegram отдаёт 409, если у бота остался webhook (getUpdates + webhook несовместимы).
     try:
         await application.bot.delete_webhook(drop_pending_updates=False)
