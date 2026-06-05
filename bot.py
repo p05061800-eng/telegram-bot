@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-06-proof-v8"
+BOT_BUILD_ID = "2026-06-06-admin-panel-v9"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -5070,6 +5070,76 @@ def _restore_order_by_id(oid: int) -> Optional[dict]:
     return None
 
 
+_RE_ADMIN_CARD_ITEM = re.compile(
+    r"•\s*(.+?)\s*—\s*(\d+)\s*шт\.\s*×\s*(\d+)\s*(BYN|RUB)\s*=\s*(\d+)\s*(BYN|RUB)",
+    re.IGNORECASE,
+)
+_RE_ADMIN_CARD_DELIVERY = re.compile(r"🚚\s*Доставка:\s*(.+)", re.IGNORECASE)
+
+
+def _parse_items_from_admin_card(text: str) -> List[dict]:
+    items: List[dict] = []
+    for m in _RE_ADMIN_CARD_ITEM.finditer(str(text or "")):
+        try:
+            items.append(
+                {
+                    "name": str(m.group(1) or "").strip(),
+                    "qty": int(m.group(2)),
+                    "price": int(m.group(3)),
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+    return items
+
+
+def _parse_delivery_from_admin_card(text: str) -> dict:
+    m = _RE_ADMIN_CARD_DELIVERY.search(str(text or ""))
+    if not m:
+        return {}
+    line = str(m.group(1) or "").strip()
+    amount = 0
+    currency = "BYN"
+    amt_m = re.search(r"—\s*(\d+)\s*(BYN|RUB)", line, re.IGNORECASE)
+    if amt_m:
+        try:
+            amount = int(amt_m.group(1))
+        except (TypeError, ValueError):
+            amount = 0
+        currency = str(amt_m.group(2) or "BYN").upper()
+    country = "by"
+    low = line.lower()
+    if "росс" in low or "🇷🇺" in line:
+        country = "ru"
+    elif "укра" in low or "🇺🇦" in line:
+        country = "ua"
+    elif "бел" in low or "🇧🇾" in line:
+        country = "by"
+    return {"label": line, "amount": amount, "currency": currency, "country": country}
+
+
+def _enrich_order_from_admin_card_text(o: dict, oid: int, text: str) -> dict:
+    """Дополнить заказ составом и доставкой из текста карточки админа."""
+    items = _parse_items_from_admin_card(text)
+    if items:
+        o["items"] = items
+    delivery = _parse_delivery_from_admin_card(text)
+    if delivery:
+        o["delivery"] = delivery
+    pay_m = _RE_ADMIN_CARD_PAY_TOTAL.search(str(text or ""))
+    if pay_m:
+        try:
+            o["total"] = int(pay_m.group(1))
+        except (TypeError, ValueError):
+            pass
+        o["payment_currency"] = str(pay_m.group(2) or "BYN").upper()
+    st_m = _RE_ADMIN_CARD_STATUS.search(str(text or ""))
+    if st_m:
+        o["status"] = _admin_status_key_from_ru(st_m.group(1))
+    ORDERS[int(oid)] = o
+    return o
+
+
 _RE_ADMIN_CARD_ORDER_ID = re.compile(
     r"(?:📦\s*Заказ\s*#|Чек\s+оплаты\s*·\s*Заказ\s*#|Заказ\s*#)(\d+)",
     re.IGNORECASE,
@@ -5134,29 +5204,31 @@ def _rebuild_order_from_admin_card_text(oid: int, text: str) -> Optional[dict]:
     rebuilt: dict = {
         "user_id": uid_i,
         "username": uname,
-        "items": [],
+        "items": _parse_items_from_admin_card(t),
         "total": total,
         "payment_currency": pay_cur,
-        "delivery": {},
+        "delivery": _parse_delivery_from_admin_card(t),
         "status": st,
         "created_at": time.time(),
         "paid": False,
         "payment_proof_submitted": is_proof,
         "clear_cart_on_paid": True,
     }
-    ORDERS[int(oid)] = rebuilt
-    return rebuilt
+    return _enrich_order_from_admin_card_text(rebuilt, int(oid), t)
 
 
 def _restore_order_for_admin(q: CallbackQuery, oid: int) -> Optional[dict]:
     """ORDERS / USER_ORDERS или текст карточки в чате админа."""
     o = _restore_order_by_id(oid)
+    msg = q.message
+    text = (msg.text or msg.caption or "").strip() if msg else ""
+    if o and text and _message_looks_like_admin_order_card(text):
+        if not list(o.get("items") or []):
+            o = _enrich_order_from_admin_card_text(o, oid, text)
     if o:
         return o
-    msg = q.message
     if not msg:
         return None
-    text = (msg.text or msg.caption or "").strip()
     o = _rebuild_order_from_admin_card_text(oid, text)
     if not o:
         return None
@@ -5408,26 +5480,47 @@ def _admin_order_notify_targets() -> List[object]:
     return out
 
 
-async def _send_deferred_admin_order_panel(
-    context: ContextTypes.DEFAULT_TYPE, order_id: int, o: dict
+async def _send_admin_order_panel(
+    context: ContextTypes.DEFAULT_TYPE,
+    order_id: int,
+    o: dict,
+    *,
+    force_new: bool = False,
+    reply_to_message_id: Optional[int] = None,
 ) -> None:
-    """Карточка заказа админу (принять/отправить/…), если ещё не отправляли."""
-    if o.get("admin_chat_id") is not None and o.get("admin_message_id") is not None:
-        return
+    """Карточка заказа админу с кнопками Принять / Отправлен / …"""
     log = logging.getLogger(__name__)
+    target_ids = _admin_target_chat_ids()
+    if not force_new:
+        cid = o.get("admin_chat_id")
+        mid = o.get("admin_message_id")
+        if cid is not None and mid is not None:
+            try:
+                if int(cid) in target_ids:
+                    await _refresh_admin_order_message(context, order_id)
+                    return
+            except (TypeError, ValueError):
+                pass
+    o.pop("admin_chat_id", None)
+    o.pop("admin_message_id", None)
     text = _format_admin_order_detail_text(order_id, o)
     kb = _kb_order_admin_actions(order_id, str(o.get("status") or "new"))
     m = None
-    for tgt in _admin_order_notify_targets():
+    targets = _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else [])
+    for tgt in targets:
         try:
-            sent = await context.bot.send_message(
-                chat_id=tgt,
-                text=text,
-                reply_markup=kb,
-                disable_web_page_preview=True,
-            )
+            kw: dict = {
+                "chat_id": tgt,
+                "text": text,
+                "reply_markup": kb,
+                "disable_web_page_preview": True,
+            }
+            if reply_to_message_id is not None:
+                kw["reply_to_message_id"] = int(reply_to_message_id)
+            sent = await context.bot.send_message(**kw)
             if m is None:
                 m = sent
+            log.info("admin order panel → target=%s order_id=%s", tgt, order_id)
         except Exception:
             log.exception(
                 "admin order panel → target=%s order_id=%s", tgt, order_id
@@ -5436,6 +5529,14 @@ async def _send_deferred_admin_order_panel(
         return
     o["admin_chat_id"] = int(m.chat_id)
     o["admin_message_id"] = int(m.message_id)
+    save_state()
+
+
+async def _send_deferred_admin_order_panel(
+    context: ContextTypes.DEFAULT_TYPE, order_id: int, o: dict
+) -> None:
+    """Карточка заказа админу после подтверждения оплаты."""
+    await _send_admin_order_panel(context, order_id, o, force_new=True)
 
 
 def _kb_order_admin_actions(order_id: int, _status: str) -> Optional[InlineKeyboardMarkup]:
@@ -9081,6 +9182,9 @@ def _infer_site_order_action_from_keyboard_layout(message: Optional[Message], da
     flat = _inline_buttons_flat(message)
     if not flat:
         return None
+    msg_text = (message.text or message.caption or "") if message else ""
+    if _message_looks_like_admin_order_card(msg_text):
+        return None
     want = (data or "").strip()
     idx = None
     for i, btn in enumerate(flat):
@@ -9219,6 +9323,8 @@ def _resolve_site_order_action(q: CallbackQuery) -> Optional[Tuple[str, Optional
         )
         return (label_action, ext)
     msg_text = (msg.text or msg.caption or "") if msg else ""
+    if msg and _message_looks_like_admin_order_card(msg_text):
+        return None
     if msg and _message_looks_like_payment_step(msg_text):
         return None
     if msg and _message_looks_like_order_preview(msg_text):
@@ -9294,6 +9400,9 @@ async def _try_handle_site_order_callback(
         return
     data = (q.data or "").strip()
     if _is_bot_checkout_payment_callback(data):
+        return
+    msg_text = (q.message.text or q.message.caption or "") if q.message else ""
+    if _message_looks_like_admin_order_card(msg_text):
         return
     if _RE_SITE_ORDER_CB_PATTERN.match(data):
         return
@@ -9645,6 +9754,10 @@ async def on_callback_query_unhandled(
         await on_order_admin_action(update, context)
         return
     if _is_bot_checkout_payment_callback(data):
+        await _callback_ack(q)
+        return
+    msg_text = (q.message.text or q.message.caption or "") if q.message else ""
+    if _message_looks_like_admin_order_card(msg_text):
         await _callback_ack(q)
         return
     parsed = _resolve_site_order_action(q)
@@ -10294,6 +10407,9 @@ async def on_order_status_buttons(
     if not o:
         await _reply_admin_order_stale(q, oid)
         raise ApplicationHandlerStop
+    if text := ((q.message.text or q.message.caption or "").strip() if q.message else ""):
+        if _message_looks_like_admin_order_card(text) and not list(o.get("items") or []):
+            o = _enrich_order_from_admin_card_text(o, oid, text)
     if action == "delmsg":
         await _admin_delete_order_chat_message(context, q, oid)
         raise ApplicationHandlerStop
@@ -12332,8 +12448,22 @@ async def on_admin_confirm_payment(
         )
     except Exception:
         pass
-    # Сначала карточка заказа у админа — чтобы ответы клиента шли reply в один тред.
-    await _send_deferred_admin_order_panel(context, oid, o)
+    # Карточка заказа админу — как на скрине, сразу под подтверждением чека.
+    try:
+        panel_text = _format_admin_order_detail_text(oid, o)
+        panel_kb = _kb_order_admin_actions(oid, str(o.get("status") or "new"))
+        panel = await q.message.reply_text(
+            panel_text,
+            reply_markup=panel_kb,
+            disable_web_page_preview=True,
+        )
+        o["admin_chat_id"] = int(panel.chat_id)
+        o["admin_message_id"] = int(panel.message_id)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "confirm_payment admin panel reply order_id=%s", oid
+        )
+        await _send_admin_order_panel(context, oid, o, force_new=True)
     if cust:
         await _send_payment_receipt(context.bot, cust, oid, o)
         await _send_customer_plain(
