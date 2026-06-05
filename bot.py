@@ -689,7 +689,14 @@ def users_touch(
         row["last_action"] = str(action).strip()
 
 
-def _remember_user_message(uid: int, username: Optional[str], kind: str, text: str) -> None:
+def _remember_user_message(
+    uid: int,
+    username: Optional[str],
+    kind: str,
+    text: str,
+    *,
+    persist: bool = True,
+) -> None:
     uid = int(uid or 0)
     if not uid or is_admin(uid):
         return
@@ -705,7 +712,13 @@ def _remember_user_message(uid: int, username: Optional[str], kind: str, text: s
             "text": body[:1500],
         }
     )
-    save_state()
+    if persist:
+        try:
+            save_state()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "remember_user_message save_state uid=%s", uid
+            )
 
 
 def _user_display_name(uid: int, username: Optional[str] = None) -> str:
@@ -777,12 +790,18 @@ def _user_state_get(uid: int, key: str) -> Optional[int]:
         return None
 
 
-def _user_state_set(uid: int, key: str, order_id: int) -> None:
+def _user_state_set(uid: int, key: str, order_id: int, *, persist: bool = True) -> None:
     if not uid:
         return
     b = _user_state_bucket(uid)
     b[key] = int(order_id)
-    save_state()
+    if persist:
+        try:
+            save_state()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "user_state_set save_state uid=%s key=%s", uid, key
+            )
 
 
 def _set_awaiting_payment_order_id(uid: int, user_data: dict, order_id: int) -> None:
@@ -5445,7 +5464,7 @@ def _ensure_awaiting_proof_session(uid: int, ud: Optional[dict] = None) -> Optio
             and int(po.get("user_id") or 0) == int(uid)
             and not po.get("paid")
         ):
-            _user_state_set(uid, "awaiting_proof", oid_i)
+            _user_state_set(uid, "awaiting_proof", oid_i, persist=False)
             return oid_i
     return None
 
@@ -11412,6 +11431,23 @@ async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     msg = update.effective_message
     if not msg:
         return
+    try:
+        await _on_user_photo_body(update, context)
+    except Exception:
+        log.exception("on_user_photo failed uid=%s", msg.from_user.id if msg.from_user else 0)
+        try:
+            await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
+        except Exception:
+            pass
+
+
+async def _on_user_photo_body(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    log = logging.getLogger(__name__)
+    msg = update.effective_message
+    if not msg:
+        return
     uid = msg.from_user.id if msg.from_user else 0
     ud = context.user_data if isinstance(context.user_data, dict) else {}
     file_id_peek = _image_file_id_from_message(msg)
@@ -11426,41 +11462,30 @@ async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
     if not file_id_peek:
         if proof_peek is not None:
-            try:
-                await msg.reply_text(
-                    "Не вижу изображение. Пришлите скрин оплаты как фото (не PDF).",
-                    reply_markup=REPLY_KB,
-                )
-            except Exception:
-                pass
-        elif uid and _find_latest_unpaid_order_id(uid) is not None:
-            try:
-                await msg.reply_text(
-                    "Не вижу изображение. Пришлите скрин как фото или картинку (PNG/JPG), не PDF.",
-                    reply_markup=REPLY_KB,
-                )
-            except Exception:
-                pass
-        return
-    if uid:
-        cap_log = (msg.caption or "").strip()
-        _remember_user_message(
-            uid,
-            getattr(msg.from_user, "username", None) if msg.from_user else None,
-            "photo",
-            cap_log or "[фото]",
-        )
-    if uid and proof_peek is not None:
-        try:
-            await on_payment_proof_photo(update, context)
-        except Exception:
-            logging.getLogger(__name__).exception(
-                "on_payment_proof_photo uid=%s oid=%s", uid, proof_peek
+            await msg.reply_text(
+                "Не вижу изображение. Пришлите скрин оплаты как фото (не PDF).",
+                reply_markup=REPLY_KB,
             )
+        elif uid and _find_latest_unpaid_order_id(uid) is not None:
+            await msg.reply_text(
+                "Не вижу изображение. Пришлите скрин как фото или картинку (PNG/JPG), не PDF.",
+                reply_markup=REPLY_KB,
+            )
+        return
+    if uid and proof_peek is not None:
+        await on_payment_proof_photo(update, context)
+        if uid:
             try:
-                await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
+                cap_log = (msg.caption or "").strip()
+                _remember_user_message(
+                    uid,
+                    getattr(msg.from_user, "username", None) if msg.from_user else None,
+                    "photo",
+                    cap_log or "[фото]",
+                    persist=False,
+                )
             except Exception:
-                pass
+                log.exception("remember photo after proof uid=%s", uid)
         return
     pp_oid = _user_state_get(uid, "postpaid_thread_oid")
     if uid and pp_oid is not None and not is_admin(uid):
@@ -11499,21 +11524,9 @@ async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if uid:
         rebound = _ensure_awaiting_proof_session(uid, ud)
         if rebound is not None:
-            try:
-                await on_payment_proof_photo(update, context)
-            except Exception:
-                log.exception(
-                    "on_payment_proof_photo rebound uid=%s oid=%s", uid, rebound
-                )
-                try:
-                    await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
-                except Exception:
-                    pass
+            await on_payment_proof_photo(update, context)
             return
-        try:
-            await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
-        except Exception:
-            pass
+        await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
 
 
 async def on_payment_proof_photo(
@@ -11563,27 +11576,36 @@ async def on_payment_proof_photo(
         await msg.reply_text(PAY_PROOF_WAIT)
         return
     _clear_crypto_auto_watch(o, uid)
-    cap = _format_payment_proof_caption(oid, o, uid)
     try:
-        ok = await _send_or_edit_admin_payment_proof(context, oid, o, file_id, cap)
+        cap = _format_payment_proof_caption(oid, o, uid)
     except Exception:
-        log.exception("payment_proof_photo admin send uid=%s oid=%s", uid, oid)
-        ok = False
-    if not ok:
-        await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL)
-        return
-    o["payment_proof_submitted"] = True
+        log.exception("payment_proof_photo caption uid=%s oid=%s", uid, oid)
+        cap = f"📸 Чек оплаты · Заказ #{oid}\n👤 id: {uid}"
     o["proof_file_id"] = file_id
+    o["payment_proof_submitted"] = True
     _user_state_pop(uid, "awaiting_proof")
     _clear_awaiting_payment_order_id(uid, ud)
-    try:
-        save_state()
-    except Exception:
-        log.exception("payment_proof_photo save_state uid=%s oid=%s", uid, oid)
     await msg.reply_text(
         "✅ Скрин получен и передан администратору.\n\n" + PAY_PROOF_WAIT,
         reply_markup=REPLY_KB,
     )
+    ok = False
+    try:
+        ok = await _send_or_edit_admin_payment_proof(context, oid, o, file_id, cap)
+    except Exception:
+        log.exception("payment_proof_photo admin send uid=%s oid=%s", uid, oid)
+    if not ok:
+        o["payment_proof_submitted"] = False
+        o.pop("proof_file_id", None)
+        o.pop("payment_proof_admin_chat_id", None)
+        o.pop("payment_proof_admin_message_id", None)
+        _user_state_set(uid, "awaiting_proof", int(oid))
+        await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
+        return
+    try:
+        save_state()
+    except Exception:
+        log.exception("payment_proof_photo save_state uid=%s oid=%s", uid, oid)
     log.info("payment_proof_photo ok uid=%s oid=%s", uid, oid)
 
 
@@ -12255,6 +12277,10 @@ def main() -> None:
         group=-1,
     )
     app.add_handler(
+        MessageHandler(filters.PHOTO | filters.Document.ALL, on_user_photo),
+        group=-1,
+    )
+    app.add_handler(
         CallbackQueryHandler(
             on_order_status_buttons,
             pattern=re.compile(r"^(accept|sent|cancel|done|delmsg)_\d+$"),
@@ -12443,7 +12469,6 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_callback_query_unhandled), group=99)
     app.add_handler(
         MessageHandler(filters.PHOTO | filters.Document.ALL, on_user_photo),
-        group=-1,
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
