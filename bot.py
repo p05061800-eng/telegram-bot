@@ -1008,8 +1008,8 @@ MSG_CART_CLEARED_TOAST = "Корзина очищена."
 MSG_PAY_NEED_PROOF_FIRST = "Сначала пришлите фото чека оплаты."
 MSG_PAY_FINISH_CURRENT = "Сначала завершите оплату по текущему заказу."
 MSG_PAY_ALREADY_OPEN = (
-    "Оплата уже открыта — выберите способ оплаты в сообщении выше "
-    "или нажмите «❌ Отменить оплату»."
+    "Оплата уже открыта — ниже отправлены актуальные кнопки "
+    "(💳 Карта · 📱 Перевод · ₿ Крипта · ❌ Отменить оплату)."
 )
 MSG_PAY_CANCELLED = (
     "Оплата отменена. Можете снова подтвердить заказ или изменить корзину на сайте."
@@ -4808,6 +4808,43 @@ async def _reply_payment_step(
     )
 
 
+def _payment_currency_for_order(o: dict) -> str:
+    cur = str(o.get("payment_currency") or "").strip().upper()
+    if cur in ("BYN", "RUB"):
+        return cur
+    d = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
+    cc = str(d.get("country") or "by").strip().lower()
+    dc = str(d.get("currency") or "").strip().upper()
+    if cc == "by" and dc == "BYN":
+        return "BYN"
+    return _goods_currency_for_delivery_country(cc)
+
+
+async def _resend_active_payment_step(
+    q: CallbackQuery,
+    uid: int,
+    ud: dict,
+    oid: int,
+    o: dict,
+) -> None:
+    """Свежее сообщение с кнопками оплаты (в т.ч. «Отменить») для активного заказа."""
+    if not q.message:
+        return
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    pay_cur = _payment_currency_for_order(o)
+    tot = _order_resolved_grand_total(o)
+    lo_est = o.get("loyalty_earn_estimate")
+    body = (
+        f"💳 Оплата по заказу #{int(oid)}\n\n"
+        f"{_payment_intro_text(int(tot), pay_cur, loyalty_earn_estimate=lo_est)}"
+    )
+    await q.message.reply_text(body, reply_markup=_kb_payment_methods())
+    _set_awaiting_payment_order_id(uid, ud, int(oid))
+
+
 def _format_delivery_block(d: Optional[dict]) -> str:
     if not d or not isinstance(d, dict):
         return ""
@@ -8559,20 +8596,13 @@ async def _run_site_confirm_order(
                 else:
                     await _callback_ack(q, MSG_PAY_NEED_PROOF_FIRST, show_alert=True)
                 return
-        pend = ud.get("awaiting_payment_order_id")
+        pend = _resolve_awaiting_payment_order_id(uid_cb, ud)
         if pend is not None:
-            try:
-                po = ORDERS.get(int(pend))
-            except (TypeError, ValueError):
-                po = None
+            po = ORDERS.get(int(pend))
             if not po or int(po.get("user_id") or 0) != int(uid_cb) or po.get("paid"):
-                ud.pop("awaiting_payment_order_id", None)
-                ud.pop("payment_pending_method", None)
+                _clear_awaiting_payment_order_id(uid_cb, ud)
             else:
-                if acked and q.message:
-                    await q.message.reply_text(MSG_PAY_ALREADY_OPEN)
-                else:
-                    await _callback_ack(q, MSG_PAY_ALREADY_OPEN, show_alert=True)
+                await _resend_active_payment_step(q, uid_cb, ud, int(pend), po)
                 return
         lines = await _restore_cart_lines_for_confirm(uid_cb, ud, context)
         if not lines:
@@ -10369,21 +10399,13 @@ async def on_send_order_to_admin(
             else:
                 await _callback_ack(q, MSG_PAY_NEED_PROOF_FIRST, show_alert=True)
             return
-    pend = ud.get("awaiting_payment_order_id")
+    pend = _resolve_awaiting_payment_order_id(uid_chk, ud)
     if pend is not None:
-        try:
-            po = ORDERS.get(int(pend))
-        except (TypeError, ValueError):
-            po = None
-            ud.pop("awaiting_payment_order_id", None)
+        po = ORDERS.get(int(pend))
         if po is None or int(po.get("user_id") or 0) != int(uid_chk) or po.get("paid"):
-            ud.pop("awaiting_payment_order_id", None)
-            ud.pop("payment_pending_method", None)
+            _clear_awaiting_payment_order_id(uid_chk, ud)
         elif po is not None and not po.get("paid"):
-            if acked and q.message:
-                await q.message.reply_text(MSG_PAY_FINISH_CURRENT)
-            else:
-                await _callback_ack(q, MSG_PAY_FINISH_CURRENT, show_alert=True)
+            await _resend_active_payment_step(q, int(uid_chk), ud, int(pend), po)
             return
     lines: Optional[List[dict]] = ud.get("order_checkout")
     if not lines:
