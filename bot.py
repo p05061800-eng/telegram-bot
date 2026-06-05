@@ -11819,10 +11819,6 @@ async def on_payment_proof_photo(
     ):
         await msg.reply_text(PAY_PROOF_WAIT)
         return
-    await msg.reply_text(
-        "✅ Скрин передан администратору.\n\n" + PAY_PROOF_WAIT,
-        reply_markup=REPLY_KB,
-    )
     _clear_crypto_auto_watch(o, uid, persist=False)
     try:
         cap = _format_payment_proof_caption(oid, o, uid)
@@ -11851,10 +11847,6 @@ async def on_payment_proof_photo(
         _set_awaiting_proof_session(uid, ud, int(oid))
         await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
         return
-    try:
-        await msg.reply_text("✅ " + PAY_PROOF_WAIT, reply_markup=REPLY_KB)
-    except Exception:
-        pass
     uname = getattr(msg.from_user, "username", None) if msg.from_user else None
     try:
         _remember_user_message(
