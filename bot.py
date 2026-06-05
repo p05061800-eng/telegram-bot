@@ -855,7 +855,9 @@ def _resolve_awaiting_payment_order_id(uid: int, user_data: Optional[dict]) -> O
         if o.get("paid"):
             continue
         ud["awaiting_payment_order_id"] = int(oid)
-        _user_state_set(uid, "awaiting_payment_order_id", int(oid))
+        if uid:
+            b = _user_state_bucket(uid)
+            b["awaiting_payment_order_id"] = int(oid)
         return int(oid)
     _clear_awaiting_payment_order_id(uid, ud)
     return None
@@ -4844,12 +4846,13 @@ async def _reply_payment_step(
     currency: str = "BYN",
     *,
     loyalty_earn_estimate: Optional[int] = None,
+    order_id: Optional[int] = None,
 ) -> None:
     await msg.reply_text(
         _payment_step_message_text(
             int(total), currency, loyalty_earn_estimate=loyalty_earn_estimate
         ),
-        reply_markup=_kb_payment_methods(),
+        reply_markup=_kb_payment_methods(order_id),
     )
 
 
@@ -4886,7 +4889,7 @@ async def _resend_active_payment_step(
         f"💳 Оплата по заказу #{int(oid)}\n\n"
         f"{_payment_intro_text(int(tot), pay_cur, loyalty_earn_estimate=lo_est)}"
     )
-    await q.message.reply_text(body, reply_markup=_kb_payment_methods())
+    await q.message.reply_text(body, reply_markup=_kb_payment_methods(int(oid)))
     _set_awaiting_payment_order_id(uid, ud, int(oid))
 
 
@@ -5115,15 +5118,95 @@ async def _notify_admin_new_order(
     return order_id
 
 
-def _kb_payment_methods() -> InlineKeyboardMarkup:
+_RE_PAY_METHOD_CB = re.compile(r"^pay_(card|transfer|crypto)(?::(?P<oid>\d+))?$")
+_RE_PAY_CANCEL_CB = re.compile(r"^pay_cancel(?::(?P<oid>\d+))?$")
+_RE_PAID_CB = re.compile(r"^paid(?::(?P<oid>\d+))?$")
+
+
+def _pay_cb(base: str, order_id: Optional[int] = None) -> str:
+    if order_id is not None:
+        try:
+            return f"{base}:{int(order_id)}"
+        except (TypeError, ValueError):
+            pass
+    return base
+
+
+def _oid_from_pay_callback(data: str) -> Optional[int]:
+    d = (data or "").strip()
+    for pat in (_RE_PAY_METHOD_CB, _RE_PAY_CANCEL_CB, _RE_PAID_CB):
+        m = pat.match(d)
+        if not m:
+            continue
+        raw = (m.groupdict().get("oid") or "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _parse_order_id_from_payment_message(text: str) -> Optional[int]:
+    m = re.search(r"Оплата по заказу\s*#(\d+)", str(text or ""), re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_payment_order_id(
+    uid: int,
+    ud: dict,
+    *,
+    callback_data: Optional[str] = None,
+    message_text: Optional[str] = None,
+) -> Optional[int]:
+    """ID заказа на шаге оплаты: callback_data → текст сообщения → сессия."""
+    for oid_raw in (
+        _oid_from_pay_callback(callback_data or ""),
+        _parse_order_id_from_payment_message(message_text or ""),
+    ):
+        if oid_raw is None:
+            continue
+        o = ORDERS.get(int(oid_raw))
+        if (
+            isinstance(o, dict)
+            and int(o.get("user_id") or 0) == int(uid)
+            and not o.get("paid")
+        ):
+            ud["awaiting_payment_order_id"] = int(oid_raw)
+            if uid:
+                b = _user_state_bucket(uid)
+                b["awaiting_payment_order_id"] = int(oid_raw)
+            return int(oid_raw)
+    return _resolve_awaiting_payment_order_id(uid, ud)
+
+
+def _kb_payment_methods(order_id: Optional[int] = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("💳 Карта", callback_data="pay_card"),
-                InlineKeyboardButton("📱 Перевод", callback_data="pay_transfer"),
+                InlineKeyboardButton(
+                    "💳 Карта", callback_data=_pay_cb("pay_card", order_id)
+                ),
+                InlineKeyboardButton(
+                    "📱 Перевод", callback_data=_pay_cb("pay_transfer", order_id)
+                ),
             ],
-            [InlineKeyboardButton("₿ Крипта", callback_data="pay_crypto")],
-            [InlineKeyboardButton("❌ Отменить оплату", callback_data="pay_cancel")],
+            [
+                InlineKeyboardButton(
+                    "₿ Крипта", callback_data=_pay_cb("pay_crypto", order_id)
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Отменить оплату", callback_data=_pay_cb("pay_cancel", order_id)
+                )
+            ],
         ]
     )
 
@@ -5154,9 +5237,18 @@ def _payment_total_label(o: dict) -> str:
     return f"{goods} {g_cur}"
 
 
-def _kb_paid_confirm(total_label: str) -> InlineKeyboardMarkup:
+def _kb_paid_confirm(
+    total_label: str, order_id: Optional[int] = None
+) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"✅ Оплатить + {total_label}", callback_data="paid")]]
+        [
+            [
+                InlineKeyboardButton(
+                    f"✅ Оплатить + {total_label}",
+                    callback_data=_pay_cb("paid", order_id),
+                )
+            ]
+        ]
     )
 
 
@@ -6347,17 +6439,22 @@ def _kb_order_preview_actions(uid: int, user_data: dict) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(rows)
 
 
-def _kb_payment_methods_with_back() -> InlineKeyboardMarkup:
+def _kb_payment_methods_with_back(
+    order_id: Optional[int] = None,
+) -> InlineKeyboardMarkup:
     """Только способы оплаты (без «назад к подтверждению» — шаг уже пройден)."""
-    return _kb_payment_methods()
+    return _kb_payment_methods(order_id)
 
 
-def _kb_paid_confirm_with_back(total_label: str) -> InlineKeyboardMarkup:
+def _kb_paid_confirm_with_back(
+    total_label: str, order_id: Optional[int] = None
+) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    f"✅ Оплатить + {total_label}", callback_data="paid"
+                    f"✅ Оплатить + {total_label}",
+                    callback_data=_pay_cb("paid", order_id),
                 )
             ],
             [
@@ -8114,7 +8211,7 @@ async def _create_order_from_synced_site_cart(
     context.user_data.pop("payment_pending_method", None)
     lo_est = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
     await _reply_payment_step(
-        msg, int(total), pay_cur, loyalty_earn_estimate=lo_est
+        msg, int(total), pay_cur, loyalty_earn_estimate=lo_est, order_id=int(oid)
     )
     users_touch(uid, "payment")
     return True
@@ -8308,6 +8405,7 @@ def _message_looks_like_payment_step(text: str) -> bool:
         "👇 Нажмите кнопку ниже",
         "💳 Карта · 📱 Перевод",
         ORDER_AUTO_ACK,
+        "Оплата по заказу",
     )
     return any(m in t for m in markers)
 
@@ -8741,6 +8839,7 @@ async def _run_site_confirm_order(
             int(total),
             pay_cur,
             loyalty_earn_estimate=lo_est,
+            order_id=int(oid),
         )
         users_touch(uid_cb, "payment")
     except Exception:
@@ -8918,7 +9017,11 @@ async def on_deep_link_structured_submit(
     tot = int(order_rec["total"])
     lo_est_dl = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
     await _reply_payment_step(
-        q.message, tot, pay_cur_dl, loyalty_earn_estimate=lo_est_dl
+        q.message,
+        tot,
+        pay_cur_dl,
+        loyalty_earn_estimate=lo_est_dl,
+        order_id=int(oid),
     )
     users_touch(u.id, "payment")
 
@@ -10210,17 +10313,11 @@ async def on_checkout_nav_back(
         )
         return
     if action == "pay_to_methods":
-        oid_raw = ud.get("awaiting_payment_order_id")
-        if oid_raw is None:
-            try:
-                await q.answer()
-            except Exception:
-                pass
-            return
-        try:
-            oid = int(oid_raw)
-        except (TypeError, ValueError):
-            ud.pop("awaiting_payment_order_id", None)
+        msg_txt = (q.message.text or q.message.caption or "") if q.message else ""
+        oid = _resolve_payment_order_id(
+            uid, ud, message_text=msg_txt
+        )
+        if oid is None:
             try:
                 await q.answer()
             except Exception:
@@ -10261,7 +10358,7 @@ async def on_checkout_nav_back(
         lo_est_pm = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
         await q.message.reply_text(
             _payment_intro_text(tot, pay_cur, loyalty_earn_estimate=lo_est_pm),
-            reply_markup=_kb_payment_methods(),
+            reply_markup=_kb_payment_methods(int(oid)),
         )
         return
 
@@ -10602,7 +10699,11 @@ async def on_send_order_to_admin(
     tot = int(order_rec["total"])
     lo_est_ta = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
     await _reply_payment_step(
-        q.message, tot, pay_cur, loyalty_earn_estimate=lo_est_ta
+        q.message,
+        tot,
+        pay_cur,
+        loyalty_earn_estimate=lo_est_ta,
+        order_id=int(oid),
     )
     users_touch(uid, "payment")
 
@@ -10614,12 +10715,15 @@ async def on_payment_cancel(
     q = update.callback_query
     if not q or not q.from_user or not q.message:
         return
-    if (q.data or "").strip() != "pay_cancel":
+    if not _RE_PAY_CANCEL_CB.match((q.data or "").strip()):
         return
     uid = int(q.from_user.id)
     ud = context.user_data
     await _callback_ack(q)
-    oid = _resolve_awaiting_payment_order_id(uid, ud)
+    msg_txt = (q.message.text or q.message.caption or "") if q.message else ""
+    oid = _resolve_payment_order_id(
+        uid, ud, callback_data=q.data, message_text=msg_txt
+    )
     if oid is not None:
         o = ORDERS.get(int(oid))
         if (
@@ -10646,39 +10750,34 @@ async def on_payment_method(
     q = update.callback_query
     if not q or not q.from_user or not q.data or not q.message:
         return
-    m = re.match(r"^pay_(card|transfer|crypto)$", (q.data or "").strip())
+    m = _RE_PAY_METHOD_CB.match((q.data or "").strip())
     if not m:
         return
     uid = q.from_user.id
     ud = context.user_data
-    oid = _resolve_awaiting_payment_order_id(uid, ud)
+    await _callback_ack(q)
+    msg_txt = (q.message.text or q.message.caption or "") if q.message else ""
+    oid = _resolve_payment_order_id(
+        uid, ud, callback_data=q.data, message_text=msg_txt
+    )
     if oid is None:
-        await _callback_ack(
-            q,
+        await q.message.reply_text(
             "Сессия оплаты устарела. Откройте «📋 Мои заказы» или оформите заказ с сайта заново.",
-            show_alert=True,
+            reply_markup=REPLY_KB,
         )
         return
     o = ORDERS.get(int(oid))
     if not o or int(o.get("user_id") or 0) != int(uid):
         _clear_awaiting_payment_order_id(uid, ud)
-        await _callback_ack(
-            q,
+        await q.message.reply_text(
             "Заказ не найден. Оформите заказ с сайта ещё раз или напишите в «Связь».",
-            show_alert=True,
+            reply_markup=REPLY_KB,
         )
         return
     if o.get("paid"):
-        try:
-            await q.answer()
-        except Exception:
-            pass
         return
     if o.get("payment_proof_submitted") and not o.get("paid"):
-        try:
-            await q.answer(PAY_PROOF_WAIT, show_alert=True)
-        except Exception:
-            pass
+        await q.message.reply_text(PAY_PROOF_WAIT, reply_markup=REPLY_KB)
         return
     pr_same = _user_state_get(uid, "awaiting_proof")
     if pr_same is not None and int(pr_same) == int(oid):
@@ -10696,15 +10795,11 @@ async def on_payment_method(
         "transfer": PAY_TRANSFER_BODY,
         "crypto": PAY_CRYPTO_BODY,
     }
-    try:
-        await q.answer()
-    except Exception:
-        pass
     users_touch(uid, "payment")
     total_label = _payment_total_label(o)
     await q.message.reply_text(
         body_map[method],
-        reply_markup=_kb_paid_confirm_with_back(total_label),
+        reply_markup=_kb_paid_confirm_with_back(total_label, int(oid)),
     )
 
 
@@ -10714,51 +10809,28 @@ async def on_payment_paid(
     q = update.callback_query
     if not q or not q.from_user or not q.data or not q.message:
         return
-    if (q.data or "").strip() != "paid":
+    if not _RE_PAID_CB.match((q.data or "").strip()):
         return
     uid = q.from_user.id
     ud = context.user_data
-    oid_raw = ud.get("awaiting_payment_order_id")
-    if oid_raw is None:
-        try:
-            await q.answer()
-        except Exception:
-            pass
-        return
-    try:
-        oid = int(oid_raw)
-    except (TypeError, ValueError):
-        ud.pop("awaiting_payment_order_id", None)
-        try:
-            await q.answer()
-        except Exception:
-            pass
+    await _callback_ack(q)
+    msg_txt = (q.message.text or q.message.caption or "") if q.message else ""
+    oid = _resolve_payment_order_id(
+        uid, ud, callback_data=q.data, message_text=msg_txt
+    )
+    if oid is None:
         return
     o = ORDERS.get(oid)
     if not o or int(o.get("user_id") or 0) != int(uid):
-        try:
-            await q.answer()
-        except Exception:
-            pass
         return
     if o.get("paid"):
-        try:
-            await q.answer(MSG_ORDER_ALREADY_PAID_TOAST, show_alert=False)
-        except Exception:
-            pass
+        await q.message.reply_text(MSG_ORDER_ALREADY_PAID_TOAST, reply_markup=REPLY_KB)
         return
     if o.get("payment_proof_submitted") and not o.get("paid"):
-        try:
-            await q.answer(PAY_PROOF_WAIT, show_alert=True)
-        except Exception:
-            pass
+        await q.message.reply_text(PAY_PROOF_WAIT, reply_markup=REPLY_KB)
         return
     pr_oid = _user_state_get(uid, "awaiting_proof")
     if pr_oid is not None and int(pr_oid) == int(oid):
-        try:
-            await q.answer()
-        except Exception:
-            pass
         try:
             await q.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -10780,10 +10852,6 @@ async def on_payment_paid(
             _notify_site_cart_cleared_after_proof(uid, int(oid), o)
         )
     except RuntimeError:
-        pass
-    try:
-        await q.answer()
-    except Exception:
         pass
     try:
         await q.message.edit_reply_markup(reply_markup=None)
@@ -11643,19 +11711,21 @@ def main() -> None:
     app.add_handler(
         CallbackQueryHandler(
             on_payment_cancel,
-            pattern=re.compile(r"^pay_cancel$"),
+            pattern=re.compile(r"^pay_cancel(:\d+)?$"),
         ),
         group=-1,
     )
     app.add_handler(
         CallbackQueryHandler(
             on_payment_method,
-            pattern=re.compile(r"^pay_(card|transfer|crypto)$"),
+            pattern=re.compile(r"^pay_(card|transfer|crypto)(:\d+)?$"),
         ),
         group=-1,
     )
     app.add_handler(
-        CallbackQueryHandler(on_payment_paid, pattern=re.compile(r"^paid$")),
+        CallbackQueryHandler(
+            on_payment_paid, pattern=re.compile(r"^paid(:\d+)?$")
+        ),
         group=-1,
     )
     app.add_handler(CommandHandler("start", start))
@@ -11744,10 +11814,14 @@ def main() -> None:
     app.add_handler(
         CallbackQueryHandler(
             on_payment_method,
-            pattern=re.compile(r"^pay_(card|transfer|crypto)$"),
+            pattern=re.compile(r"^pay_(card|transfer|crypto)(:\d+)?$"),
         )
     )
-    app.add_handler(CallbackQueryHandler(on_payment_paid, pattern=re.compile(r"^paid$")))
+    app.add_handler(
+        CallbackQueryHandler(
+            on_payment_paid, pattern=re.compile(r"^paid(:\d+)?$")
+        )
+    )
     app.add_handler(
         CallbackQueryHandler(
             on_admin_confirm_payment,
