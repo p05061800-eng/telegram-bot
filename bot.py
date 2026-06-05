@@ -940,7 +940,7 @@ def _apply_post_deploy_session_reset(uid: int, user_data: dict) -> None:
             _user_state_pop(uid, "awaiting_payment_order_id")
     proof = _user_state_get(uid, "awaiting_proof")
     if proof is not None:
-        po = _ensure_order_in_orders(int(proof), int(uid))
+        po = _restore_order_by_id(int(proof)) or _ensure_order_in_orders(int(proof), int(uid))
         if (
             isinstance(po, dict)
             and int(po.get("user_id") or 0) == int(uid)
@@ -4941,6 +4941,32 @@ def _refresh_unpaid_order_payment(
     return int(o.get("total") or 0), str(o.get("payment_currency") or pay_cur)
 
 
+def _restore_order_by_id(oid: int) -> Optional[dict]:
+    """ORDERS после рестарта: найти заказ по id в USER_ORDERS."""
+    try:
+        oid_i = int(oid)
+    except (TypeError, ValueError):
+        return None
+    o = ORDERS.get(oid_i)
+    if isinstance(o, dict):
+        return o
+    for uid_k, lst in USER_ORDERS.items():
+        try:
+            uid_i = int(uid_k)
+        except (TypeError, ValueError):
+            continue
+        for rec in lst or []:
+            if not isinstance(rec, dict):
+                continue
+            try:
+                rid = int(str(rec.get("id") or "0"))
+            except (TypeError, ValueError):
+                continue
+            if rid == oid_i:
+                return _ensure_order_in_orders(oid_i, uid_i)
+    return None
+
+
 def _ensure_order_in_orders(oid: int, uid: int) -> Optional[dict]:
     """ORDERS после рестарта: восстановить запись из USER_ORDERS по id."""
     try:
@@ -5071,7 +5097,10 @@ def _format_admin_order_detail_text(order_id: int, o: dict) -> str:
     d = o.get("delivery") if isinstance(o.get("delivery"), dict) else None
     line_cur = _order_line_currency_from_delivery(d)
     items_block = _format_order_items_for_admin(list(o.get("items") or []), line_cur)
-    tot = _order_resolved_grand_total(o)
+    tot, pay_cur = _order_payment_display(o)
+    if int(tot) <= 0:
+        tot = _order_resolved_grand_total(o)
+        pay_cur = line_cur
     st = str(o.get("status") or "new")
     st_ru = _order_status_label_ru(st)
     dline = _format_delivery_block(d)
@@ -5111,7 +5140,7 @@ def _format_admin_order_detail_text(order_id: int, o: dict) -> str:
     parts.extend(
         [
             "",
-            f"💰 К оплате: {tot} {line_cur}",
+            f"💰 К оплате: {tot} {pay_cur}",
             "",
             f"📊 Статус: {st_ru}",
             "",
@@ -5220,7 +5249,7 @@ async def _notify_admin_new_order(
     bonus_applied: int = 0,
     bonus_points_spent: int = 0,
 ) -> Optional[int]:
-    """Создать заказ в ORDERS и отправить карточку админу с кнопками действий."""
+    """Создать заказ в ORDERS; карточка админу — после подтверждения оплаты по фото чека."""
     global ORDER_COUNTER
     order_id = int(ORDER_COUNTER)
     uid = int(user.id) if user else 0
@@ -5254,7 +5283,6 @@ async def _notify_admin_new_order(
     ORDERS[order_id] = rec
     if uid:
         users_touch(uid, activity_only=True)
-    await _send_deferred_admin_order_panel(context, order_id, rec)
     save_state()
     return order_id
 
@@ -5391,34 +5419,40 @@ def _ensure_awaiting_proof_session(uid: int, ud: Optional[dict] = None) -> Optio
     ap = _user_state_get(uid, "awaiting_proof")
     if ap is not None:
         return int(ap)
-    pay_pend = _user_state_get(uid, "awaiting_payment_order_id")
-    if pay_pend is not None:
-        po = _ensure_order_in_orders(int(pay_pend), int(uid))
+    ud_d = ud if isinstance(ud, dict) else {}
+    candidates: List[int] = []
+    for raw in (
+        _user_state_get(uid, "awaiting_payment_order_id"),
+        ud_d.get("awaiting_payment_order_id"),
+    ):
+        if raw is None:
+            continue
+        try:
+            candidates.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    latest = _find_latest_unpaid_order_id(uid)
+    if latest is not None:
+        candidates.append(int(latest))
+    seen: set = set()
+    for oid_i in reversed(candidates):
+        if oid_i in seen:
+            continue
+        seen.add(oid_i)
+        po = _ensure_order_in_orders(oid_i, int(uid))
         if (
             isinstance(po, dict)
             and int(po.get("user_id") or 0) == int(uid)
             and not po.get("paid")
-            and not po.get("payment_proof_submitted")
         ):
-            _user_state_bucket(uid)["awaiting_proof"] = int(pay_pend)
-            return int(pay_pend)
-    ud_d = ud if isinstance(ud, dict) else {}
-    oid = _resolve_awaiting_payment_order_id(uid, ud_d)
-    if oid is not None:
-        po = _ensure_order_in_orders(int(oid), int(uid))
-        if (
-            isinstance(po, dict)
-            and not po.get("paid")
-            and not po.get("payment_proof_submitted")
-        ):
-            _user_state_bucket(uid)["awaiting_proof"] = int(oid)
-            return int(oid)
+            _user_state_set(uid, "awaiting_proof", oid_i)
+            return oid_i
     return None
 
 
 def _set_awaiting_proof_session(uid: int, ud: dict, oid: int) -> None:
     oid_i = int(oid)
-    _user_state_bucket(uid)["awaiting_proof"] = oid_i
+    _user_state_set(uid, "awaiting_proof", oid_i)
     _bind_payment_order_session(uid, ud, oid_i)
 
 
@@ -9183,12 +9217,32 @@ async def on_callback_query_unhandled(
     if _RE_PAID_CB.match(data):
         await on_payment_paid(update, context)
         return
+    if re.match(r"^(accept|sent|cancel|done|delmsg)_\d+$", data):
+        await on_order_status_buttons(update, context)
+        return
+    if re.match(r"^confirm_payment_\d+$", data):
+        await on_admin_confirm_payment(update, context)
+        return
+    if re.match(r"^reject_payment_\d+$", data):
+        await on_admin_reject_payment(update, context)
+        return
+    if re.match(r"^oam:rep:\d+$", data):
+        await on_order_admin_action(update, context)
+        return
+    if _is_bot_checkout_payment_callback(data):
+        await _callback_ack(q)
+        return
     parsed = _resolve_site_order_action(q)
     if parsed:
         await on_site_order_button_callback(update, context, parsed=parsed)
         return
     await _callback_ack(q)
     if not q.message:
+        return
+    if re.match(
+        r"^(accept|sent|cancel|done|delmsg|confirm_payment|reject_payment|oam:rep)_",
+        data,
+    ):
         return
     if _message_looks_like_order_preview(q.message.text or q.message.caption or ""):
         logging.getLogger(__name__).error(
@@ -9655,7 +9709,7 @@ async def on_admin_open_order(
     except ValueError:
         await q.answer()
         return
-    o = ORDERS.get(oid)
+    o = _restore_order_by_id(oid)
     if not o:
         try:
             await q.answer("Заказ не найден", show_alert=False)
@@ -9686,7 +9740,7 @@ async def on_order_admin_action(
     except ValueError:
         await q.answer()
         return
-    o = ORDERS.get(oid)
+    o = _restore_order_by_id(oid)
     if not o:
         try:
             await q.answer("Заказ не найден", show_alert=False)
@@ -9793,7 +9847,7 @@ async def on_order_status_buttons(
     except ValueError:
         await q.answer()
         return
-    o = ORDERS.get(oid)
+    o = _restore_order_by_id(oid)
     if not o:
         try:
             await q.answer("Заказ не найден", show_alert=False)
@@ -11215,10 +11269,18 @@ async def on_payment_paid(
     if o.get("paid"):
         await q.message.reply_text(MSG_ORDER_ALREADY_PAID_TOAST, reply_markup=REPLY_KB)
         return
-    if o.get("payment_proof_submitted") and not o.get("paid"):
+    if (
+        o.get("payment_proof_submitted")
+        and not o.get("paid")
+        and o.get("payment_proof_admin_message_id")
+    ):
         await q.message.reply_text(PAY_PROOF_WAIT, reply_markup=REPLY_KB)
         return
     _set_awaiting_proof_session(uid, ud, int(oid))
+    try:
+        save_state()
+    except Exception:
+        log.exception("on_payment_paid proof session save uid=%s oid=%s", uid, oid)
     pm = ud.pop("payment_pending_method", None)
     if pm:
         o["payment_pending_method"] = pm
@@ -11267,28 +11329,38 @@ async def _send_or_edit_admin_payment_proof(
                 media=InputMediaPhoto(media=file_id, caption=caption),
                 reply_markup=kb,
             )
+            log.info(
+                "payment proof edited admin chat=%s msg=%s order_id=%s",
+                cid,
+                mid,
+                order_id,
+            )
             return True
         except Exception as e:
-            log.info("payment proof edit_media: %s", e)
-    try:
-        sent = await context.bot.send_photo(
-            chat_id=ORDER_NOTIFY_TARGET,
-            photo=file_id,
-            caption=caption,
-            reply_markup=kb,
-        )
-    except Exception:
-        log.exception("скрин оплаты → ORDER_NOTIFY_TARGET order_id=%s", order_id)
+            log.info("payment proof edit_media order_id=%s: %s", order_id, e)
+    targets = _admin_order_notify_targets() or [int(ADMIN_ID)]
+    sent = None
+    for tgt in targets:
         try:
             sent = await context.bot.send_photo(
-                chat_id=ADMIN_ID,
+                chat_id=tgt,
                 photo=file_id,
                 caption=caption,
                 reply_markup=kb,
             )
+            log.info(
+                "payment proof sent admin target=%s order_id=%s msg=%s",
+                tgt,
+                order_id,
+                sent.message_id,
+            )
+            break
         except Exception:
-            log.exception("скрин оплаты → ADMIN_ID order_id=%s", order_id)
-            return False
+            log.exception(
+                "скрин оплаты → admin target=%s order_id=%s", tgt, order_id
+            )
+    if sent is None:
+        return False
     o["payment_proof_admin_chat_id"] = int(sent.chat_id)
     o["payment_proof_admin_message_id"] = int(sent.message_id)
     return True
@@ -11361,6 +11433,14 @@ async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 )
             except Exception:
                 pass
+        elif uid and _find_latest_unpaid_order_id(uid) is not None:
+            try:
+                await msg.reply_text(
+                    "Не вижу изображение. Пришлите скрин как фото или картинку (PNG/JPG), не PDF.",
+                    reply_markup=REPLY_KB,
+                )
+            except Exception:
+                pass
         return
     if uid:
         cap_log = (msg.caption or "").strip()
@@ -11417,6 +11497,19 @@ async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
         return
     if uid:
+        rebound = _ensure_awaiting_proof_session(uid, ud)
+        if rebound is not None:
+            try:
+                await on_payment_proof_photo(update, context)
+            except Exception:
+                log.exception(
+                    "on_payment_proof_photo rebound uid=%s oid=%s", uid, rebound
+                )
+                try:
+                    await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
+                except Exception:
+                    pass
+            return
         try:
             await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
         except Exception:
@@ -11462,7 +11555,11 @@ async def on_payment_proof_photo(
         _user_state_pop(uid, "awaiting_proof")
         await msg.reply_text(MSG_ORDER_ALREADY_PAID_SKIP_PROOF)
         return
-    if o.get("payment_proof_submitted") and not o.get("paid"):
+    if (
+        o.get("payment_proof_submitted")
+        and not o.get("paid")
+        and o.get("payment_proof_admin_message_id")
+    ):
         await msg.reply_text(PAY_PROOF_WAIT)
         return
     _clear_crypto_auto_watch(o, uid)
@@ -11509,7 +11606,7 @@ async def on_admin_confirm_payment(
     except ValueError:
         await q.answer()
         return
-    o = ORDERS.get(oid)
+    o = _restore_order_by_id(oid)
     if not o:
         await q.answer()
         return
@@ -11604,7 +11701,7 @@ async def on_admin_reject_payment(
     except ValueError:
         await q.answer()
         return
-    o = ORDERS.get(oid)
+    o = _restore_order_by_id(oid)
     if not o:
         await q.answer()
         return
@@ -12155,6 +12252,34 @@ def main() -> None:
 
     app.add_handler(
         TypeHandler(Update, track_user_activity, block=False),
+        group=-1,
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_order_status_buttons,
+            pattern=re.compile(r"^(accept|sent|cancel|done|delmsg)_\d+$"),
+        ),
+        group=-1,
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_order_admin_action,
+            pattern=re.compile(r"^oam:rep:\d+$"),
+        ),
+        group=-1,
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_admin_confirm_payment,
+            pattern=re.compile(r"^confirm_payment_\d+$"),
+        ),
+        group=-1,
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_admin_reject_payment,
+            pattern=re.compile(r"^reject_payment_\d+$"),
+        ),
         group=-1,
     )
     app.add_handler(
