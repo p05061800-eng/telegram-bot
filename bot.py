@@ -929,24 +929,24 @@ def _apply_post_deploy_session_reset(uid: int, user_data: dict) -> None:
         user_data.pop(k, None)
     pend = _user_state_get(uid, "awaiting_payment_order_id")
     if pend is not None:
-        o = ORDERS.get(int(pend))
+        po = _ensure_order_in_orders(int(pend), int(uid))
         if (
-            isinstance(o, dict)
-            and int(o.get("user_id") or 0) == int(uid)
-            and not o.get("paid")
+            isinstance(po, dict)
+            and int(po.get("user_id") or 0) == int(uid)
+            and not po.get("paid")
         ):
             user_data["awaiting_payment_order_id"] = int(pend)
         else:
             _user_state_pop(uid, "awaiting_payment_order_id")
     proof = _user_state_get(uid, "awaiting_proof")
     if proof is not None:
-        po = ORDERS.get(int(proof))
+        po = _ensure_order_in_orders(int(proof), int(uid))
         if (
             isinstance(po, dict)
             and int(po.get("user_id") or 0) == int(uid)
             and not po.get("paid")
         ):
-            pass
+            user_data["awaiting_payment_order_id"] = int(proof)
         else:
             _user_state_pop(uid, "awaiting_proof")
     t_task = user_data.get("tinder_autoplay_task")
@@ -5335,7 +5335,18 @@ def _image_file_id_from_message(msg: Optional[Message]) -> Optional[str]:
     if msg.photo:
         return str(msg.photo[-1].file_id)
     doc = msg.document
-    if doc and str(doc.mime_type or "").lower().startswith("image/"):
+    if not doc:
+        return None
+    mime = str(doc.mime_type or "").lower()
+    fname = str(doc.file_name or "").lower()
+    if mime.startswith("image/"):
+        return str(doc.file_id)
+    if any(
+        fname.endswith(ext)
+        for ext in (".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif", ".gif", ".bmp")
+    ):
+        return str(doc.file_id)
+    if not mime or mime == "application/octet-stream":
         return str(doc.file_id)
     return None
 
@@ -5380,12 +5391,35 @@ def _ensure_awaiting_proof_session(uid: int, ud: Optional[dict] = None) -> Optio
     ap = _user_state_get(uid, "awaiting_proof")
     if ap is not None:
         return int(ap)
+    pay_pend = _user_state_get(uid, "awaiting_payment_order_id")
+    if pay_pend is not None:
+        po = _ensure_order_in_orders(int(pay_pend), int(uid))
+        if (
+            isinstance(po, dict)
+            and int(po.get("user_id") or 0) == int(uid)
+            and not po.get("paid")
+            and not po.get("payment_proof_submitted")
+        ):
+            _user_state_bucket(uid)["awaiting_proof"] = int(pay_pend)
+            return int(pay_pend)
     ud_d = ud if isinstance(ud, dict) else {}
     oid = _resolve_awaiting_payment_order_id(uid, ud_d)
     if oid is not None:
-        _user_state_bucket(uid)["awaiting_proof"] = int(oid)
-        return int(oid)
+        po = _ensure_order_in_orders(int(oid), int(uid))
+        if (
+            isinstance(po, dict)
+            and not po.get("paid")
+            and not po.get("payment_proof_submitted")
+        ):
+            _user_state_bucket(uid)["awaiting_proof"] = int(oid)
+            return int(oid)
     return None
+
+
+def _set_awaiting_proof_session(uid: int, ud: dict, oid: int) -> None:
+    oid_i = int(oid)
+    _user_state_bucket(uid)["awaiting_proof"] = oid_i
+    _bind_payment_order_session(uid, ud, oid_i)
 
 
 def _bind_payment_order_session(uid: int, ud: dict, oid: int) -> None:
@@ -11184,21 +11218,11 @@ async def on_payment_paid(
     if o.get("payment_proof_submitted") and not o.get("paid"):
         await q.message.reply_text(PAY_PROOF_WAIT, reply_markup=REPLY_KB)
         return
-    pr_oid = _user_state_get(uid, "awaiting_proof")
-    if pr_oid is not None and int(pr_oid) == int(oid):
-        try:
-            await q.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        await q.message.reply_text(
-            PAY_PROOF_REQUEST, reply_markup=_kb_proof_step_back()
-        )
-        return
+    _set_awaiting_proof_session(uid, ud, int(oid))
     pm = ud.pop("payment_pending_method", None)
     if pm:
         o["payment_pending_method"] = pm
     _clear_crypto_auto_watch(o, uid)
-    _user_state_set(uid, "awaiting_proof", int(oid))
     _clear_checkout_delivery(ud)
     _cart_clear_site_pricing_hints(uid)
     _clear_user_cart_after_payment_proof(uid, int(oid), o)
@@ -11312,11 +11336,32 @@ async def _forward_support_photo_to_admin(
 
 async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Фото/картинка: скрин оплаты (awaiting_proof), postpaid_thread, иначе «Связь»."""
+    log = logging.getLogger(__name__)
     msg = update.effective_message
-    if not msg or not _image_file_id_from_message(msg):
+    if not msg:
         return
     uid = msg.from_user.id if msg.from_user else 0
     ud = context.user_data if isinstance(context.user_data, dict) else {}
+    file_id_peek = _image_file_id_from_message(msg)
+    proof_peek = _ensure_awaiting_proof_session(uid, ud) if uid else None
+    log.info(
+        "user_photo uid=%s proof_oid=%s has_file=%s photo=%s doc=%s",
+        uid,
+        proof_peek,
+        bool(file_id_peek),
+        bool(msg.photo),
+        bool(msg.document),
+    )
+    if not file_id_peek:
+        if proof_peek is not None:
+            try:
+                await msg.reply_text(
+                    "Не вижу изображение. Пришлите скрин оплаты как фото (не PDF).",
+                    reply_markup=REPLY_KB,
+                )
+            except Exception:
+                pass
+        return
     if uid:
         cap_log = (msg.caption or "").strip()
         _remember_user_message(
@@ -11325,13 +11370,12 @@ async def on_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "photo",
             cap_log or "[фото]",
         )
-    proof_oid = _ensure_awaiting_proof_session(uid, ud)
-    if uid and proof_oid is not None:
+    if uid and proof_peek is not None:
         try:
             await on_payment_proof_photo(update, context)
         except Exception:
             logging.getLogger(__name__).exception(
-                "on_payment_proof_photo uid=%s oid=%s", uid, proof_oid
+                "on_payment_proof_photo uid=%s oid=%s", uid, proof_peek
             )
             try:
                 await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
@@ -11386,6 +11430,11 @@ async def on_payment_proof_photo(
     msg = update.effective_message
     file_id = _image_file_id_from_message(msg)
     if not msg or not file_id:
+        if msg:
+            await msg.reply_text(
+                "Не удалось прочитать файл. Отправьте скрин как фото.",
+                reply_markup=REPLY_KB,
+            )
         return
     ud = context.user_data if isinstance(context.user_data, dict) else {}
     uid = msg.from_user.id if msg.from_user else 0
@@ -12268,7 +12317,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_pick_category, pattern=re.compile(r"^c:(\d+|all)$")))
     app.add_handler(CallbackQueryHandler(on_callback_query_unhandled), group=99)
     app.add_handler(
-        MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_user_photo),
+        MessageHandler(filters.PHOTO | filters.Document.ALL, on_user_photo),
         group=-1,
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
