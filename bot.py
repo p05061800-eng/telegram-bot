@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-06-orders-v6"
+BOT_BUILD_ID = "2026-06-06-proof-v7"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -5501,7 +5501,64 @@ async def _notify_admin_new_order(
     if uid:
         users_touch(uid, activity_only=True)
     save_state()
+    await _notify_admin_pending_payment(context, order_id, rec)
     return order_id
+
+
+async def _notify_admin_pending_payment(
+    context: ContextTypes.DEFAULT_TYPE, order_id: int, o: dict
+) -> None:
+    """Короткое уведомление админу: заказ создан, ждём скрин оплаты."""
+    log = logging.getLogger(__name__)
+    uid = int(o.get("user_id") or 0)
+    un = str(o.get("username") or "").strip().lstrip("@")
+    who = f"@{un}" if un else f"id {uid}"
+    tot, cur = _order_payment_display(o)
+    text = (
+        f"🛒 Новый заказ #{order_id}\n"
+        f"👤 {who}\n"
+        f"💰 К оплате: {tot} {cur}\n\n"
+        "Клиент на шаге оплаты — пришлём чек, когда отправит скрин."
+    )
+    for tgt in _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else []):
+        try:
+            await context.bot.send_message(
+                chat_id=tgt,
+                text=text,
+                disable_web_page_preview=True,
+            )
+            log.info("admin pending payment notify target=%s order=%s", tgt, order_id)
+        except Exception:
+            log.exception(
+                "admin pending payment notify target=%s order=%s", tgt, order_id
+            )
+
+
+async def _notify_admin_awaiting_proof(
+    context: ContextTypes.DEFAULT_TYPE, order_id: int, o: dict
+) -> None:
+    """Клиент нажал «Я оплатил» — скоро пришлёт скрин."""
+    log = logging.getLogger(__name__)
+    uid = int(o.get("user_id") or 0)
+    un = str(o.get("username") or "").strip().lstrip("@")
+    who = f"@{un}" if un else f"id {uid}"
+    text = (
+        f"📸 Ждём чек · Заказ #{order_id}\n"
+        f"👤 {who}\n\n"
+        "Клиент подтвердил оплату — скоро пришлёт скрин."
+    )
+    for tgt in _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else []):
+        try:
+            await context.bot.send_message(
+                chat_id=tgt,
+                text=text,
+                disable_web_page_preview=True,
+            )
+            log.info("admin awaiting proof notify target=%s order=%s", tgt, order_id)
+        except Exception:
+            log.exception(
+                "admin awaiting proof notify target=%s order=%s", tgt, order_id
+            )
 
 
 _RE_PAY_METHOD_CB = re.compile(r"^pay_(card|transfer|crypto)(?::(?P<oid>\d+))?$")
@@ -6101,11 +6158,17 @@ async def _ensure_customer_admin_folder(
     row = users_ensure(uid_i)
     cid = row.get("admin_folder_chat_id")
     mid = row.get("admin_folder_message_id")
+    targets = _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else [])
+    target_ids = {int(t) for t in targets if isinstance(t, int)}
     if cid is not None and mid is not None:
         try:
-            return int(cid), int(mid)
+            cid_i, mid_i = int(cid), int(mid)
+            if cid_i in target_ids:
+                return cid_i, mid_i
         except (TypeError, ValueError):
             pass
+        row.pop("admin_folder_chat_id", None)
+        row.pop("admin_folder_message_id", None)
     name = _user_display_name(uid_i, username)
     text = (
         f"📁 Клиент: {name}\n"
@@ -11680,6 +11743,10 @@ async def on_payment_paid(
         PAY_PROOF_REQUEST, reply_markup=_kb_proof_step_back()
     )
     try:
+        await _notify_admin_awaiting_proof(context, int(oid), o)
+    except Exception:
+        log.exception("on_payment_paid admin notify uid=%s oid=%s", uid, oid)
+    try:
         save_state()
     except Exception:
         logging.getLogger(__name__).exception(
@@ -11696,8 +11763,14 @@ async def _send_or_edit_admin_payment_proof(
 ) -> bool:
     """Сообщение админу со скрином и кнопками подтверждения; при повторной отправке — edit."""
     log = logging.getLogger(__name__)
+    if len(caption) > 1024:
+        caption = caption[:1021] + "…"
     cust_uid = int(o.get("user_id") or 0)
     kb = _kb_payment_admin_review(order_id, cust_uid)
+    targets = _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else [])
+    if not targets:
+        log.error("payment proof: admin targets empty order_id=%s", order_id)
+        return False
     folder_cid, folder_mid = await _ensure_customer_admin_folder(
         context,
         cust_uid,
@@ -11722,38 +11795,72 @@ async def _send_or_edit_admin_payment_proof(
             return True
         except Exception as e:
             log.info("payment proof edit_media order_id=%s: %s", order_id, e)
-    targets = _admin_order_notify_targets() or [int(ADMIN_ID)]
     sent = None
     for tgt in targets:
-        try:
-            kw: dict = {
-                "chat_id": tgt,
-                "photo": file_id,
-                "caption": caption,
-                "reply_markup": kb,
-            }
-            if (
-                folder_cid is not None
-                and folder_mid is not None
-                and int(folder_cid) == int(tgt)
-            ):
-                kw["reply_to_message_id"] = int(folder_mid)
-            sent = await context.bot.send_photo(**kw)
-            log.info(
-                "payment proof sent admin target=%s order_id=%s uid=%s msg=%s",
-                tgt,
-                order_id,
-                cust_uid,
-                sent.message_id,
-            )
+        for with_reply in (True, False):
+            try:
+                kw: dict = {
+                    "chat_id": tgt,
+                    "photo": file_id,
+                    "caption": caption,
+                    "reply_markup": kb,
+                }
+                if (
+                    with_reply
+                    and folder_cid is not None
+                    and folder_mid is not None
+                    and int(folder_cid) == int(tgt)
+                ):
+                    kw["reply_to_message_id"] = int(folder_mid)
+                sent = await context.bot.send_photo(**kw)
+                log.info(
+                    "payment proof sent admin target=%s order_id=%s uid=%s msg=%s reply=%s",
+                    tgt,
+                    order_id,
+                    cust_uid,
+                    sent.message_id,
+                    with_reply,
+                )
+                break
+            except Exception as e:
+                log.warning(
+                    "payment proof send_photo target=%s order_id=%s reply=%s: %s",
+                    tgt,
+                    order_id,
+                    with_reply,
+                    e,
+                )
+        if sent is not None:
             break
-        except Exception:
-            log.exception(
-                "скрин оплаты → admin target=%s order_id=%s uid=%s",
-                tgt,
-                order_id,
-                cust_uid,
-            )
+    if sent is None:
+        short = (
+            f"📸 Чек оплаты · Заказ #{order_id}\n"
+            f"👤 id {cust_uid}\n"
+            "Фото ниже ↓"
+        )
+        for tgt in targets:
+            try:
+                sent = await context.bot.send_photo(chat_id=tgt, photo=file_id)
+                await context.bot.send_message(
+                    chat_id=tgt,
+                    text=short + "\n\n" + caption[:3500],
+                    reply_markup=kb,
+                    reply_to_message_id=int(sent.message_id),
+                )
+                log.info(
+                    "payment proof fallback split target=%s order_id=%s msg=%s",
+                    tgt,
+                    order_id,
+                    sent.message_id,
+                )
+                break
+            except Exception:
+                log.exception(
+                    "payment proof fallback target=%s order_id=%s uid=%s",
+                    tgt,
+                    order_id,
+                    cust_uid,
+                )
     if sent is None:
         return False
     o["payment_proof_admin_chat_id"] = int(sent.chat_id)
@@ -12069,6 +12176,13 @@ async def on_payment_proof_photo(
         save_state()
     except Exception:
         log.exception("payment_proof_photo save_state uid=%s oid=%s", uid, oid)
+    try:
+        await msg.reply_text(
+            "✅ Чек передан администратору. Ожидайте подтверждения оплаты.",
+            reply_markup=REPLY_KB,
+        )
+    except Exception:
+        log.exception("payment_proof_photo customer ok uid=%s oid=%s", uid, oid)
     log.info("payment_proof_photo ok uid=%s oid=%s", uid, oid)
 
 
