@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-06-admin-panel-v9"
+BOT_BUILD_ID = "2026-06-06-proof-v10"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -785,21 +785,6 @@ async def track_user_activity(
         users_touch(uid, activity_only=True)
         _register_login_username(uid, getattr(u, "username", None))
         _sync_user_delivery_country_to_user_data(uid, context.user_data)
-        msg = update.message
-        if (
-            msg
-            and not is_admin(uid)
-            and _image_file_id_from_message(msg)
-            and _user_wants_proof_upload(
-                uid,
-                context.user_data if isinstance(context.user_data, dict) else {},
-                msg,
-            )
-        ):
-            ack_key = f"proof_ack:{msg.chat_id}:{msg.message_id}"
-            if not context.application.bot_data.get(ack_key):
-                context.application.bot_data[ack_key] = True
-                asyncio.create_task(_send_proof_received_ack(msg))
     except Exception:
         logging.getLogger(__name__).exception("USERS touch")
 
@@ -11899,7 +11884,7 @@ async def _send_or_edit_admin_payment_proof(
     *,
     customer_msg: Optional[Message] = None,
 ) -> bool:
-    """Сообщение админу со скрином и кнопками подтверждения; при повторной отправке — edit."""
+    """Скрин оплаты админу: copy_message → send_photo → forward (без reply в «папку»)."""
     log = logging.getLogger(__name__)
     if len(caption) > 1024:
         caption = caption[:1021] + "…"
@@ -11909,147 +11894,129 @@ async def _send_or_edit_admin_payment_proof(
     if not targets:
         log.error("payment proof: admin targets empty order_id=%s", order_id)
         return False
-    target_ids = _admin_target_chat_ids()
-    folder_cid, folder_mid = await _ensure_customer_admin_folder(
-        context,
+    log.info(
+        "payment proof send order_id=%s uid=%s targets=%s admin_id=%s",
+        order_id,
         cust_uid,
-        str(o.get("username") or "").strip() or None,
+        targets,
+        ADMIN_ID,
     )
-    cid = o.get("payment_proof_admin_chat_id")
-    mid = o.get("payment_proof_admin_message_id")
-    if cid is not None and mid is not None:
-        try:
-            cid_i = int(cid)
-        except (TypeError, ValueError):
-            cid_i = None
-        if cid_i is None or cid_i not in target_ids:
-            log.info(
-                "payment proof stale admin chat=%s targets=%s order_id=%s — resend",
-                cid,
-                sorted(target_ids),
-                order_id,
-            )
-            o.pop("payment_proof_admin_chat_id", None)
-            o.pop("payment_proof_admin_message_id", None)
-        else:
-            try:
-                await context.bot.edit_message_media(
-                    chat_id=cid_i,
-                    message_id=int(mid),
-                    media=InputMediaPhoto(media=file_id, caption=caption),
-                    reply_markup=kb,
-                )
-                log.info(
-                    "payment proof edited admin chat=%s msg=%s order_id=%s",
-                    cid_i,
-                    mid,
-                    order_id,
-                )
-                return True
-            except Exception as e:
-                log.info("payment proof edit_media order_id=%s: %s", order_id, e)
-                o.pop("payment_proof_admin_chat_id", None)
-                o.pop("payment_proof_admin_message_id", None)
+    o.pop("payment_proof_admin_chat_id", None)
+    o.pop("payment_proof_admin_message_id", None)
     sent = None
+    last_err: Optional[Exception] = None
+
+    async def _try_copy(tgt: object) -> Optional[Message]:
+        if customer_msg is None:
+            return None
+        try:
+            return await context.bot.copy_message(
+                chat_id=tgt,
+                from_chat_id=int(customer_msg.chat_id),
+                message_id=int(customer_msg.message_id),
+                caption=caption,
+                reply_markup=kb,
+            )
+        except Exception as e:
+            nonlocal last_err
+            last_err = e
+            log.warning("payment proof copy_message target=%s order=%s: %s", tgt, order_id, e)
+            return None
+
+    async def _try_photo(tgt: object) -> Optional[Message]:
+        try:
+            return await context.bot.send_photo(
+                chat_id=tgt,
+                photo=file_id,
+                caption=caption,
+                reply_markup=kb,
+            )
+        except Exception as e:
+            nonlocal last_err
+            last_err = e
+            log.warning("payment proof send_photo target=%s order=%s: %s", tgt, order_id, e)
+            return None
+
+    async def _try_forward(tgt: object) -> Optional[Message]:
+        if customer_msg is None:
+            return None
+        try:
+            fwd = await context.bot.forward_message(
+                chat_id=tgt,
+                from_chat_id=int(customer_msg.chat_id),
+                message_id=int(customer_msg.message_id),
+            )
+            await context.bot.send_message(
+                chat_id=tgt,
+                text=caption[:4090],
+                reply_markup=kb,
+                reply_to_message_id=int(fwd.message_id),
+            )
+            return fwd
+        except Exception as e:
+            nonlocal last_err
+            last_err = e
+            log.exception("payment proof forward target=%s order=%s", tgt, order_id)
+            return None
+
     for tgt in targets:
-        for with_reply in (True, False):
-            try:
-                kw: dict = {
-                    "chat_id": tgt,
-                    "photo": file_id,
-                    "caption": caption,
-                    "reply_markup": kb,
-                }
-                if (
-                    with_reply
-                    and folder_cid is not None
-                    and folder_mid is not None
-                    and int(folder_cid) == int(tgt)
-                ):
-                    kw["reply_to_message_id"] = int(folder_mid)
-                sent = await context.bot.send_photo(**kw)
-                log.info(
-                    "payment proof sent admin target=%s order_id=%s uid=%s msg=%s reply=%s",
-                    tgt,
-                    order_id,
-                    cust_uid,
-                    sent.message_id,
-                    with_reply,
-                )
-                break
-            except Exception as e:
-                log.warning(
-                    "payment proof send_photo target=%s order_id=%s reply=%s: %s",
-                    tgt,
-                    order_id,
-                    with_reply,
-                    e,
-                )
+        sent = await _try_copy(tgt)
         if sent is not None:
             break
+        sent = await _try_photo(tgt)
+        if sent is not None:
+            break
+        sent = await _try_forward(tgt)
+        if sent is not None:
+            break
+
     if sent is None:
-        short = (
-            f"📸 Чек оплаты · Заказ #{order_id}\n"
-            f"👤 id {cust_uid}\n"
-            "Фото ниже ↓"
+        short = f"📸 Чек · Заказ #{order_id} · клиент id {cust_uid}\n\nФото не удалось прикрепить автоматически."
+        for tgt in targets:
+            try:
+                alert = await context.bot.send_message(
+                    chat_id=tgt,
+                    text=short,
+                    reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
+                if customer_msg is not None:
+                    sent = await context.bot.copy_message(
+                        chat_id=tgt,
+                        from_chat_id=int(customer_msg.chat_id),
+                        message_id=int(customer_msg.message_id),
+                        reply_to_message_id=int(alert.message_id),
+                    )
+                else:
+                    sent = await context.bot.send_photo(chat_id=tgt, photo=file_id)
+                log.info(
+                    "payment proof alert+copy target=%s order=%s msg=%s",
+                    tgt,
+                    order_id,
+                    sent.message_id if sent else None,
+                )
+                break
+            except Exception as e:
+                last_err = e
+                log.exception("payment proof alert target=%s order=%s", tgt, order_id)
+
+    if sent is None:
+        log.error(
+            "payment proof all methods failed order_id=%s uid=%s last_err=%s",
+            order_id,
+            cust_uid,
+            last_err,
         )
-        for tgt in targets:
-            try:
-                sent = await context.bot.send_photo(chat_id=tgt, photo=file_id)
-                await context.bot.send_message(
-                    chat_id=tgt,
-                    text=short + "\n\n" + caption[:3500],
-                    reply_markup=kb,
-                    reply_to_message_id=int(sent.message_id),
-                )
-                log.info(
-                    "payment proof fallback split target=%s order_id=%s msg=%s",
-                    tgt,
-                    order_id,
-                    sent.message_id,
-                )
-                break
-            except Exception:
-                log.exception(
-                    "payment proof fallback target=%s order_id=%s uid=%s",
-                    tgt,
-                    order_id,
-                    cust_uid,
-                )
-    if sent is None and customer_msg is not None:
-        for tgt in targets:
-            try:
-                fwd = await context.bot.forward_message(
-                    chat_id=tgt,
-                    from_chat_id=int(customer_msg.chat_id),
-                    message_id=int(customer_msg.message_id),
-                )
-                await context.bot.send_message(
-                    chat_id=tgt,
-                    text=caption[:4090],
-                    reply_markup=kb,
-                    reply_to_message_id=int(fwd.message_id),
-                )
-                sent = fwd
-                log.info(
-                    "payment proof forward target=%s order_id=%s uid=%s msg=%s",
-                    tgt,
-                    order_id,
-                    cust_uid,
-                    fwd.message_id,
-                )
-                break
-            except Exception:
-                log.exception(
-                    "payment proof forward target=%s order_id=%s uid=%s",
-                    tgt,
-                    order_id,
-                    cust_uid,
-                )
-    if sent is None:
         return False
+
     o["payment_proof_admin_chat_id"] = int(sent.chat_id)
     o["payment_proof_admin_message_id"] = int(sent.message_id)
+    log.info(
+        "payment proof delivered chat=%s msg=%s order_id=%s",
+        sent.chat_id,
+        sent.message_id,
+        order_id,
+    )
     return True
 
 
@@ -12332,41 +12299,43 @@ async def on_payment_proof_photo(
         o.pop("payment_proof_admin_message_id", None)
     _clear_crypto_auto_watch(o, uid, persist=False)
     try:
-        await msg.reply_text(
-            "⏳ Получили скрин, передаём администратору…",
-            reply_markup=REPLY_KB,
-        )
-    except Exception:
-        log.exception("payment_proof_photo ack uid=%s oid=%s", uid, oid)
-    try:
         cap = _format_payment_proof_caption(oid, o, uid)
     except Exception:
         log.exception("payment_proof_photo caption uid=%s oid=%s", uid, oid)
         cap = f"📸 Чек оплаты · Заказ #{oid}\n👤 id: {uid}"
     o["proof_file_id"] = file_id
-    o["payment_proof_submitted"] = True
-    _user_state_pop(uid, "awaiting_proof", persist=False)
-    _clear_awaiting_payment_order_id(uid, ud, persist=False)
     ok = False
     try:
         ok = await asyncio.wait_for(
             _send_or_edit_admin_payment_proof(
                 context, oid, o, file_id, cap, customer_msg=msg
             ),
-            timeout=25.0,
+            timeout=45.0,
         )
     except asyncio.TimeoutError:
         log.error("payment_proof_photo admin send timeout uid=%s oid=%s", uid, oid)
     except Exception:
         log.exception("payment_proof_photo admin send uid=%s oid=%s", uid, oid)
     if not ok:
-        o["payment_proof_submitted"] = False
         o.pop("proof_file_id", None)
         o.pop("payment_proof_admin_chat_id", None)
         o.pop("payment_proof_admin_message_id", None)
         _set_awaiting_proof_session(uid, ud, int(oid))
         await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
         return
+    o["payment_proof_submitted"] = True
+    _user_state_pop(uid, "awaiting_proof", persist=False)
+    _clear_awaiting_payment_order_id(uid, ud, persist=False)
+    try:
+        asyncio.get_running_loop().create_task(
+            _ensure_customer_admin_folder(
+                context,
+                uid,
+                getattr(msg.from_user, "username", None) if msg.from_user else None,
+            )
+        )
+    except RuntimeError:
+        pass
     uname = getattr(msg.from_user, "username", None) if msg.from_user else None
     try:
         _remember_user_message(
