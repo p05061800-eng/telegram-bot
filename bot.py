@@ -125,17 +125,31 @@ def _ensure_flask_health_server_thread() -> None:
     thr.start()
 
 
-# Админ-панель (/admin) и /say — основной id; дополнительные через TELEGRAM_ADMIN_IDS (через запятую)
-ADMIN_ID = 711309799
-BOT_BUILD_ID = "2026-06-06-proof-v4"
+# Админ: id только из env (Render Dashboard), не захардкожен в коде.
+def _read_primary_admin_id() -> int:
+    for key in (
+        "TELEGRAM_ADMIN_ID",
+        "TELEGRAM_ADMIN_CHAT_ID",
+        "ILLUCARDS_TELEGRAM_ADMIN_CHAT_ID",
+        "TELEGRAM_ORDER_NOTIFY_ID",
+        "ORDER_NOTIFY_CHAT_ID",
+    ):
+        raw = (os.getenv(key) or "").strip()
+        if raw.isdecimal():
+            return int(raw)
+    return 0
+
+
+ADMIN_ID = _read_primary_admin_id()
+BOT_BUILD_ID = "2026-06-06-proof-v5"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
 def _read_order_notify_target():
-    """Куда слать заказы: из .env int id или @username; иначе личка ADMIN_ID."""
+    """Куда слать заказы: из .env int id или @username; иначе ADMIN_ID из env."""
     s = (os.getenv("TELEGRAM_ORDER_NOTIFY_ID") or os.getenv("ORDER_NOTIFY_CHAT_ID") or "").strip()
     if not s:
-        return int(ADMIN_ID)
+        return int(ADMIN_ID) if ADMIN_ID else 0
     if s.startswith("@"):
         return s
     try:
@@ -151,7 +165,9 @@ for _adm_raw in (os.getenv("TELEGRAM_ADMIN_IDS") or "").split(","):
     _adm_raw = _adm_raw.strip()
     if _adm_raw.isdecimal():
         _ADMIN_IDS_EXTRA.add(int(_adm_raw))
-ADMIN_IDS: set = {int(ADMIN_ID)} | _ADMIN_IDS_EXTRA
+ADMIN_IDS: set = set(_ADMIN_IDS_EXTRA)
+if ADMIN_ID:
+    ADMIN_IDS.add(int(ADMIN_ID))
 ADMIN_ACCESS_DENIED = "Нет доступа: эта команда только для администратора."
 
 
@@ -5261,11 +5277,11 @@ def _format_payment_proof_caption(order_id: int, o: dict, uid: int) -> str:
 
 
 def _admin_order_notify_targets() -> List[object]:
-    """Куда слать карточку заказа с кнопками ✅ Принять / ❌ Отменить."""
+    """Куда слать заказы и чеки — только из env, без захардкоженного id."""
     out: List[object] = []
     seen: set = set()
-    for raw in (ORDER_NOTIFY_TARGET, ADMIN_ID, _resolve_admin_chat_id()):
-        if raw is None or raw == "":
+    for raw in (ORDER_NOTIFY_TARGET, _resolve_admin_chat_id()):
+        if raw is None or raw == "" or raw == 0:
             continue
         if isinstance(raw, int):
             key = ("i", int(raw))
@@ -9808,13 +9824,33 @@ def _kb_admin_customer_detail(uid: int, section: str = "all") -> InlineKeyboardM
     return InlineKeyboardMarkup(rows)
 
 
+async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показать Telegram user id (для настройки TELEGRAM_ADMIN_ID на Render)."""
+    msg = update.effective_message
+    u = update.effective_user
+    if not msg or not u:
+        return
+    uname = f"@{u.username}" if u.username else "—"
+    await msg.reply_text(
+        f"Ваш Telegram ID: `{u.id}`\n"
+        f"Username: {uname}\n\n"
+        "Этот id нужно указать в Render → Environment:\n"
+        "`TELEGRAM_ADMIN_ID`, `TELEGRAM_ORDER_NOTIFY_ID`, `TELEGRAM_ADMIN_CHAT_ID`"
+    )
+
+
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     u = update.effective_user
     if not msg or not u:
         return
     if not is_admin(u.id):
-        await msg.reply_text(ADMIN_ACCESS_DENIED)
+        await msg.reply_text(
+            f"{ADMIN_ACCESS_DENIED}\n\n"
+            f"Ваш Telegram ID: {u.id}\n"
+            "Отправьте /myid — скопируйте id и добавьте в Render → Environment "
+            "(TELEGRAM_ADMIN_ID и TELEGRAM_ORDER_NOTIFY_ID), затем перезапустите сервис."
+        )
         return
     await msg.reply_text(
         "👑 Админ-панель\n\nВыберите раздел 👇",
@@ -9829,7 +9865,12 @@ async def admin_say_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not msg or not u:
         return
     if not is_admin(u.id):
-        await msg.reply_text(ADMIN_ACCESS_DENIED)
+        await msg.reply_text(
+            f"{ADMIN_ACCESS_DENIED}\n\n"
+            f"Ваш Telegram ID: {u.id}\n"
+            "Отправьте /myid — скопируйте id и добавьте в Render → Environment "
+            "(TELEGRAM_ADMIN_ID и TELEGRAM_ORDER_NOTIFY_ID), затем перезапустите сервис."
+        )
         return
     args = context.args or []
     if len(args) < 2:
@@ -12509,10 +12550,17 @@ async def post_init(application: Application) -> None:
         n_lc,
     )
     try:
-        await application.bot.send_message(
-            int(ADMIN_ID),
-            f"🟢 Бот перезапущен · {BOT_BUILD_ID}",
-        )
+        startup_text = f"🟢 Бот перезапущен · {BOT_BUILD_ID}"
+        notified: set = set()
+        for tgt in _admin_order_notify_targets():
+            key = int(tgt) if isinstance(tgt, int) else str(tgt).strip().lower()
+            if key in notified:
+                continue
+            notified.add(key)
+            try:
+                await application.bot.send_message(chat_id=tgt, text=startup_text)
+            except Exception:
+                log.exception("startup notify target=%s build=%s", tgt, BOT_BUILD_ID)
     except Exception:
         log.exception("startup notify admin build=%s", BOT_BUILD_ID)
     # Иначе Telegram отдаёт 409, если у бота остался webhook (getUpdates + webhook несовместимы).
@@ -12650,6 +12698,7 @@ def main() -> None:
         group=-1,
     )
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("myid", myid_cmd))
     app.add_handler(CommandHandler("catalog", catalog_cmd))
     app.add_handler(CommandHandler("promo", send_promo))
     app.add_handler(CommandHandler("swipe", send_tinder_mode))
