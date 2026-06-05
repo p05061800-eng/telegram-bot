@@ -4094,6 +4094,13 @@ def _persist_site_pending_order(
     lines_snap = _cart_get_lines_uid(int(uid), user_data)
     if lines_snap and not meta_out.get("items"):
         meta_out["items"] = deepcopy(lines_snap)
+    meta_out = _merge_site_bonus_into_meta(int(uid), meta_out)
+    if lines_snap:
+        pt, pc, _ = _resolve_site_confirm_pricing(
+            int(uid), user_data or {}, list(lines_snap), meta_out
+        )
+        meta_out["preview_pay_total"] = int(pt)
+        meta_out["preview_pay_currency"] = str(pc)
     if meta_out:
         rec["site_pending_meta"] = meta_out
         if user_data is not None:
@@ -4657,6 +4664,38 @@ def _merge_site_bonus_into_meta(uid: int, meta: Optional[dict]) -> dict:
     return out
 
 
+def _parse_grand_total_from_preview_text(text: str) -> Optional[Tuple[int, str]]:
+    """Итого из текста превью («💰 Итого: 7 200 RUB») — как видит пользователь."""
+    m = re.search(
+        r"💰\s*Итого:\s*([\d\s\u00a0]+)\s*(RUB|BYN)",
+        str(text or ""),
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    raw_n = re.sub(r"[\s\u00a0]", "", m.group(1) or "")
+    try:
+        val = int(raw_n)
+    except (TypeError, ValueError):
+        return None
+    cur = str(m.group(2) or "").strip().upper()
+    if val > 0 and cur in ("BYN", "RUB"):
+        return int(val), cur
+    return None
+
+
+def _order_payment_display(o: dict) -> Tuple[int, str]:
+    """Сумма и валюта для шага оплаты — как сохранено в заказе при подтверждении."""
+    cur = _payment_currency_for_order(o)
+    try:
+        stored = int(o.get("total") or 0)
+    except (TypeError, ValueError):
+        stored = 0
+    if stored > 0:
+        return int(stored), cur
+    return int(_order_resolved_grand_total(o)), cur
+
+
 def _user_has_unpaid_order(uid: int) -> bool:
     return _find_latest_unpaid_order_id(int(uid)) is not None
 
@@ -4668,6 +4707,7 @@ def _resolve_site_confirm_pricing(
     meta: Optional[dict],
 ) -> Tuple[int, str, dict]:
     """Итог и валюта для шага оплаты — те же правила, что в превью корзины."""
+    meta_m = _merge_site_bonus_into_meta(uid, meta if isinstance(meta, dict) else {})
     cc = str(USER_PREF_DELIVERY_COUNTRY.get(uid) or "by").strip().lower()
     if cc not in DELIVERY_OPTIONS:
         cc = "by"
@@ -4678,17 +4718,22 @@ def _resolve_site_confirm_pricing(
         "amount": int(damount),
         "currency": dcur,
     }
+    try:
+        locked = int(meta_m.get("preview_pay_total") or 0)
+    except (TypeError, ValueError):
+        locked = 0
+    locked_cur = str(meta_m.get("preview_pay_currency") or "").strip().upper()
+    if locked > 0 and locked_cur in ("BYN", "RUB"):
+        return int(locked), locked_cur, drec
     fin = _site_cart_checkout_finance(uid, list(lines), cc, ud)
     pay_cur = str(fin["g_cur"])
     goods = int(fin["goods"])
-    final_total = _site_final_total_from_sources(uid, meta, pay_cur)
+    final_total = _site_final_total_from_sources(uid, meta_m, pay_cur)
     if final_total and int(final_total) > 0 and _site_grand_covers_goods(int(final_total), goods):
         total = int(final_total)
-    elif fin["from_site"]:
-        total = int(fin["grand_show"])
     else:
         total = int(fin["grand_show"])
-        pts, disc = _site_bonus_from_sources(uid, meta)
+        pts, disc = _site_bonus_from_sources(uid, meta_m)
         if disc <= 0 and pts > 0:
             disc = _bonus_discount_units(pts, pay_cur)
         if disc > 0:
@@ -4835,7 +4880,7 @@ async def _resend_active_payment_step(
     except Exception:
         pass
     pay_cur = _payment_currency_for_order(o)
-    tot = _order_resolved_grand_total(o)
+    tot, pay_cur = _order_payment_display(o)
     lo_est = o.get("loyalty_earn_estimate")
     body = (
         f"💳 Оплата по заказу #{int(oid)}\n\n"
@@ -5084,15 +5129,13 @@ def _kb_payment_methods() -> InlineKeyboardMarkup:
 
 
 def _payment_total_label(o: dict) -> str:
+    tot, cur = _order_payment_display(o)
+    if tot > 0:
+        return f"{int(tot)} {cur}"
     d = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
-    cur = str(d.get("currency") or "BYN")
     cc = str(d.get("country") or "").strip().lower()
-    stored = _order_resolved_grand_total(o)
+    dcur = str(d.get("currency") or "BYN")
     g_cur = _goods_currency_for_delivery_country(cc)
-    if stored > 0:
-        if cc == "by" and cur == "BYN":
-            return f"{stored} BYN"
-        return f"{stored} {g_cur}"
     try:
         goods = int(o.get("total_goods") if o.get("total_goods") is not None else 0)
     except (TypeError, ValueError):
@@ -5104,7 +5147,7 @@ def _payment_total_label(o: dict) -> str:
         d_amt = int(d.get("amount") or 0)
     except (TypeError, ValueError):
         d_amt = 0
-    if cc == "by" and cur == "BYN":
+    if cc == "by" and dcur == "BYN":
         return f"{goods + d_amt} BYN"
     if d_amt > 0:
         return f"{goods + d_amt} {g_cur}"
@@ -8614,10 +8657,13 @@ async def _run_site_confirm_order(
             )
             await _answer_order_callback_stale(q, acked=acked)
             return
-        meta = _get_site_pending_meta(uid_cb, ud)
+        meta = _merge_site_bonus_into_meta(uid_cb, _get_site_pending_meta(uid_cb, ud))
         total, pay_cur, drec = _resolve_site_confirm_pricing(
             uid_cb, ud, list(lines), meta
         )
+        parsed_preview = _parse_grand_total_from_preview_text(order_text)
+        if parsed_preview:
+            total, pay_cur = int(parsed_preview[0]), str(parsed_preview[1])
         goods_total, _ = _cart_totals(list(lines))
         dl_bonus_applied = 0
         dl_bonus_points_spent = 0
