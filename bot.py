@@ -4940,8 +4940,12 @@ def _ensure_order_in_orders(oid: int, uid: int) -> Optional[dict]:
     except (TypeError, ValueError):
         return None
     o = ORDERS.get(oid_i)
-    if isinstance(o, dict) and int(o.get("user_id") or 0) == uid_i:
-        return o
+    if isinstance(o, dict):
+        stored_uid = int(o.get("user_id") or 0)
+        if stored_uid in (0, uid_i):
+            if stored_uid != uid_i:
+                o["user_id"] = uid_i
+            return o
     for rec in USER_ORDERS.get(uid_i) or []:
         if not isinstance(rec, dict):
             continue
@@ -5286,6 +5290,44 @@ def _parse_order_id_from_payment_message(text: str) -> Optional[int]:
         return None
 
 
+def _message_looks_like_order_payment_step(text: str) -> bool:
+    t = str(text or "")
+    return bool(t.strip()) and (
+        "Оплата по заказу" in t or _message_looks_like_payment_step(t)
+    )
+
+
+def _stub_order_for_payment_step(oid: int, uid: int, message_text: str) -> dict:
+    """Минимальный заказ из текста шага оплаты — чтобы кнопки работали без ORDERS в RAM."""
+    total = 0
+    pay_cur = "BYN"
+    parsed = _parse_grand_total_from_preview_text(message_text or "")
+    if parsed:
+        total, pay_cur = int(parsed[0]), str(parsed[1])
+    return {
+        "user_id": int(uid),
+        "items": [],
+        "total": int(total),
+        "delivery": {},
+        "status": "new",
+        "created_at": time.time(),
+        "paid": False,
+        "payment_proof_submitted": False,
+        "clear_cart_on_paid": True,
+        "payment_currency": str(pay_cur),
+        "payment_total_locked": bool(int(total) > 0),
+    }
+
+
+def _bind_payment_order_session(uid: int, ud: dict, oid: int) -> None:
+    oid_i = int(oid)
+    if isinstance(ud, dict):
+        ud["awaiting_payment_order_id"] = oid_i
+    if uid:
+        b = _user_state_bucket(int(uid))
+        b["awaiting_payment_order_id"] = oid_i
+
+
 def _resolve_payment_order_id(
     uid: int,
     ud: dict,
@@ -5301,15 +5343,17 @@ def _resolve_payment_order_id(
         if oid_raw is None:
             continue
         o = _ensure_order_in_orders(int(oid_raw), int(uid))
+        if not isinstance(o, dict) and _message_looks_like_order_payment_step(
+            message_text or ""
+        ):
+            o = _stub_order_for_payment_step(int(oid_raw), int(uid), message_text or "")
+            ORDERS[int(oid_raw)] = o
         if (
             isinstance(o, dict)
             and int(o.get("user_id") or 0) == int(uid)
             and not o.get("paid")
         ):
-            ud["awaiting_payment_order_id"] = int(oid_raw)
-            if uid:
-                b = _user_state_bucket(uid)
-                b["awaiting_payment_order_id"] = int(oid_raw)
+            _bind_payment_order_session(int(uid), ud, int(oid_raw))
             return int(oid_raw)
     return _resolve_awaiting_payment_order_id(uid, ud)
 
@@ -9006,12 +9050,22 @@ async def on_callback_query_unhandled(
         return
     data = (q.data or "").strip()
     uid = int(q.from_user.id) if q.from_user else 0
-    logging.getLogger(__name__).warning(
+    log = logging.getLogger(__name__)
+    log.warning(
         "unhandled callback_query uid=%s data=%r chat_msg=%s",
         uid,
         data,
         q.message.message_id if q.message else None,
     )
+    if _RE_PAY_METHOD_CB.match(data):
+        await on_payment_method(update, context)
+        return
+    if _RE_PAY_CANCEL_CB.match(data):
+        await on_payment_cancel(update, context)
+        return
+    if _RE_PAID_CB.match(data):
+        await on_payment_paid(update, context)
+        return
     parsed = _resolve_site_order_action(q)
     if parsed:
         await on_site_order_button_callback(update, context, parsed=parsed)
@@ -10913,69 +10967,89 @@ async def on_payment_cancel(
 async def on_payment_method(
     update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """pay_card | pay_transfer | pay_crypto — реквизиты и кнопка «Я оплатил»."""
+    log = logging.getLogger(__name__)
     q = update.callback_query
     if not q or not q.from_user or not q.data or not q.message:
         return
     m = _RE_PAY_METHOD_CB.match((q.data or "").strip())
     if not m:
         return
-    uid = q.from_user.id
-    ud = context.user_data
+    uid = int(q.from_user.id)
+    ud = context.user_data if isinstance(context.user_data, dict) else {}
     await _callback_ack(q)
     msg_txt = (q.message.text or q.message.caption or "") if q.message else ""
-    oid = _resolve_payment_order_id(
-        uid, ud, callback_data=q.data, message_text=msg_txt
-    )
-    if oid is None:
-        await q.message.reply_text(
-            "Сессия оплаты устарела. Откройте «📋 Мои заказы» или оформите заказ с сайта заново.",
-            reply_markup=REPLY_KB,
+    log.info("payment_method uid=%s data=%r msg_oid=%s", uid, q.data, _parse_order_id_from_payment_message(msg_txt))
+    try:
+        oid = _resolve_payment_order_id(
+            uid, ud, callback_data=q.data, message_text=msg_txt
         )
-        return
-    o = _ensure_order_in_orders(int(oid), int(uid))
-    if not o or int(o.get("user_id") or 0) != int(uid):
-        _clear_awaiting_payment_order_id(uid, ud)
-        await q.message.reply_text(
-            "Заказ не найден. Оформите заказ с сайта ещё раз или напишите в «Связь».",
-            reply_markup=REPLY_KB,
+        if oid is None:
+            await q.message.reply_text(
+                "Сессия оплаты устарела. Нажмите «Подтвердить заказ» на превью ещё раз или «📋 Мои заказы».",
+                reply_markup=REPLY_KB,
+            )
+            return
+        o = _ensure_order_in_orders(int(oid), uid)
+        if not isinstance(o, dict) and _message_looks_like_order_payment_step(msg_txt):
+            o = _stub_order_for_payment_step(int(oid), uid, msg_txt)
+            ORDERS[int(oid)] = o
+        if not o or int(o.get("user_id") or 0) != uid:
+            _clear_awaiting_payment_order_id(uid, ud)
+            await q.message.reply_text(
+                "Заказ не найден. Оформите заказ с сайта ещё раз или напишите в «Связь».",
+                reply_markup=REPLY_KB,
+            )
+            return
+        _refresh_unpaid_order_payment(
+            o,
+            uid,
+            ud,
+            preview_text=_get_site_pending_preview(uid) or msg_txt,
+            lines=_cart_get_lines_uid(uid, ud),
+            meta=_get_site_pending_meta(uid, ud),
         )
-        return
-    _refresh_unpaid_order_payment(
-        o,
-        int(uid),
-        ud,
-        preview_text=_get_site_pending_preview(int(uid)),
-        lines=_cart_get_lines_uid(int(uid), ud),
-        meta=_get_site_pending_meta(int(uid), ud),
-    )
-    save_state()
-    if o.get("paid"):
-        return
-    if o.get("payment_proof_submitted") and not o.get("paid"):
-        await q.message.reply_text(PAY_PROOF_WAIT, reply_markup=REPLY_KB)
-        return
-    pr_same = _user_state_get(uid, "awaiting_proof")
-    if pr_same is not None and int(pr_same) == int(oid):
-        _user_state_pop(uid, "awaiting_proof")
-    method = m.group(1)
-    ud["payment_pending_method"] = method
-    if method == "crypto":
-        _user_state_set(uid, "crypto_check", oid)
-        o["crypto_auto_active"] = True
-        o["crypto_auto_deadline"] = time.time() + random.uniform(120.0, 300.0)
-    else:
-        _clear_crypto_auto_watch(o, uid)
-    body_map = {
-        "card": PAY_CARD_BODY,
-        "transfer": PAY_TRANSFER_BODY,
-        "crypto": PAY_CRYPTO_BODY,
-    }
-    users_touch(uid, "payment")
-    total_label = _payment_total_label(o)
-    await q.message.reply_text(
-        body_map[method],
-        reply_markup=_kb_paid_confirm_with_back(total_label, int(oid)),
-    )
+        if o.get("paid"):
+            await q.message.reply_text(MSG_ORDER_ALREADY_PAID_TOAST, reply_markup=REPLY_KB)
+            return
+        if o.get("payment_proof_submitted") and not o.get("paid"):
+            await q.message.reply_text(PAY_PROOF_WAIT, reply_markup=REPLY_KB)
+            return
+        pr_same = _user_state_get(uid, "awaiting_proof")
+        if pr_same is not None and int(pr_same) == int(oid):
+            _user_state_pop(uid, "awaiting_proof")
+        method = m.group(1)
+        ud["payment_pending_method"] = method
+        _bind_payment_order_session(uid, ud, int(oid))
+        if method == "crypto":
+            _user_state_bucket(uid)["crypto_check"] = int(oid)
+            o["crypto_auto_active"] = True
+            o["crypto_auto_deadline"] = time.time() + random.uniform(120.0, 300.0)
+        else:
+            _clear_crypto_auto_watch(o, uid)
+        body_map = {
+            "card": PAY_CARD_BODY,
+            "transfer": PAY_TRANSFER_BODY,
+            "crypto": PAY_CRYPTO_BODY,
+        }
+        users_touch(uid, "payment")
+        total_label = _payment_total_label(o)
+        await q.message.reply_text(
+            body_map[method],
+            reply_markup=_kb_paid_confirm_with_back(total_label, int(oid)),
+        )
+        try:
+            save_state()
+        except Exception:
+            log.exception("payment_method save_state uid=%s oid=%s", uid, oid)
+    except Exception:
+        log.exception("payment_method failed uid=%s data=%r", uid, q.data)
+        try:
+            await q.message.reply_text(
+                "Не удалось открыть способ оплаты. Нажмите кнопку ещё раз или «Подтвердить заказ» на превью.",
+                reply_markup=REPLY_KB,
+            )
+        except Exception:
+            pass
 
 
 async def on_payment_paid(
