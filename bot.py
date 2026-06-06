@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-06-proof-v14"
+BOT_BUILD_ID = "2026-06-06-notify-v15"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -1729,6 +1729,22 @@ def _sync_auth_ok(request: web.Request, data: dict) -> bool:
     header_secret = (request.headers.get("X-Sync-Secret") or "").strip()
     body_secret = str(data.get("secret") or "").strip()
     return hmac.compare_digest(header_secret or body_secret, SYNC_API_SECRET)
+
+
+def _site_api_auth_ok(request: web.Request, data: dict) -> bool:
+    """Сайт (Vercel): X-Sync-Secret, secret в теле или Bearer (sync / order secret)."""
+    if _sync_auth_ok(request, data):
+        return True
+    auth = (request.headers.get("Authorization") or "").strip()
+    if not auth.lower().startswith("bearer "):
+        return False
+    tok = auth[7:].strip()
+    if not tok:
+        return False
+    for secret in (SYNC_API_SECRET, ORDER_STATUS_UPDATE_SECRET):
+        if secret and hmac.compare_digest(tok, secret):
+            return True
+    return False
 
 
 def _resolve_sync_uid(data: dict) -> int:
@@ -3417,6 +3433,89 @@ async def _http_sync_home_promotions(request: web.Request) -> web.Response:
     return _login_json_response({"success": True, "items": len(items)})
 
 
+async def _http_site_notify(request: web.Request) -> web.Response:
+    """POST /api/notify — сайт (Vercel) шлёт Telegram через Render, без TELEGRAM_BOT_TOKEN."""
+    log = logging.getLogger(__name__)
+    try:
+        data = await request.json()
+    except Exception:
+        return _login_json_response({"success": False, "error": "Некорректный JSON"}, status=400)
+    if not isinstance(data, dict):
+        return _login_json_response({"success": False, "error": "Некорректные данные"}, status=400)
+    if not _site_api_auth_ok(request, data):
+        return _login_json_response({"success": False, "error": "Forbidden"}, status=403)
+    bot = request.app.get("bot")
+    if bot is None:
+        return _login_json_response({"success": False, "error": "Бот недоступен"}, status=503)
+
+    target = str(data.get("target") or "customer").strip().lower()
+    event = str(data.get("event") or "custom").strip().lower()
+    raw_text = str(data.get("text") or data.get("message") or "").strip()
+
+    if target == "admin":
+        if not raw_text:
+            oid_raw = data.get("botOrderId") or data.get("orderId") or data.get("order_id")
+            status = str(data.get("status") or "").strip()
+            ext = str(data.get("externalOrderId") or data.get("external_id") or "").strip()
+            parts = ["📣 Сайт"]
+            if oid_raw not in (None, ""):
+                parts.append(f"заказ #{oid_raw}")
+            if ext:
+                parts.append(ext)
+            if status:
+                parts.append(_order_status_label_ru(status))
+            raw_text = " · ".join(parts) if len(parts) > 1 else ""
+        if not raw_text:
+            return _login_json_response({"success": False, "error": "Укажите text"}, status=400)
+        sent = 0
+        for tgt in _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else []):
+            try:
+                await bot.send_message(
+                    chat_id=tgt,
+                    text=raw_text[:4090],
+                    disable_web_page_preview=True,
+                )
+                sent += 1
+            except Exception:
+                log.exception("site notify admin target=%s", tgt)
+        if sent == 0:
+            return _login_json_response(
+                {"success": False, "error": "Не удалось отправить админу"},
+                status=502,
+            )
+        return _login_json_response({"success": True, "sent": sent})
+
+    uid = _resolve_sync_uid(data)
+    if not uid:
+        return _login_json_response(
+            {"success": False, "error": "Пользователь не найден (telegramUserId / username)"},
+            status=404,
+        )
+    if not raw_text and event in ("order_status", "status"):
+        try:
+            oid = int(data.get("botOrderId") or data.get("orderId") or data.get("order_id") or 0)
+        except (TypeError, ValueError):
+            oid = 0
+        status = str(data.get("status") or "new").strip()
+        sk = _norm_bot_order_status(status)
+        raw_text = _format_customer_order_status_notice(max(0, oid), sk)
+        if oid <= 0:
+            raw_text = raw_text.replace("(#0)", "").strip()
+    if not raw_text:
+        return _login_json_response(
+            {"success": False, "error": "Укажите text или status"},
+            status=400,
+        )
+    ok = await _send_customer_plain(bot, int(uid), raw_text[:4090])
+    if not ok:
+        return _login_json_response(
+            {"success": False, "error": "Не удалось отправить клиенту"},
+            status=502,
+        )
+    log.info("site notify customer uid=%s event=%s", uid, event)
+    return _login_json_response({"success": True, "user_id": int(uid)})
+
+
 def _login_api_base_meta(request: web.Request) -> str:
     """Публичный URL API входа для meta login-api-base (CORS + verify на том же процессе, что выдал код)."""
     explicit = (os.getenv("LOGIN_API_PUBLIC_URL") or "").strip().rstrip("/")
@@ -3486,6 +3585,7 @@ async def _run_login_http_api(bot) -> None:
     app.router.add_options("/api/sync/favorites", _http_login_options)
     app.router.add_options("/api/sync/state", _http_login_options)
     app.router.add_options("/api/sync/promotions", _http_login_options)
+    app.router.add_options("/api/notify", _http_login_options)
     app.router.add_post("/api/send-code", _http_send_code)
     app.router.add_post("/api/verify-code", _http_verify_code)
     app.router.add_post("/api/telegram-auth", _http_telegram_auth)
@@ -3494,6 +3594,7 @@ async def _run_login_http_api(bot) -> None:
     app.router.add_get("/api/sync/state", _http_get_sync_state)
     app.router.add_post("/api/sync/state", _http_sync_state)
     app.router.add_post("/api/sync/promotions", _http_sync_home_promotions)
+    app.router.add_post("/api/notify", _http_site_notify)
     runner = web.AppRunner(app)
     await runner.setup()
     raw_port = (os.getenv("LOGIN_API_PORT") or os.getenv("PORT") or "10000").strip()
@@ -3509,7 +3610,7 @@ async def _run_login_http_api(bot) -> None:
     site = web.TCPSite(runner, host=host, port=port)
     await site.start()
     log.info(
-        "HTTP API сайта: %s:%s (/, /health, /login, /api/send-code, /api/verify-code, /api/sync/cart)",
+        "HTTP API сайта: %s:%s (/, /health, /login, /api/send-code, /api/verify-code, /api/notify, /api/sync/cart)",
         host,
         port,
     )
