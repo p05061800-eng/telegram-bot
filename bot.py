@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-06-proof-v12"
+BOT_BUILD_ID = "2026-06-06-proof-v13"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -539,7 +539,7 @@ def save_state() -> None:
 
 
 def _refresh_orders_state_from_redis() -> None:
-    """Подтянуть ORDERS и user_states из Redis (сессия оплаты после другого handler)."""
+    """Подтянуть ORDERS и user_states из Redis, не затирая свежее in-memory состояние."""
     if not STATE_REDIS_KEY or STATE_REDIS_SAVE_BLOCKED:
         return
     raw = _state_redis_command(["GET", STATE_REDIS_KEY])
@@ -554,17 +554,28 @@ def _refresh_orders_state_from_redis() -> None:
         return
     global ORDER_COUNTER
     loaded_orders = _int_key_dict(data.get("orders"))
-    if loaded_orders:
-        ORDERS.clear()
-        ORDERS.update(loaded_orders)
+    for oid, rec in loaded_orders.items():
+        if not isinstance(rec, dict):
+            continue
+        local = ORDERS.get(oid)
+        if not isinstance(local, dict):
+            ORDERS[oid] = rec
+            continue
+        for key, val in rec.items():
+            if key not in local or local.get(key) in (None, "", 0, False, []):
+                local[key] = val
     loaded_user_orders = _int_key_dict(data.get("user_orders"))
-    if loaded_user_orders:
-        USER_ORDERS.clear()
-        USER_ORDERS.update(loaded_user_orders)
+    for uid, lst in loaded_user_orders.items():
+        if uid not in USER_ORDERS or not USER_ORDERS.get(uid):
+            USER_ORDERS[uid] = lst
     loaded_states = _int_key_dict(data.get("user_states"))
-    if loaded_states:
-        user_states.clear()
-        user_states.update(loaded_states)
+    for uid, bucket in loaded_states.items():
+        if not isinstance(bucket, dict):
+            continue
+        local_b = user_states.setdefault(uid, {})
+        for key, val in bucket.items():
+            if key not in local_b:
+                local_b[key] = val
     try:
         restored_counter = int(data.get("order_counter") or 0)
     except (TypeError, ValueError):
@@ -5077,6 +5088,10 @@ def _restore_order_by_id(oid: int) -> Optional[dict]:
     o = ORDERS.get(oid_i)
     if isinstance(o, dict):
         return o
+    _refresh_orders_state_from_redis()
+    o = ORDERS.get(oid_i)
+    if isinstance(o, dict):
+        return o
     for uid_k, lst in USER_ORDERS.items():
         try:
             uid_i = int(uid_k)
@@ -5243,6 +5258,7 @@ def _rebuild_order_from_admin_card_text(oid: int, text: str) -> Optional[dict]:
 
 def _restore_order_for_admin(q: CallbackQuery, oid: int) -> Optional[dict]:
     """ORDERS / USER_ORDERS или текст карточки в чате админа."""
+    _refresh_orders_state_from_redis()
     o = _restore_order_by_id(oid)
     msg = q.message
     text = (msg.text or msg.caption or "").strip() if msg else ""
@@ -5942,23 +5958,28 @@ def _is_reply_to_proof_request(msg: Optional[Message]) -> bool:
 
 
 def _user_wants_proof_upload(uid: int, ud: dict, msg: Optional[Message]) -> bool:
+    def _peek() -> bool:
+        if _user_state_get(uid, "awaiting_proof") is not None:
+            return True
+        if _user_state_get(uid, "awaiting_payment_order_id") is not None:
+            return True
+        if isinstance(ud, dict) and (
+            ud.get("awaiting_proof") or ud.get("awaiting_payment_order_id")
+        ):
+            return True
+        dl = _user_state_get(uid, "proof_deadline")
+        if dl is not None and int(dl) > int(time.time()):
+            return True
+        if _find_latest_unpaid_order_id(uid) is not None:
+            return True
+        if _is_reply_to_proof_request(msg):
+            return True
+        return False
+
+    if _peek():
+        return True
     _refresh_orders_state_from_redis()
-    if _user_state_get(uid, "awaiting_proof") is not None:
-        return True
-    if _user_state_get(uid, "awaiting_payment_order_id") is not None:
-        return True
-    if isinstance(ud, dict) and (
-        ud.get("awaiting_proof") or ud.get("awaiting_payment_order_id")
-    ):
-        return True
-    dl = _user_state_get(uid, "proof_deadline")
-    if dl is not None and int(dl) > int(time.time()):
-        return True
-    if _find_latest_unpaid_order_id(uid) is not None:
-        return True
-    if _is_reply_to_proof_request(msg):
-        return True
-    return False
+    return _peek()
 
 
 async def _send_proof_received_ack(msg: Message) -> None:
@@ -11929,13 +11950,17 @@ async def on_payment_paid(
         )
 
 
-def _telegram_sent_ids(sent: object) -> Tuple[int, int]:
+def _telegram_sent_ids(
+    sent: object, *, fallback_chat_id: Optional[int] = None
+) -> Tuple[int, int]:
     """chat_id и message_id из Message или MessageId (python-telegram-bot 20+)."""
     if hasattr(sent, "chat_id") and getattr(sent, "chat_id", None) is not None:
         chat_id = int(sent.chat_id)  # type: ignore[attr-defined]
     elif hasattr(sent, "chat"):
         chat = getattr(sent, "chat")
         chat_id = int(chat.id if hasattr(chat, "id") else chat)
+    elif fallback_chat_id is not None:
+        chat_id = int(fallback_chat_id)
     else:
         raise TypeError(f"cannot resolve chat_id from {type(sent)!r}")
     return chat_id, int(getattr(sent, "message_id"))
@@ -11990,6 +12015,7 @@ async def _send_or_edit_admin_payment_proof(
     o.pop("payment_proof_admin_chat_id", None)
     o.pop("payment_proof_admin_message_id", None)
     sent = None
+    sent_chat_id: Optional[int] = None
     last_err: Optional[Exception] = None
 
     async def _try_copy(tgt: object) -> Optional[Message]:
@@ -12046,14 +12072,18 @@ async def _send_or_edit_admin_payment_proof(
             return None
 
     for tgt in targets:
+        tgt_chat = int(tgt) if isinstance(tgt, int) else None
         sent = await _try_photo(tgt)
         if sent is not None:
+            sent_chat_id = tgt_chat
             break
         sent = await _try_copy(tgt)
         if sent is not None:
+            sent_chat_id = tgt_chat
             break
         sent = await _try_forward(tgt)
         if sent is not None:
+            sent_chat_id = tgt_chat
             break
 
     if sent is None:
@@ -12075,6 +12105,7 @@ async def _send_or_edit_admin_payment_proof(
                     )
                 else:
                     sent = await context.bot.send_photo(chat_id=tgt, photo=file_id)
+                sent_chat_id = tgt_chat if isinstance(tgt, int) else None
                 log.info(
                     "payment proof alert+copy target=%s order=%s msg=%s",
                     tgt,
@@ -12096,7 +12127,9 @@ async def _send_or_edit_admin_payment_proof(
         return False
 
     try:
-        chat_id, message_id = _telegram_sent_ids(sent)
+        chat_id, message_id = _telegram_sent_ids(
+            sent, fallback_chat_id=sent_chat_id
+        )
     except (TypeError, ValueError) as e:
         log.exception("payment proof sent ids order_id=%s: %s", order_id, e)
         return False
@@ -12161,14 +12194,15 @@ async def route_customer_media_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Явный роутер фото/картинок — MessageHandler иногда не срабатывает на Render."""
-    msg = update.message
+    msg = update.effective_message
     if not msg or not msg.from_user:
         return
     uid = int(msg.from_user.id)
     ud = context.user_data if isinstance(context.user_data, dict) else {}
     file_id = _image_file_id_from_message(msg)
+    wants_proof = _user_wants_proof_upload(uid, ud, msg)
     if not file_id:
-        if not is_admin(uid) and _user_wants_proof_upload(uid, ud, msg):
+        if not is_admin(uid) and wants_proof:
             await msg.reply_text(
                 "Не вижу изображение. Пришлите скрин как фото (PNG/JPG), не PDF.",
                 reply_markup=REPLY_KB,
@@ -12181,13 +12215,8 @@ async def route_customer_media_message(
         msg.message_id,
         bool(msg.photo),
         bool(msg.document),
-        _user_wants_proof_upload(uid, ud, msg),
+        wants_proof,
     )
-    if not is_admin(uid) and _user_wants_proof_upload(uid, ud, msg):
-        try:
-            await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
-        except Exception:
-            logging.getLogger(__name__).exception("media_route proof ack uid=%s", uid)
     await on_user_photo(update, context)
     raise ApplicationHandlerStop
 
@@ -12362,6 +12391,10 @@ async def _on_payment_proof_photo_body(
     if oid_raw is None:
         await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
         return
+    try:
+        await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
+    except Exception:
+        log.exception("payment_proof_photo ack uid=%s oid=%s", uid, oid_raw)
     try:
         oid = int(oid_raw)
     except (TypeError, ValueError):
