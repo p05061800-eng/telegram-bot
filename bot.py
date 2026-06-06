@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-06-proof-v13"
+BOT_BUILD_ID = "2026-06-06-proof-v14"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -12190,34 +12190,94 @@ _PROOF_MEDIA_FILTER = (
 )
 
 
-async def route_customer_media_message(
+async def on_customer_proof_media(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Явный роутер фото/картинок — MessageHandler иногда не срабатывает на Render."""
+    """Единая точка входа для фото/картинок клиента (block=True, без гонок block=False)."""
+    log = logging.getLogger(__name__)
     msg = update.effective_message
     if not msg or not msg.from_user:
         return
     uid = int(msg.from_user.id)
+    if is_admin(uid):
+        return
     ud = context.user_data if isinstance(context.user_data, dict) else {}
     file_id = _image_file_id_from_message(msg)
-    wants_proof = _user_wants_proof_upload(uid, ud, msg)
+    log.info(
+        "proof_media uid=%s msg_id=%s photo=%s doc=%s file=%s",
+        uid,
+        msg.message_id,
+        bool(msg.photo),
+        bool(msg.document),
+        bool(file_id),
+    )
+
+    if user_support_state.get(uid):
+        ok = await _forward_support_photo_to_admin(context, msg, uid)
+        if ok:
+            user_support_state.pop(uid, None)
+            m_ok = await msg.reply_text(MSG_SUPPORT_THANKS)
+            _track_temp_message(uid, m_ok)
+        else:
+            await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
+        raise ApplicationHandlerStop
+
+    pp_oid = _user_state_get(uid, "postpaid_thread_oid")
+    if pp_oid is not None:
+        cap = (msg.caption or "").strip() if msg.caption else ""
+        fid = file_id or (msg.photo[-1].file_id if msg.photo else None)
+        if not fid:
+            await msg.reply_text(
+                "Пришлите фото или картинку (PNG/JPG), не PDF.",
+                reply_markup=REPLY_KB,
+            )
+        else:
+            ok = await _forward_postpaid_client_payload_to_admin(
+                context,
+                uid=uid,
+                oid=int(pp_oid),
+                body_text=cap or None,
+                msg=msg,
+                photo_file_id=fid,
+            )
+            if ok:
+                try:
+                    await msg.reply_text(MSG_POSTPAID_FORWARDED_OK)
+                except Exception:
+                    pass
+            else:
+                await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
+        raise ApplicationHandlerStop
+
     if not file_id:
-        if not is_admin(uid) and wants_proof:
+        if _user_wants_proof_upload(uid, ud, msg):
             await msg.reply_text(
                 "Не вижу изображение. Пришлите скрин как фото (PNG/JPG), не PDF.",
                 reply_markup=REPLY_KB,
             )
             raise ApplicationHandlerStop
         return
-    logging.getLogger(__name__).info(
-        "media_route uid=%s msg_id=%s photo=%s doc=%s proof=%s",
-        uid,
-        msg.message_id,
-        bool(msg.photo),
-        bool(msg.document),
-        wants_proof,
-    )
-    await on_user_photo(update, context)
+
+    wants_proof = _user_wants_proof_upload(uid, ud, msg)
+    if not wants_proof:
+        await msg.reply_text(
+            "Сначала нажмите «✅ Оплатить» на сообщении с реквизитами, затем пришлите скрин.",
+            reply_markup=REPLY_KB,
+        )
+        raise ApplicationHandlerStop
+
+    try:
+        await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
+    except Exception:
+        log.exception("proof_media ack uid=%s", uid)
+    try:
+        await _on_payment_proof_photo_body(update, context)
+    except Exception:
+        log.exception("proof_media body uid=%s", uid)
+        try:
+            await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
+        except Exception:
+            pass
     raise ApplicationHandlerStop
 
 
@@ -12351,6 +12411,7 @@ async def on_payment_flow_non_text(
         "Пришлите скрин оплаты как фото или картинку (PNG/JPG), не стикер и не PDF.",
         reply_markup=REPLY_KB,
     )
+    raise ApplicationHandlerStop
 
 
 async def on_payment_proof_photo(
@@ -12391,10 +12452,6 @@ async def _on_payment_proof_photo_body(
     if oid_raw is None:
         await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
         return
-    try:
-        await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
-    except Exception:
-        log.exception("payment_proof_photo ack uid=%s oid=%s", uid, oid_raw)
     try:
         oid = int(oid_raw)
     except (TypeError, ValueError):
@@ -13188,6 +13245,7 @@ def main() -> None:
     app = (
         Application.builder()
         .token(token)
+        .concurrent_updates(False)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
@@ -13199,11 +13257,7 @@ def main() -> None:
         group=-1,
     )
     app.add_handler(
-        TypeHandler(Update, route_customer_media_message, block=False),
-        group=-1,
-    )
-    app.add_handler(
-        MessageHandler(_PROOF_MEDIA_FILTER, on_user_photo),
+        MessageHandler(_PROOF_MEDIA_FILTER, on_customer_proof_media),
         group=-1,
     )
     app.add_handler(
@@ -13398,6 +13452,7 @@ def main() -> None:
     )
     app.add_handler(CallbackQueryHandler(on_pick_category, pattern=re.compile(r"^c:(\d+|all)$")))
     app.add_handler(CallbackQueryHandler(on_callback_query_unhandled), group=99)
+    app.add_handler(MessageHandler(_PROOF_MEDIA_FILTER, on_user_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     # Краткие сбои Telegram / наложение деплоев: повторить bootstrap (delete_webhook и т.д.).
