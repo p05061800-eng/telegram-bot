@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-06-proof-v11"
+BOT_BUILD_ID = "2026-06-06-proof-v12"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -536,6 +536,41 @@ def save_state() -> None:
         os.replace(tmp, STATE_FILE)
     except Exception:
         logging.getLogger(__name__).exception("Не удалось сохранить состояние бота")
+
+
+def _refresh_orders_state_from_redis() -> None:
+    """Подтянуть ORDERS и user_states из Redis (сессия оплаты после другого handler)."""
+    if not STATE_REDIS_KEY or STATE_REDIS_SAVE_BLOCKED:
+        return
+    raw = _state_redis_command(["GET", STATE_REDIS_KEY])
+    if not isinstance(raw, str) or not raw.strip():
+        return
+    try:
+        data = json.loads(raw)
+    except Exception:
+        logging.getLogger(__name__).exception("refresh orders state: json parse failed")
+        return
+    if not isinstance(data, dict):
+        return
+    global ORDER_COUNTER
+    loaded_orders = _int_key_dict(data.get("orders"))
+    if loaded_orders:
+        ORDERS.clear()
+        ORDERS.update(loaded_orders)
+    loaded_user_orders = _int_key_dict(data.get("user_orders"))
+    if loaded_user_orders:
+        USER_ORDERS.clear()
+        USER_ORDERS.update(loaded_user_orders)
+    loaded_states = _int_key_dict(data.get("user_states"))
+    if loaded_states:
+        user_states.clear()
+        user_states.update(loaded_states)
+    try:
+        restored_counter = int(data.get("order_counter") or 0)
+    except (TypeError, ValueError):
+        restored_counter = 0
+    max_oid = max([0] + [int(x) for x in ORDERS.keys()])
+    ORDER_COUNTER = max(int(ORDER_COUNTER), restored_counter, max_oid + 1)
 
 
 def load_state() -> None:
@@ -5792,6 +5827,35 @@ def _resolve_proof_order_record(
     return stub
 
 
+def _resolve_proof_order_id_aggressive(
+    uid: int, ud: Optional[dict] = None
+) -> Optional[int]:
+    """ID заказа для чека: сессия → Redis user_states → последний неоплаченный."""
+    _refresh_orders_state_from_redis()
+    ud_d = ud if isinstance(ud, dict) else {}
+    oid = _resolve_proof_order_id_for_photo(uid, ud_d)
+    if oid is not None:
+        return int(oid)
+    for raw in (
+        _user_state_get(uid, "awaiting_proof"),
+        ud_d.get("awaiting_proof"),
+        _user_state_get(uid, "awaiting_payment_order_id"),
+        ud_d.get("awaiting_payment_order_id"),
+    ):
+        if raw is None:
+            continue
+        try:
+            oid_i = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if _proof_order_owned_by_user(uid, oid_i):
+            return oid_i
+    latest = _find_latest_unpaid_order_id(uid)
+    if latest is not None:
+        return int(latest)
+    return None
+
+
 def _resolve_proof_order_id_for_photo(
     uid: int, ud: Optional[dict] = None
 ) -> Optional[int]:
@@ -5861,9 +5925,13 @@ def _set_awaiting_proof_session(uid: int, ud: dict, oid: int) -> None:
     oid_i = int(oid)
     if isinstance(ud, dict):
         ud["awaiting_proof"] = oid_i
-    _user_state_bucket(uid)["proof_deadline"] = int(time.time()) + 7200
+        ud["awaiting_payment_order_id"] = oid_i
+    b = _user_state_bucket(uid)
+    b["proof_deadline"] = int(time.time()) + 7200
     _user_state_set(uid, "awaiting_proof", oid_i)
+    _user_state_set(uid, "awaiting_payment_order_id", oid_i)
     _bind_payment_order_session(uid, ud, oid_i)
+    save_state()
 
 
 def _is_reply_to_proof_request(msg: Optional[Message]) -> bool:
@@ -5874,6 +5942,7 @@ def _is_reply_to_proof_request(msg: Optional[Message]) -> bool:
 
 
 def _user_wants_proof_upload(uid: int, ud: dict, msg: Optional[Message]) -> bool:
+    _refresh_orders_state_from_redis()
     if _user_state_get(uid, "awaiting_proof") is not None:
         return True
     if _user_state_get(uid, "awaiting_payment_order_id") is not None:
@@ -11780,6 +11849,7 @@ async def on_payment_paid(
         return
     uid = int(q.from_user.id)
     ud = context.user_data if isinstance(context.user_data, dict) else {}
+    _refresh_orders_state_from_redis()
     await _callback_ack(q)
     msg_txt = (q.message.text or q.message.caption or "") if q.message else ""
     oid = _resolve_payment_order_id(
@@ -12094,15 +12164,30 @@ async def route_customer_media_message(
     msg = update.message
     if not msg or not msg.from_user:
         return
-    if not _image_file_id_from_message(msg):
+    uid = int(msg.from_user.id)
+    ud = context.user_data if isinstance(context.user_data, dict) else {}
+    file_id = _image_file_id_from_message(msg)
+    if not file_id:
+        if not is_admin(uid) and _user_wants_proof_upload(uid, ud, msg):
+            await msg.reply_text(
+                "Не вижу изображение. Пришлите скрин как фото (PNG/JPG), не PDF.",
+                reply_markup=REPLY_KB,
+            )
+            raise ApplicationHandlerStop
         return
     logging.getLogger(__name__).info(
-        "media_route uid=%s msg_id=%s photo=%s doc=%s",
-        msg.from_user.id,
+        "media_route uid=%s msg_id=%s photo=%s doc=%s proof=%s",
+        uid,
         msg.message_id,
         bool(msg.photo),
         bool(msg.document),
+        _user_wants_proof_upload(uid, ud, msg),
     )
+    if not is_admin(uid) and _user_wants_proof_upload(uid, ud, msg):
+        try:
+            await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
+        except Exception:
+            logging.getLogger(__name__).exception("media_route proof ack uid=%s", uid)
     await on_user_photo(update, context)
     raise ApplicationHandlerStop
 
@@ -12133,7 +12218,7 @@ async def _on_user_photo_body(
     uid = msg.from_user.id if msg.from_user else 0
     ud = context.user_data if isinstance(context.user_data, dict) else {}
     file_id_peek = _image_file_id_from_message(msg)
-    proof_peek = _resolve_proof_order_id_for_photo(uid, ud) if uid else None
+    proof_peek = _resolve_proof_order_id_aggressive(uid, ud) if uid else None
     log.info(
         "user_photo uid=%s proof_oid=%s has_file=%s photo=%s doc=%s",
         uid,
@@ -12154,7 +12239,7 @@ async def _on_user_photo_body(
                 reply_markup=REPLY_KB,
             )
         return
-    proof_oid = _resolve_proof_order_id_for_photo(uid, ud) if uid else None
+    proof_oid = _resolve_proof_order_id_aggressive(uid, ud) if uid else None
     if uid and file_id_peek:
         if proof_oid is not None:
             await on_payment_proof_photo(update, context)
@@ -12231,7 +12316,7 @@ async def on_payment_flow_non_text(
         return
     uid = int(msg.from_user.id)
     ud = context.user_data if isinstance(context.user_data, dict) else {}
-    if _resolve_proof_order_id_for_photo(uid, ud) is None:
+    if _resolve_proof_order_id_aggressive(uid, ud) is None:
         return
     await msg.reply_text(
         "Пришлите скрин оплаты как фото или картинку (PNG/JPG), не стикер и не PDF.",
@@ -12272,12 +12357,8 @@ async def _on_payment_proof_photo_body(
     uid = msg.from_user.id if msg.from_user else 0
     if not uid:
         return
-    oid_raw = _resolve_proof_order_id_for_photo(uid, ud)
-    if oid_raw is None:
-        latest = _find_latest_unpaid_order_id(uid)
-        if latest is not None:
-            _set_awaiting_proof_session(uid, ud, int(latest))
-            oid_raw = int(latest)
+    _refresh_orders_state_from_redis()
+    oid_raw = _resolve_proof_order_id_aggressive(uid, ud)
     if oid_raw is None:
         await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
         return
@@ -12324,10 +12405,6 @@ async def _on_payment_proof_photo_body(
         o.pop("payment_proof_admin_chat_id", None)
         o.pop("payment_proof_admin_message_id", None)
     _clear_crypto_auto_watch(o, uid, persist=False)
-    try:
-        await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
-    except Exception:
-        log.exception("payment_proof_photo ack uid=%s oid=%s", uid, oid)
     try:
         cap = _format_payment_proof_caption(oid, o, uid)
     except Exception:
@@ -13288,7 +13365,6 @@ def main() -> None:
     )
     app.add_handler(CallbackQueryHandler(on_pick_category, pattern=re.compile(r"^c:(\d+|all)$")))
     app.add_handler(CallbackQueryHandler(on_callback_query_unhandled), group=99)
-    app.add_handler(MessageHandler(_PROOF_MEDIA_FILTER, on_user_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     # Краткие сбои Telegram / наложение деплоев: повторить bootstrap (delete_webhook и т.д.).
