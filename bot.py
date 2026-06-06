@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-06-proof-v10"
+BOT_BUILD_ID = "2026-06-06-proof-v11"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -1098,6 +1098,10 @@ MSG_SEND_SUPPORT_FAIL = "Не удалось отправить сообщени
 MSG_ORDER_ALREADY_PAID_SKIP_PROOF = "По этому заказу оплата уже учтена, скрин не нужен."
 MSG_PAY_PROOF_TO_ADMIN_FAIL = (
     "Не удалось передать скрин администратору. Попробуйте ещё раз или напишите в поддержку."
+)
+MSG_PAY_PROOF_RECEIVED = "⏳ Получили скрин, передаём администратору…"
+MSG_PAY_PROOF_OK = (
+    "✅ Чек передан администратору. Ожидайте подтверждения оплаты."
 )
 MSG_CALLBACK_CATEGORY_INVALID = "Такой категории нет. Откройте каталог заново."
 MSG_CART_CLEARED_TOAST = "Корзина очищена."
@@ -11855,6 +11859,18 @@ async def on_payment_paid(
         )
 
 
+def _telegram_sent_ids(sent: object) -> Tuple[int, int]:
+    """chat_id и message_id из Message или MessageId (python-telegram-bot 20+)."""
+    if hasattr(sent, "chat_id") and getattr(sent, "chat_id", None) is not None:
+        chat_id = int(sent.chat_id)  # type: ignore[attr-defined]
+    elif hasattr(sent, "chat"):
+        chat = getattr(sent, "chat")
+        chat_id = int(chat.id if hasattr(chat, "id") else chat)
+    else:
+        raise TypeError(f"cannot resolve chat_id from {type(sent)!r}")
+    return chat_id, int(getattr(sent, "message_id"))
+
+
 def _admin_target_chat_ids() -> set:
     ids: set = set()
     for raw in _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else []):
@@ -11960,10 +11976,10 @@ async def _send_or_edit_admin_payment_proof(
             return None
 
     for tgt in targets:
-        sent = await _try_copy(tgt)
+        sent = await _try_photo(tgt)
         if sent is not None:
             break
-        sent = await _try_photo(tgt)
+        sent = await _try_copy(tgt)
         if sent is not None:
             break
         sent = await _try_forward(tgt)
@@ -12009,12 +12025,18 @@ async def _send_or_edit_admin_payment_proof(
         )
         return False
 
-    o["payment_proof_admin_chat_id"] = int(sent.chat_id)
-    o["payment_proof_admin_message_id"] = int(sent.message_id)
+    try:
+        chat_id, message_id = _telegram_sent_ids(sent)
+    except (TypeError, ValueError) as e:
+        log.exception("payment proof sent ids order_id=%s: %s", order_id, e)
+        return False
+
+    o["payment_proof_admin_chat_id"] = chat_id
+    o["payment_proof_admin_message_id"] = message_id
     log.info(
         "payment proof delivered chat=%s msg=%s order_id=%s",
-        sent.chat_id,
-        sent.message_id,
+        chat_id,
+        message_id,
         order_id,
     )
     return True
@@ -12222,6 +12244,22 @@ async def on_payment_proof_photo(
     """Фото-скрин оплаты при awaiting_proof; оплата у заказа — после подтверждения админом."""
     log = logging.getLogger(__name__)
     msg = update.effective_message
+    try:
+        await _on_payment_proof_photo_body(update, context)
+    except Exception:
+        log.exception("on_payment_proof_photo failed uid=%s", msg.from_user.id if msg and msg.from_user else 0)
+        if msg:
+            try:
+                await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
+            except Exception:
+                pass
+
+
+async def _on_payment_proof_photo_body(
+    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Тело обработки скрина оплаты."""
+    log = logging.getLogger(__name__)
+    msg = update.effective_message
     file_id = _image_file_id_from_message(msg)
     if not msg or not file_id:
         if msg:
@@ -12276,21 +12314,9 @@ async def on_payment_proof_photo(
             ud.pop("awaiting_proof", None)
         await msg.reply_text(MSG_ORDER_ALREADY_PAID_SKIP_PROOF)
         return
-    if (
-        o.get("payment_proof_submitted")
-        and not o.get("paid")
-        and o.get("payment_proof_admin_message_id")
-        and _proof_stored_in_current_admin_chat(o)
-    ):
-        await msg.reply_text(PAY_PROOF_WAIT)
-        return
-    if (
-        o.get("payment_proof_submitted")
-        and not o.get("paid")
-        and not _proof_stored_in_current_admin_chat(o)
-    ):
+    if o.get("payment_proof_submitted") and not o.get("paid"):
         log.info(
-            "payment proof resend to current admin uid=%s oid=%s old_chat=%s",
+            "payment proof resubmit uid=%s oid=%s prev_chat=%s",
             uid,
             oid,
             o.get("payment_proof_admin_chat_id"),
@@ -12298,6 +12324,10 @@ async def on_payment_proof_photo(
         o.pop("payment_proof_admin_chat_id", None)
         o.pop("payment_proof_admin_message_id", None)
     _clear_crypto_auto_watch(o, uid, persist=False)
+    try:
+        await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
+    except Exception:
+        log.exception("payment_proof_photo ack uid=%s oid=%s", uid, oid)
     try:
         cap = _format_payment_proof_caption(oid, o, uid)
     except Exception:
@@ -12352,10 +12382,7 @@ async def on_payment_proof_photo(
     except Exception:
         log.exception("payment_proof_photo save_state uid=%s oid=%s", uid, oid)
     try:
-        await msg.reply_text(
-            "✅ Чек передан администратору. Ожидайте подтверждения оплаты.",
-            reply_markup=REPLY_KB,
-        )
+        await msg.reply_text(MSG_PAY_PROOF_OK, reply_markup=REPLY_KB)
     except Exception:
         log.exception("payment_proof_photo customer ok uid=%s oid=%s", uid, oid)
     log.info("payment_proof_photo ok uid=%s oid=%s", uid, oid)
