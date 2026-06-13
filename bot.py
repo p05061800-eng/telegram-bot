@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-14-order-sync-v17"
+BOT_BUILD_ID = "2026-06-14-order-restore-v18"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -234,6 +234,8 @@ async def _send_customer_plain(bot, user_id: int, text: str) -> bool:
 USER_CART: dict = {}
 # После входа на сайт по коду: текст черновика до «Подтвердить / Отмена» (user_data может быть пуст)
 SITE_LOGIN_PENDING_ORDER: Dict[int, str] = {}
+# Последний order_id с сайта по user_id (checkout → sync/cart).
+PENDING_SITE_ORDER_BY_USER: Dict[int, str] = {}
 USER_FAVORITES: dict = {}
 # Списки избранного в POST /api/sync/state, /api/sync/cart, /api/verify-code (ключ «items» сюда
 # не входит — в sync/cart «items» это корзина). Для POST /api/sync/favorites дополнительно читают «items».
@@ -2975,6 +2977,7 @@ async def _handle_site_order_from_sync_payload(
     if del_raw is not None and not merged.get("delivery"):
         merged["delivery"] = str(del_raw).strip().upper()
     register_shared_deep_link_order(order_id, merged)
+    PENDING_SITE_ORDER_BY_USER[int(uid)] = order_id
     products: List[dict] = []
     try:
         products = await load_products() or []
@@ -2993,7 +2996,13 @@ async def _handle_site_order_from_sync_payload(
     skip_notify = bool(
         data.get("skip_buyer_notify") or data.get("skipBuyerNotify")
     )
-    if not skip_notify and bot and norm:
+    session = data.get("session") if isinstance(data.get("session"), dict) else {}
+    from_checkout = (
+        str(session.get("source") or "").strip() == "vercel_order_create"
+        or bool(order_id and isinstance(order_raw, dict))
+    )
+    should_notify = bot and norm and (not skip_notify or from_checkout)
+    if should_notify:
         preview = _format_site_order_confirm_preview(int(uid), norm, products)
         if preview.strip():
             try:
@@ -3060,9 +3069,12 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
     note_loy = _apply_site_loyalty_from_sync(uid, data)
     bot_loy = request.app.get("bot")
     _schedule_loyalty_notify(bot_loy, uid, note_loy)
-    if lines:
-        _schedule_site_cart_confirm_prompt(bot_loy, uid, intro_kind="verified")
+    skip_buyer_notify = bool(
+        data.get("skip_buyer_notify") or data.get("skipBuyerNotify")
+    )
     site_order_id = await _handle_site_order_from_sync_payload(data, uid, bot_loy)
+    if lines and not skip_buyer_notify:
+        _schedule_site_cart_confirm_prompt(bot_loy, uid, intro_kind="verified")
     users_touch(uid, "cart_sync")
     body_loy: Dict[str, object] = {"success": True, "user_id": uid, "items": len(lines)}
     if site_order_id:
@@ -9381,13 +9393,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     users_touch(uid, "start")
     _register_login_username(uid, msg.from_user.username)
     args = context.args or []
-    await _reply_site_transition_notice(msg, uid)
+    first = (args[0] or "").strip() if args else ""
+    joined = " ".join(args).strip() if args else ""
+    jl = joined.lower()
+    fl = (first or "").strip().lower()
+    is_web_login = bool(args) and (
+        _is_web_login_start_payload(jl) or _is_web_login_start_payload(fl)
+    )
+    is_order_link = bool(args) and bool(_parse_order_id_from_start_args(list(args)))
+    if not is_web_login and not is_order_link:
+        await _reply_site_transition_notice(msg, uid)
     if args:
-        first = (args[0] or "").strip()
-        joined = " ".join(args).strip()
-        jl = joined.lower()
-        fl = (first or "").strip().lower()
-        if _is_web_login_start_payload(jl) or _is_web_login_start_payload(fl):
+        if is_web_login:
             await _maybe_thank_first_telegram_auth(msg, uid)
             un = (msg.from_user.username or "").strip()
             wait_id = _login_wait_id_from_start_payload(jl) or _login_wait_id_from_start_payload(fl)
@@ -9411,17 +9428,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Или вернитесь на вкладку с сайтом — вход завершится автоматически.",
                 reply_markup=_account_open_markup(wait_id, uid),
             )
+            pending_oid = (PENDING_SITE_ORDER_BY_USER.get(uid) or "").strip()
+            if pending_oid:
+                order = await _fetch_order_for_deep_link(pending_oid)
+                if order:
+                    await _present_site_order_confirm_prompt(msg, context, uid, order)
+                    return
             try:
                 await _refresh_user_state_from_site(uid)
-                await _maybe_prompt_site_cart_confirmation(
+                if await _maybe_prompt_site_cart_confirmation(
                     context.bot, uid, context.user_data, intro_kind="verified"
-                )
+                ):
+                    return
             except Exception:
                 logging.getLogger(__name__).exception(
                     "web_login → cart sync failed uid=%s", uid
                 )
             return
         oid = _parse_order_id_from_start_args(list(args))
+        if not oid:
+            oid = (PENDING_SITE_ORDER_BY_USER.get(uid) or "").strip() or None
         if oid:
             order = await _fetch_order_for_deep_link(oid)
             if not order:
