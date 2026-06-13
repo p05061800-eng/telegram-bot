@@ -1433,6 +1433,26 @@ def _is_web_login_start_payload(raw: str) -> bool:
     return s == "web_login" or _login_wait_id_from_start_payload(s) is not None
 
 
+def _login_code_sync_secret() -> str:
+    """Секрет sync-login-code: на Render часто задан только TELEGRAM_SYNC_API_SECRET."""
+    return (
+        (os.getenv("ILLUCARDS_LOGIN_CODE_SYNC_SECRET") or "").strip()
+        or (os.getenv("TELEGRAM_SYNC_API_SECRET") or "").strip()
+    )
+
+
+async def _sync_login_wait_to_site(
+    telegram_user_id: int,
+    username: str,
+    wait_id: str,
+) -> bool:
+    """Синхронизация автовхода: wait_id + профиль на сайт (без кода)."""
+    wid = str(wait_id or "").strip().lower()
+    if len(wid) != 32 or not all(c in "0123456789abcdef" for c in wid):
+        return False
+    return await _sync_login_code_to_site("", int(telegram_user_id), username, wid)
+
+
 async def _sync_login_code_to_site(
     code: str,
     telegram_user_id: int,
@@ -1444,46 +1464,85 @@ async def _sync_login_code_to_site(
     and mark web_login_<wait_id> ready. If env is absent, the bot /api/verify-code
     flow still works.
     """
+    secret = _login_code_sync_secret()
     url = (os.getenv("ILLUCARDS_LOGIN_CODE_SYNC_URL") or "").strip()
-    secret = (os.getenv("ILLUCARDS_LOGIN_CODE_SYNC_SECRET") or "").strip()
     if not url:
-        try:
-            url = f"{_illucards_site_base_url()}/api/internal/sync-login-code"
-        except Exception:
-            url = ""
+        url = f"{_illucards_site_base_url()}/api/internal/sync-login-code"
     if not url or not secret:
+        logging.getLogger(__name__).warning(
+            "sync-login-code: секрет не задан — wait_id не синхронизирован с сайтом"
+        )
         return False
     un = str(username or "").strip().lstrip("@")
     payload: dict = {
-        "code": str(code),
         "user_id": int(telegram_user_id),
         "username_display": un if un else f"id{int(telegram_user_id)}",
         "username_norm": _normalize_login_username(un) if un else "",
     }
+    code_digits = re.sub(r"\D", "", str(code or ""))
+    if len(code_digits) == 4:
+        payload["code"] = code_digits
     if wait_id:
         wid = _login_wait_id_from_start_payload(f"web_login_{wait_id}") or ""
         if wid:
             payload["wait_id"] = wid
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
-            async with session.post(
-                url,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {secret}",
-                    "Content-Type": "application/json",
-                },
-            ) as resp:
-                if resp.status >= 300:
-                    body = await resp.text()
-                    logging.getLogger(__name__).warning(
-                        "sync-login-code HTTP %s: %s", resp.status, body[:300]
-                    )
-                    return False
-                return True
-    except Exception:
-        logging.getLogger(__name__).exception("sync-login-code failed")
+    if "code" not in payload and "wait_id" not in payload:
         return False
+    last_err: Optional[str] = None
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {secret}",
+                        "Content-Type": "application/json",
+                    },
+                ) as resp:
+                    if resp.status == 200:
+                        return True
+                    body = await resp.text()
+                    last_err = f"HTTP {resp.status}: {body[:300]}"
+                    logging.getLogger(__name__).warning(
+                        "sync-login-code attempt %s/3 %s",
+                        attempt + 1,
+                        last_err,
+                    )
+        except Exception as e:
+            last_err = str(e)
+            logging.getLogger(__name__).warning(
+                "sync-login-code attempt %s/3: %s", attempt + 1, e
+            )
+        if attempt < 2:
+            await asyncio.sleep(1.5)
+    if last_err:
+        logging.getLogger(__name__).warning(
+            "sync-login-code failed: %s url=%s", last_err, url
+        )
+    return False
+
+
+def _account_open_markup(
+    wait_id: Optional[str] = None,
+    telegram_user_id: Optional[int] = None,
+) -> InlineKeyboardMarkup:
+    """Личный кабинет — user_id для мгновенного входа + tg_wait для синхронизации."""
+    wid = str(wait_id or "").strip().lower()
+    uid = int(telegram_user_id or 0)
+    has_wait = len(wid) == 32 and all(c in "0123456789abcdef" for c in wid)
+    base = _illucards_site_base_url()
+    if uid > 0 and has_wait:
+        url = f"{base}/account?user_id={uid}&tg_wait={wid}"
+    elif uid > 0:
+        url = f"{base}/account?user_id={uid}"
+    elif has_wait:
+        url = f"{base}/account?tg_wait={wid}"
+    else:
+        url = f"{base}/account"
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Открыть личный кабинет", url=url)]]
+    )
 
 
 def _login_cors_headers() -> dict:
@@ -9236,20 +9295,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _maybe_thank_first_telegram_auth(msg, uid)
             un = (msg.from_user.username or "").strip()
             wait_id = _login_wait_id_from_start_payload(jl) or _login_wait_id_from_start_payload(fl)
-            code = _issue_login_code(uid, un)
-            await _sync_login_code_to_site(code, uid, un, wait_id=wait_id)
+            if not wait_id:
+                await msg.reply_text(
+                    "Для входа на сайт нажмите «Войти через Telegram» в личном кабинете на "
+                    f"{_illucards_site_base_url()}/account",
+                    reply_markup=REPLY_KB,
+                )
+                return
+            synced = await _sync_login_wait_to_site(uid, un, wait_id)
+            if not synced:
+                await msg.reply_text(
+                    "Сервис входа временно недоступен. Попробуйте ещё раз через минуту.",
+                    reply_markup=REPLY_KB,
+                )
+                return
             await msg.reply_text(
-                _telegram_login_code_message(code),
-                reply_markup=REPLY_KB,
+                "✅ Вход подтверждён.\n\n"
+                "Нажмите кнопку ниже — откроется личный кабинет на сайте (вход уже выполнен).\n\n"
+                "Или вернитесь на вкладку с сайтом — вход завершится автоматически.",
+                reply_markup=_account_open_markup(wait_id, uid),
             )
-            await msg.reply_text(
-                "Код уже отправлен. Вернитесь на сайт, вставьте его и нажмите «Войти».",
-                reply_markup=REPLY_KB,
-            )
-            if await _maybe_prompt_site_cart_confirmation(
-                context.bot, uid, context.user_data, intro_kind="draft"
-            ):
-                await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
             return
         oid = _parse_order_id_from_start_args(list(args))
         if oid:
