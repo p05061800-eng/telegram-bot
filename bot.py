@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-06-notify-v15"
+BOT_BUILD_ID = "2026-06-14-order-sync-v16"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -2931,6 +2931,79 @@ def _sync_explicit_clear(data: dict, *keys: str) -> bool:
     return False
 
 
+async def _handle_site_order_from_sync_payload(
+    data: dict, uid: int, bot
+) -> Optional[str]:
+    """Запомнить заказ с сайта (order/create → sync/cart) для /start order_<id>."""
+    order_id = str(data.get("order_id") or "").strip()
+    order_raw = data.get("order")
+    if isinstance(order_raw, dict):
+        order_id = str(
+            order_raw.get("order_id") or order_raw.get("id") or order_id
+        ).strip()
+    if not order_id:
+        return None
+    merged: dict = dict(order_raw) if isinstance(order_raw, dict) else {}
+    merged["user_id"] = int(uid)
+    merged.setdefault("id", order_id)
+    merged.setdefault("order_id", order_id)
+    cart_raw = data.get("cart")
+    if not isinstance(cart_raw, list):
+        cart_raw = data.get("items")
+    if isinstance(cart_raw, list) and cart_raw and not merged.get("items"):
+        merged["items"] = deepcopy(cart_raw)
+    merged.setdefault("status", "new")
+    del_raw = (
+        data.get("deliveryCountry")
+        or data.get("delivery_country")
+        or merged.get("delivery")
+    )
+    if del_raw is not None and not merged.get("delivery"):
+        merged["delivery"] = str(del_raw).strip().upper()
+    register_shared_deep_link_order(order_id, merged)
+    products: List[dict] = []
+    try:
+        products = await load_products() or []
+    except Exception:
+        products = []
+    norm = _normalize_deep_link_order(deepcopy(merged), order_id, products)
+    if norm:
+        _apply_site_order_norm_to_user_cart(int(uid), norm)
+        preview = _format_site_order_confirm_preview(int(uid), norm, products)
+        if preview.strip():
+            meta: Dict[str, object] = {
+                "external_id": order_id,
+                "items": list(norm.get("items") or []),
+            }
+            _persist_site_pending_order(int(uid), preview, meta, None)
+    skip_notify = bool(
+        data.get("skip_buyer_notify") or data.get("skipBuyerNotify")
+    )
+    if not skip_notify and bot and norm:
+        preview = _format_site_order_confirm_preview(int(uid), norm, products)
+        if preview.strip():
+            try:
+                await bot.send_message(
+                    int(uid),
+                    START_SITE_TRANSITION_TEXT,
+                    reply_markup=REPLY_KB,
+                )
+                await _send_site_cart_confirm_prompt(
+                    bot, int(uid), preview, intro_kind="draft"
+                )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "site order notify after sync uid=%s order=%s", uid, order_id
+                )
+    logging.getLogger(__name__).info(
+        "sync/cart: registered site order uid=%s order_id=%s skip_notify=%s",
+        uid,
+        order_id,
+        skip_notify,
+    )
+    return order_id
+
+
 async def _http_sync_cart(request: web.Request) -> web.Response:
     try:
         data = await request.json()
@@ -2945,10 +3018,10 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
         return _login_json_response({"success": False, "error": "Пользователь не найден"}, status=404)
     del_raw = data.get("deliveryCountry") or data.get("delivery_country")
     bot_code, _, _, _ = _delivery_option_for_site_code(str(del_raw or "BY"))
-    raw_items = data.get("items")
-    if raw_items is None:
-        raw_items = data.get("cart")
-    lines = _normalize_sync_cart_items(raw_items, bot_code)
+    cart_raw = data.get("cart")
+    if not isinstance(cart_raw, list):
+        cart_raw = data.get("items")
+    lines = _normalize_sync_cart_items(cart_raw, bot_code)
     _remember_user_delivery_country(uid, bot_code)
     try:
         products = await load_products()
@@ -2970,30 +3043,13 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
     note_loy = _apply_site_loyalty_from_sync(uid, data)
     bot_loy = request.app.get("bot")
     _schedule_loyalty_notify(bot_loy, uid, note_loy)
-
-    order_id_raw = str(
-        data.get("order_id") or data.get("orderId") or data.get("id") or ""
-    ).strip()
-    order_payload = data.get("order")
-    if order_id_raw and isinstance(order_payload, dict):
-        payload = deepcopy(order_payload)
-        payload.setdefault("user_id", int(uid))
-        register_shared_deep_link_order(order_id_raw, payload)
-        SITE_LOGIN_PENDING_ORDER[int(uid)] = order_id_raw
-
-    skip_buyer_notify = bool(
-        data.get("skip_buyer_notify") or data.get("skipBuyerNotify")
-    )
-    if lines and not skip_buyer_notify:
+    if lines:
         _schedule_site_cart_confirm_prompt(bot_loy, uid, intro_kind="verified")
+    site_order_id = await _handle_site_order_from_sync_payload(data, uid, bot_loy)
     users_touch(uid, "cart_sync")
-    body_loy: Dict[str, object] = {
-        "success": True,
-        "user_id": uid,
-        "items": len(lines),
-    }
-    if order_id_raw:
-        body_loy["order_id"] = order_id_raw
+    body_loy: Dict[str, object] = {"success": True, "user_id": uid, "items": len(lines)}
+    if site_order_id:
+        body_loy["order_id"] = site_order_id
     lb_loy = USER_SITE_LOYALTY.get(uid, {}).get("balance")
     if lb_loy is not None:
         try:
@@ -9308,18 +9364,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     users_touch(uid, "start")
     _register_login_username(uid, msg.from_user.username)
     args = context.args or []
-    first = (args[0] or "").strip() if args else ""
-    joined = " ".join(args).strip() if args else ""
-    jl = joined.lower()
-    fl = (first or "").strip().lower()
-    is_web_login = bool(args) and (
-        _is_web_login_start_payload(jl) or _is_web_login_start_payload(fl)
-    )
-    is_order_link = bool(args) and bool(_parse_order_id_from_start_args(list(args)))
-    if not is_web_login and not is_order_link:
-        await _reply_site_transition_notice(msg, uid)
+    await _reply_site_transition_notice(msg, uid)
     if args:
-        if is_web_login:
+        first = (args[0] or "").strip()
+        joined = " ".join(args).strip()
+        jl = joined.lower()
+        fl = (first or "").strip().lower()
+        if _is_web_login_start_payload(jl) or _is_web_login_start_payload(fl):
+            await _maybe_thank_first_telegram_auth(msg, uid)
             un = (msg.from_user.username or "").strip()
             wait_id = _login_wait_id_from_start_payload(jl) or _login_wait_id_from_start_payload(fl)
             if not wait_id:
@@ -9336,27 +9388,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     reply_markup=REPLY_KB,
                 )
                 return
-            await _maybe_thank_first_telegram_auth(msg, uid)
             await msg.reply_text(
                 "✅ Вход подтверждён.\n\n"
                 "Нажмите кнопку ниже — откроется личный кабинет на сайте (вход уже выполнен).\n\n"
                 "Или вернитесь на вкладку с сайтом — вход завершится автоматически.",
                 reply_markup=_account_open_markup(wait_id, uid),
             )
-            pending_oid = (SITE_LOGIN_PENDING_ORDER.get(uid) or "").strip()
-            if pending_oid:
-                order = await _fetch_order_for_deep_link(pending_oid)
-                if order:
-                    await _present_site_order_confirm_prompt(msg, context, uid, order)
-                    return
-            if await _maybe_prompt_site_cart_confirmation(
-                context.bot, uid, context.user_data, intro_kind="draft"
-            ):
-                return
             return
         oid = _parse_order_id_from_start_args(list(args))
-        if not oid:
-            oid = (SITE_LOGIN_PENDING_ORDER.get(uid) or "").strip() or None
         if oid:
             order = await _fetch_order_for_deep_link(oid)
             if not order:
