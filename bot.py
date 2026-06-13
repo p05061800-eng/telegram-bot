@@ -1253,7 +1253,6 @@ BTN_MY_ORDERS = "📋 Мои заказы"
 BTN_DELIVERY = "🚚 Доставка"
 BTN_RANDOM_CARD = "🎁 Случайная карточка"
 BTN_FAVORITES = "💚 Избранное"
-BTN_BONUSES = "⭐ Бонусы"
 
 # Уведомление клиенту при входе админа в режим ответа
 ADMIN_TYPING_NOTICE = "⏳ Администратор печатает..."
@@ -4017,7 +4016,7 @@ def _rarity_label_ru(s: str) -> str:
 REPLY_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(BTN_CHAT), KeyboardButton(BTN_MY_ORDERS)],
-        [KeyboardButton(BTN_DELIVERY), KeyboardButton(BTN_BONUSES)],
+        [KeyboardButton(BTN_DELIVERY)],
     ],
     resize_keyboard=True,
 )
@@ -4028,7 +4027,6 @@ REPLY_MENU_TEXTS = frozenset(
         BTN_CHAT,
         BTN_MY_ORDERS,
         BTN_DELIVERY,
-        BTN_BONUSES,
     },
 )
 
@@ -13212,14 +13210,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if text == BTN_RANDOM_CARD:
         await send_random_card(update, context)
-        return
-
-    if text == BTN_BONUSES:
-        await msg.reply_text(
-            _loyalty_menu_text(uid),
-            reply_markup=REPLY_KB,
-            disable_web_page_preview=True,
-        )
         return
 
     await msg.reply_text(MSG_UNKNOWN_TEXT, reply_markup=REPLY_KB)
