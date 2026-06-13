@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-14-order-sync-v16"
+BOT_BUILD_ID = "2026-06-14-order-sync-v17"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -9411,6 +9411,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Или вернитесь на вкладку с сайтом — вход завершится автоматически.",
                 reply_markup=_account_open_markup(wait_id, uid),
             )
+            try:
+                await _refresh_user_state_from_site(uid)
+                await _maybe_prompt_site_cart_confirmation(
+                    context.bot, uid, context.user_data, intro_kind="verified"
+                )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "web_login → cart sync failed uid=%s", uid
+                )
             return
         oid = _parse_order_id_from_start_args(list(args))
         if oid:
