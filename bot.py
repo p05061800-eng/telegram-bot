@@ -1782,11 +1782,25 @@ async def _http_verify_code(request: web.Request) -> web.Response:
 
 def _sync_auth_ok(request: web.Request, data: dict) -> bool:
     """Проверка секрета синхронизации сайта -> бот."""
-    if not SYNC_API_SECRET:
+    secrets = [s for s in (SYNC_API_SECRET, ORDER_STATUS_UPDATE_SECRET) if s]
+    if not secrets:
         return True
     header_secret = (request.headers.get("X-Sync-Secret") or "").strip()
     body_secret = str(data.get("secret") or "").strip()
-    return hmac.compare_digest(header_secret or body_secret, SYNC_API_SECRET)
+    for candidate in (header_secret, body_secret):
+        if not candidate:
+            continue
+        for secret in secrets:
+            if hmac.compare_digest(candidate, secret):
+                return True
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        tok = auth[7:].strip()
+        if tok:
+            for secret in secrets:
+                if hmac.compare_digest(tok, secret):
+                    return True
+    return False
 
 
 def _site_api_auth_ok(request: web.Request, data: dict) -> bool:
@@ -3017,6 +3031,9 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
     if not uid:
         return _login_json_response({"success": False, "error": "Пользователь не найден"}, status=404)
     del_raw = data.get("deliveryCountry") or data.get("delivery_country")
+    order_obj = data.get("order")
+    if not del_raw and isinstance(order_obj, dict):
+        del_raw = order_obj.get("delivery") or order_obj.get("deliveryCountry")
     bot_code, _, _, _ = _delivery_option_for_site_code(str(del_raw or "BY"))
     cart_raw = data.get("cart")
     if not isinstance(cart_raw, list):
