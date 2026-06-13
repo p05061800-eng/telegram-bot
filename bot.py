@@ -2945,7 +2945,10 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
         return _login_json_response({"success": False, "error": "Пользователь не найден"}, status=404)
     del_raw = data.get("deliveryCountry") or data.get("delivery_country")
     bot_code, _, _, _ = _delivery_option_for_site_code(str(del_raw or "BY"))
-    lines = _normalize_sync_cart_items(data.get("items"), bot_code)
+    raw_items = data.get("items")
+    if raw_items is None:
+        raw_items = data.get("cart")
+    lines = _normalize_sync_cart_items(raw_items, bot_code)
     _remember_user_delivery_country(uid, bot_code)
     try:
         products = await load_products()
@@ -2967,10 +2970,30 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
     note_loy = _apply_site_loyalty_from_sync(uid, data)
     bot_loy = request.app.get("bot")
     _schedule_loyalty_notify(bot_loy, uid, note_loy)
-    if lines:
+
+    order_id_raw = str(
+        data.get("order_id") or data.get("orderId") or data.get("id") or ""
+    ).strip()
+    order_payload = data.get("order")
+    if order_id_raw and isinstance(order_payload, dict):
+        payload = deepcopy(order_payload)
+        payload.setdefault("user_id", int(uid))
+        register_shared_deep_link_order(order_id_raw, payload)
+        SITE_LOGIN_PENDING_ORDER[int(uid)] = order_id_raw
+
+    skip_buyer_notify = bool(
+        data.get("skip_buyer_notify") or data.get("skipBuyerNotify")
+    )
+    if lines and not skip_buyer_notify:
         _schedule_site_cart_confirm_prompt(bot_loy, uid, intro_kind="verified")
     users_touch(uid, "cart_sync")
-    body_loy: Dict[str, object] = {"success": True, "user_id": uid, "items": len(lines)}
+    body_loy: Dict[str, object] = {
+        "success": True,
+        "user_id": uid,
+        "items": len(lines),
+    }
+    if order_id_raw:
+        body_loy["order_id"] = order_id_raw
     lb_loy = USER_SITE_LOYALTY.get(uid, {}).get("balance")
     if lb_loy is not None:
         try:
@@ -9285,14 +9308,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     users_touch(uid, "start")
     _register_login_username(uid, msg.from_user.username)
     args = context.args or []
-    await _reply_site_transition_notice(msg, uid)
+    first = (args[0] or "").strip() if args else ""
+    joined = " ".join(args).strip() if args else ""
+    jl = joined.lower()
+    fl = (first or "").strip().lower()
+    is_web_login = bool(args) and (
+        _is_web_login_start_payload(jl) or _is_web_login_start_payload(fl)
+    )
+    is_order_link = bool(args) and bool(_parse_order_id_from_start_args(list(args)))
+    if not is_web_login and not is_order_link:
+        await _reply_site_transition_notice(msg, uid)
     if args:
-        first = (args[0] or "").strip()
-        joined = " ".join(args).strip()
-        jl = joined.lower()
-        fl = (first or "").strip().lower()
-        if _is_web_login_start_payload(jl) or _is_web_login_start_payload(fl):
-            await _maybe_thank_first_telegram_auth(msg, uid)
+        if is_web_login:
             un = (msg.from_user.username or "").strip()
             wait_id = _login_wait_id_from_start_payload(jl) or _login_wait_id_from_start_payload(fl)
             if not wait_id:
@@ -9309,14 +9336,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     reply_markup=REPLY_KB,
                 )
                 return
+            await _maybe_thank_first_telegram_auth(msg, uid)
             await msg.reply_text(
                 "✅ Вход подтверждён.\n\n"
                 "Нажмите кнопку ниже — откроется личный кабинет на сайте (вход уже выполнен).\n\n"
                 "Или вернитесь на вкладку с сайтом — вход завершится автоматически.",
                 reply_markup=_account_open_markup(wait_id, uid),
             )
+            pending_oid = (SITE_LOGIN_PENDING_ORDER.get(uid) or "").strip()
+            if pending_oid:
+                order = await _fetch_order_for_deep_link(pending_oid)
+                if order:
+                    await _present_site_order_confirm_prompt(msg, context, uid, order)
+                    return
+            if await _maybe_prompt_site_cart_confirmation(
+                context.bot, uid, context.user_data, intro_kind="draft"
+            ):
+                return
             return
         oid = _parse_order_id_from_start_args(list(args))
+        if not oid:
+            oid = (SITE_LOGIN_PENDING_ORDER.get(uid) or "").strip() or None
         if oid:
             order = await _fetch_order_for_deep_link(oid)
             if not order:
