@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-17-order-start-payload-v21"
+BOT_BUILD_ID = "2026-06-17-order-checkout-hint-v22"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -2956,9 +2956,74 @@ def _sync_explicit_clear(data: dict, *keys: str) -> bool:
     return False
 
 
+def _site_order_start_token(order_id: str, buyer_seq: Optional[int] = None) -> str:
+    """Короткий payload для /start (order_N или order_<uuid без дефисов>)."""
+    try:
+        seq = int(buyer_seq or 0)
+    except (TypeError, ValueError):
+        seq = 0
+    if seq > 0:
+        return f"order_{seq}"
+    oid = str(order_id or "").strip()
+    compact = oid.replace("-", "")
+    if re.fullmatch(r"[a-f0-9]{32}", compact, re.I):
+        return f"order_{compact.lower()}"
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", oid)[:56]
+    return f"order_{safe}" if safe else "order"
+
+
+def _extract_buyer_seq_from_sources(*sources: object) -> Optional[int]:
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for key in ("buyer_seq", "buyerSeq"):
+            raw = src.get(key)
+            try:
+                seq = int(raw or 0)
+            except (TypeError, ValueError):
+                seq = 0
+            if seq > 0:
+                return seq
+    return None
+
+
+async def _notify_site_order_start_hint(
+    bot,
+    uid: int,
+    order_id: str,
+    buyer_seq: Optional[int] = None,
+) -> bool:
+    """Если полный checkout не открылся — подсказка с /start order_N."""
+    bot = _resolve_live_bot(bot)
+    if not bot or not uid or not str(order_id or "").strip():
+        return False
+    tok = _site_order_start_token(order_id, buyer_seq)
+    log = logging.getLogger(__name__)
+    try:
+        await bot.send_message(
+            chat_id=int(uid),
+            text=(
+                "Заказ с сайта IlluCards оформлен.\n\n"
+                f"Нажмите или отправьте:\n/start {tok}\n\n"
+                "Если сообщение с составом заказа не появилось выше — эта команда откроет его."
+            ),
+            reply_markup=REPLY_KB,
+        )
+        log.info(
+            "site order start hint uid=%s order=%s token=%s",
+            uid,
+            order_id,
+            tok,
+        )
+        return True
+    except Exception:
+        log.exception("site order start hint failed uid=%s order=%s", uid, order_id)
+        return False
+
+
 async def _handle_site_order_from_sync_payload(
     data: dict, uid: int, bot
-) -> Optional[str]:
+) -> Tuple[Optional[str], bool]:
     """Запомнить заказ с сайта (order/create → sync/cart) для /start order_<id>."""
     order_id = str(data.get("order_id") or "").strip()
     order_raw = data.get("order")
@@ -2967,7 +3032,7 @@ async def _handle_site_order_from_sync_payload(
             order_raw.get("order_id") or order_raw.get("id") or order_id
         ).strip()
     if not order_id:
-        return None
+        return None, False
     merged: dict = dict(order_raw) if isinstance(order_raw, dict) else {}
     merged["user_id"] = int(uid)
     merged.setdefault("id", order_id)
@@ -3015,7 +3080,9 @@ async def _handle_site_order_from_sync_payload(
     username = str(data.get("username") or "").strip().lstrip("@") or None
     if not username and isinstance(order_raw, dict):
         username = str(order_raw.get("username") or "").strip().lstrip("@") or None
+    buyer_seq = _extract_buyer_seq_from_sources(data, merged, order_raw)
     should_notify = bot and norm and (not skip_notify or from_checkout)
+    checkout_pushed = False
     if should_notify:
         try:
             ok = await _present_site_order_checkout_flow(
@@ -3024,6 +3091,7 @@ async def _handle_site_order_from_sync_payload(
                 norm=norm,
                 username=username,
             )
+            checkout_pushed = bool(ok)
             if not ok:
                 logging.getLogger(__name__).warning(
                     "site order checkout flow failed uid=%s order=%s", uid, order_id
@@ -3032,13 +3100,19 @@ async def _handle_site_order_from_sync_payload(
             logging.getLogger(__name__).exception(
                 "site order notify after sync uid=%s order=%s", uid, order_id
             )
+    if from_checkout and bot and order_id and not checkout_pushed:
+        hinted = await _notify_site_order_start_hint(
+            bot, int(uid), order_id, buyer_seq
+        )
+        checkout_pushed = checkout_pushed or hinted
     logging.getLogger(__name__).info(
-        "sync/cart: registered site order uid=%s order_id=%s skip_notify=%s",
+        "sync/cart: registered site order uid=%s order_id=%s skip_notify=%s checkout_pushed=%s",
         uid,
         order_id,
         skip_notify,
+        checkout_pushed,
     )
-    return order_id
+    return order_id, checkout_pushed
 
 
 async def _http_sync_cart(request: web.Request) -> web.Response:
@@ -3086,11 +3160,14 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
     skip_buyer_notify = bool(
         data.get("skip_buyer_notify") or data.get("skipBuyerNotify")
     )
-    site_order_id = await _handle_site_order_from_sync_payload(data, uid, bot_loy)
+    site_order_id, checkout_pushed = await _handle_site_order_from_sync_payload(
+        data, uid, bot_loy
+    )
     users_touch(uid, "cart_sync")
     body_loy: Dict[str, object] = {"success": True, "user_id": uid, "items": len(lines)}
     if site_order_id:
         body_loy["order_id"] = site_order_id
+        body_loy["checkout_pushed"] = bool(checkout_pushed)
     lb_loy = USER_SITE_LOYALTY.get(uid, {}).get("balance")
     if lb_loy is not None:
         try:
@@ -8860,13 +8937,28 @@ async def _fetch_site_orders_for_user(uid: int) -> List[dict]:
         sep = "&" if "?" in ORDER_USER_ORDERS_API_URL else "?"
         url = f"{ORDER_USER_ORDERS_API_URL}{sep}user_id={safe_uid}"
     headers = _site_api_request_headers()
+    log = logging.getLogger(__name__)
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
             async with session.get(url, headers=headers or None) as resp:
                 if resp.status != 200:
+                    if resp.status == 401:
+                        log.warning(
+                            "site orders API HTTP 401 uid=%s — проверьте ILLUCARDS_ORDER_UPDATE_SECRET "
+                            "на Render (тот же Bearer, что на Vercel).",
+                            user_id,
+                        )
+                    else:
+                        log.warning(
+                            "site orders API HTTP %s uid=%s url=%s",
+                            resp.status,
+                            user_id,
+                            url,
+                        )
                     return []
                 data = await resp.json()
     except Exception:
+        log.exception("site orders API failed uid=%s", user_id)
         return []
     raw_orders = data.get("orders") if isinstance(data, dict) else data
     if not isinstance(raw_orders, list):
@@ -9958,9 +10050,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     pending_oid = await _resolve_pending_site_order_id(int(uid))
     if pending_oid:
+        buyer_seq = None
+        for raw in await _fetch_site_orders_for_user(int(uid)):
+            oid = str(raw.get("id") or raw.get("order_id") or "").strip()
+            if oid == pending_oid:
+                buyer_seq = _extract_buyer_seq_from_sources(raw)
+                break
+        tok = _site_order_start_token(pending_oid, buyer_seq)
         await msg.reply_text(
             "На сайте есть незавершённый заказ, но бот не смог его загрузить.\n\n"
-            f"Отправьте команду:\n/start order_{pending_oid}\n\n"
+            f"Отправьте команду:\n/start {tok}\n\n"
             "Если не помогло — снова нажмите «Оформить заказ через телеграм бот» на сайте.",
             reply_markup=REPLY_KB,
         )
