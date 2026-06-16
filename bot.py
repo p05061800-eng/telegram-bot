@@ -236,6 +236,8 @@ USER_CART: dict = {}
 SITE_LOGIN_PENDING_ORDER: Dict[int, str] = {}
 # Последний order_id с сайта по user_id (checkout → sync/cart).
 PENDING_SITE_ORDER_BY_USER: Dict[int, str] = {}
+# Уже отправленный в чат checkout с сайта (uid:order_id → timestamp), без дублей при /start.
+_SITE_CHECKOUT_PUSHED: Dict[str, float] = {}
 USER_FAVORITES: dict = {}
 # Списки избранного в POST /api/sync/state, /api/sync/cart, /api/verify-code (ключ «items» сюда
 # не входит — в sync/cart «items» это корзина). Для POST /api/sync/favorites дополнительно читают «items».
@@ -1755,19 +1757,6 @@ async def _http_verify_code(request: web.Request) -> web.Response:
             _user_orders_merge_site(uid, _normalize_sync_orders(data.get("orders")))
         note_vc = _apply_site_loyalty_from_sync(uid, data)
         _schedule_loyalty_notify(bot, uid, note_vc)
-    preview = (
-        _format_login_site_cart_pending_text(uid, del_cc, products) if uid else ""
-    )
-    if bot and uid and preview:
-        _persist_site_pending_order(uid, preview)
-        try:
-            # await, а не create_task: иначе клиент может сразу уйти с страницы и задача не успевает.
-            await _send_site_login_cart_order_message(bot, uid, preview)
-        except Exception:
-            logging.getLogger(__name__).exception(
-                "verify-code → не удалось отправить корзину в Telegram user_id=%s",
-                uid,
-            )
     resp_vc: Dict[str, object] = {
         "success": True,
         "user_id": uid,
@@ -3001,23 +2990,27 @@ async def _handle_site_order_from_sync_payload(
         str(session.get("source") or "").strip() == "vercel_order_create"
         or bool(order_id and isinstance(order_raw, dict))
     )
+    bot = _resolve_live_bot(bot)
+    username = str(data.get("username") or "").strip().lstrip("@") or None
+    if not username and isinstance(order_raw, dict):
+        username = str(order_raw.get("username") or "").strip().lstrip("@") or None
     should_notify = bot and norm and (not skip_notify or from_checkout)
     if should_notify:
-        preview = _format_site_order_confirm_preview(int(uid), norm, products)
-        if preview.strip():
-            try:
-                await bot.send_message(
-                    int(uid),
-                    START_SITE_TRANSITION_TEXT,
-                    reply_markup=REPLY_KB,
+        try:
+            ok = await _present_site_order_checkout_flow(
+                bot=bot,
+                uid=int(uid),
+                norm=norm,
+                username=username,
+            )
+            if not ok:
+                logging.getLogger(__name__).warning(
+                    "site order checkout flow failed uid=%s order=%s", uid, order_id
                 )
-                await _send_site_cart_confirm_prompt(
-                    bot, int(uid), preview, intro_kind="draft"
-                )
-            except Exception:
-                logging.getLogger(__name__).exception(
-                    "site order notify after sync uid=%s order=%s", uid, order_id
-                )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "site order notify after sync uid=%s order=%s", uid, order_id
+            )
     logging.getLogger(__name__).info(
         "sync/cart: registered site order uid=%s order_id=%s skip_notify=%s",
         uid,
@@ -3067,14 +3060,12 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
             crec["site_bonus_applied"] = int(disc)
     _apply_optional_favorites_from_site_payload(uid, data, products)
     note_loy = _apply_site_loyalty_from_sync(uid, data)
-    bot_loy = request.app.get("bot")
+    bot_loy = _resolve_live_bot(request.app.get("bot"))
     _schedule_loyalty_notify(bot_loy, uid, note_loy)
     skip_buyer_notify = bool(
         data.get("skip_buyer_notify") or data.get("skipBuyerNotify")
     )
     site_order_id = await _handle_site_order_from_sync_payload(data, uid, bot_loy)
-    if lines and not skip_buyer_notify:
-        _schedule_site_cart_confirm_prompt(bot_loy, uid, intro_kind="verified")
     users_touch(uid, "cart_sync")
     body_loy: Dict[str, object] = {"success": True, "user_id": uid, "items": len(lines)}
     if site_order_id:
@@ -3204,8 +3195,6 @@ async def _http_sync_state(request: web.Request) -> web.Response:
     note_st = _apply_site_loyalty_from_sync(uid, data)
     bot_st = request.app.get("bot")
     _schedule_loyalty_notify(bot_st, uid, note_st)
-    if lines:
-        _schedule_site_cart_confirm_prompt(bot_st, uid, intro_kind="verified")
     users_touch(uid, "sync")
     body = {
         "success": True,
@@ -6873,9 +6862,9 @@ def _format_login_site_cart_pending_text(
     pts, disc = _site_bonus_from_sources(uid, meta)
     if pts > 0 or disc > 0:
         b_show = pts if pts > 0 else disc
-        out.append(f"⭐ Списано бонусов: {b_show}")
+        out.append(f"Списано бонусов: {b_show}")
         if disc > 0:
-            out.append(f"⭐ Скидка бонусами: {disc} {pay_cur}")
+            out.append(f"Скидка бонусами: {disc} {pay_cur}")
         out.append("")
     site_gt_raw = _cart_get_site_grand_total(uid, g_cur)
     if inc and not site_gt_raw:
@@ -6928,20 +6917,11 @@ async def _send_site_cart_confirm_prompt(
     log = logging.getLogger(__name__)
     if not preview_inner.strip():
         return
-    if intro_kind == "verified":
-        intro = (
-            "✅ Вход на сайт подтверждён.\n\n"
-            "Состав из корзины сайта уже в «🛒 Корзина» бота. "
-            "Нажмите «Подтвердить заказ» — откроются способы оплаты. "
-            "«Отмена» — без подтверждения."
-        )
-    else:
-        intro = (
-            "🛒 Заказ с сайта подтянут в бота.\n\n"
-            "Нажмите «Подтвердить заказ» — откроются способы оплаты. "
-            "«Отмена» — сбросить черновик."
-        )
-    body = f"{intro}\n\n{preview_inner.strip()}"
+    intro = (
+        "Проверьте состав и доставку. Нажмите «Подтвердить заказ» — откроются шаги оплаты. "
+        "Заказ уходит админу только после подтверждения оплаты со скрином чека."
+    )
+    body = f"{intro}\n\n📦 Ваш заказ\n\n{preview_inner.strip()}"
     if len(body) > 4090:
         body = body[:4082] + "…"
     try:
@@ -8977,6 +8957,295 @@ def _apply_site_order_norm_to_user_cart(uid: int, norm: dict) -> None:
     _cart_apply_site_pricing_hints(uid, _site_order_pricing_hint_payload(norm))
 
 
+def _resolve_live_bot(bot=None):
+    if bot is not None:
+        return bot
+    return globals().get("_BOT_APP_BOT")
+
+
+class _BotOnlyContext:
+    """Минимальный context для HTTP sync (без Telegram Update)."""
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.application = type("_AppShim", (), {"bot_data": {}})()
+        self.user_data: dict = {}
+
+
+def _site_checkout_username_label(uid: int, username: Optional[str] = None) -> str:
+    un = str(username or "").strip().lstrip("@")
+    if not un:
+        row = users_ensure(int(uid))
+        un = str(row.get("username") or "").strip().lstrip("@")
+    return un or f"id{int(uid)}"
+
+
+def _find_unpaid_bot_order_by_external_id(uid: int, external_id: str) -> Optional[int]:
+    ext = str(external_id or "").strip()
+    if not ext or not uid:
+        return None
+    for oid_raw, rec in ORDERS.items():
+        if not isinstance(rec, dict):
+            continue
+        try:
+            oid = int(oid_raw)
+        except (TypeError, ValueError):
+            continue
+        if int(rec.get("user_id") or 0) != int(uid):
+            continue
+        if rec.get("paid"):
+            continue
+        if str(rec.get("external_id") or "").strip() == ext:
+            return oid
+    return None
+
+
+def _prepare_site_checkout_meta(uid: int, norm: dict) -> dict:
+    meta: Dict[str, object] = {
+        "loyalty_hint": deepcopy(norm),
+        "external_id": str(norm.get("external_id") or norm.get("order_id") or "").strip(),
+    }
+    for src, dst in (
+        ("bonus_applied", "bonus_applied"),
+        ("bonus_points_spent", "bonus_points_spent"),
+        ("bonusWillEarn", "bonus_will_earn"),
+        ("bonus_will_earn", "bonus_will_earn"),
+    ):
+        if norm.get(src) is None:
+            continue
+        try:
+            meta[dst] = int(norm.get(src) or 0)
+        except (TypeError, ValueError):
+            pass
+    norm_items = norm.get("items")
+    if isinstance(norm_items, list) and norm_items:
+        meta["items"] = deepcopy(list(norm_items))
+    return _merge_site_bonus_into_meta(uid, meta)
+
+
+def _format_site_checkout_order_body(
+    uid: int,
+    norm: dict,
+    products: Optional[List[dict]] = None,
+    *,
+    user_data: Optional[dict] = None,
+) -> str:
+    """Текст заказа с сайта — как в старом checkout (скрины)."""
+    _apply_site_order_norm_to_user_cart(int(uid), norm)
+    if products:
+        lines = deepcopy(list(norm.get("items") or _cart_get_lines_uid(uid, user_data)))
+        if lines:
+            _reconcile_cart_lines_to_catalog(products, lines)
+            _cart_set_items_uid(int(uid), lines)
+    lines = deepcopy(list(norm.get("items") or _cart_get_lines_uid(uid, user_data)))
+    if not lines:
+        return ""
+    d = norm.get("delivery") if isinstance(norm.get("delivery"), dict) else {}
+    cc = str(d.get("country") or "by").strip().lower()
+    if cc not in DELIVERY_OPTIONS:
+        cc = _cart_price_region_for_user(int(uid), user_data or {})
+    fin = _site_cart_checkout_finance(int(uid), lines, cc, user_data)
+    meta = _prepare_site_checkout_meta(int(uid), norm)
+    grand_show, pay_cur, _ = _resolve_site_confirm_pricing(
+        int(uid), user_data or {}, lines, meta
+    )
+    d_label = fin["d_label"]
+    d_amt = fin["d_amt"]
+    d_cur = fin["d_cur"]
+    inc = fin["inc"]
+    out: List[str] = ["📦 Ваш заказ", ""]
+    g_cur = fin["g_cur"]
+    for x in lines:
+        if not isinstance(x, dict):
+            continue
+        name_raw = str(x.get("name") or "—")
+        name = name_raw[:200]
+        if len(name_raw) > 200:
+            name = name.rstrip() + "…"
+        p = int(x.get("price") or 0)
+        q = int(x.get("qty") or 1)
+        lc = str(x.get("line_currency") or "").strip().upper()
+        xcur = lc if lc in ("BYN", "RUB") else g_cur
+        out.append(f"• {name} — {q} шт. × {p} {xcur} = {p * q} {xcur}")
+    out.append("")
+    pts, disc = _site_bonus_from_sources(int(uid), meta)
+    if pts > 0:
+        out.append(f"Списано бонусов: {pts}")
+    if disc > 0:
+        out.append(f"Скидка бонусами: {disc} {pay_cur}")
+    if pts > 0 or disc > 0:
+        out.append("")
+    if inc:
+        out.append(f"🚚 Доставка: {d_label} (уже в сумме на сайте)")
+    else:
+        out.append(f"🚚 Доставка: {d_label} — {d_amt} {d_cur}")
+    out.append(f"💰 Итого: {grand_show} {pay_cur}")
+    earn = _loyalty_compute_earn_estimate(int(grand_show), norm, cart_lines=lines)
+    if earn is not None and int(earn) > 0:
+        out.append("")
+        out.append(f"⭐ Ориентировочно начислится бонусов с заказа: ~{int(earn)}")
+    s = "\n".join(out)
+    if len(s) > 3900:
+        s = s[:3890] + "…"
+    return s
+
+
+def _site_checkout_payment_message(uid: int, username: Optional[str] = None) -> str:
+    un = _site_checkout_username_label(int(uid), username)
+    return (
+        "Выберите способ оплаты:\n\n"
+        "💳 Карта -> 💵 Перевод -> ₿ Крипта\n"
+        "💳 Оплата -> 📸 Скрин -> 🔎 Проверка -> ✅ Готово\n\n"
+        f"Заказ {un}"
+    )
+
+
+async def _begin_site_checkout_order(
+    context,
+    uid: int,
+    norm: dict,
+    user_data: Optional[dict],
+    *,
+    username: Optional[str] = None,
+) -> Optional[Tuple[int, int, str]]:
+    """Создать заказ в боте и открыть шаг оплаты (без кнопки «Подтвердить»)."""
+    ud = user_data if isinstance(user_data, dict) else {}
+    _apply_site_order_norm_to_user_cart(int(uid), norm)
+    lines = list(_cart_get_lines_uid(int(uid), ud))
+    if not lines:
+        return None
+    meta = _prepare_site_checkout_meta(int(uid), norm)
+    ext_id = str(meta.get("external_id") or "").strip()
+    existing = _find_unpaid_bot_order_by_external_id(int(uid), ext_id) if ext_id else None
+    if existing is not None:
+        po = ORDERS.get(int(existing)) or {}
+        tot, pay_cur = _order_payment_display(po)
+        _set_awaiting_payment_order_id(int(uid), ud, int(existing))
+        save_state()
+        return int(existing), int(tot), str(pay_cur)
+    total, pay_cur, drec = _resolve_site_confirm_pricing(int(uid), ud, lines, meta)
+    goods_total, _ = _cart_totals(list(lines))
+    dl_bonus_applied = 0
+    dl_bonus_points_spent = 0
+    lo_hint = deepcopy(norm)
+    try:
+        dl_bonus_applied = int(meta.get("bonus_applied") or norm.get("bonus_applied") or 0)
+    except (TypeError, ValueError):
+        dl_bonus_applied = 0
+    try:
+        dl_bonus_points_spent = int(
+            meta.get("bonus_points_spent") or norm.get("bonus_points_spent") or 0
+        )
+    except (TypeError, ValueError):
+        dl_bonus_points_spent = 0
+    if dl_bonus_points_spent <= 0:
+        dl_bonus_points_spent = dl_bonus_applied
+
+    class _CheckoutUser:
+        def __init__(self, user_id: int, uname: Optional[str]):
+            self.id = int(user_id)
+            self.username = str(uname or "").strip().lstrip("@")
+
+    user = _CheckoutUser(int(uid), username or _site_checkout_username_label(int(uid), username))
+    oid = await _notify_admin_new_order(
+        context,
+        user,
+        list(lines),
+        int(total),
+        deepcopy(drec),
+        loyalty_hint_dict=lo_hint,
+        bonus_applied=int(dl_bonus_applied),
+        bonus_points_spent=int(dl_bonus_points_spent),
+    )
+    if oid is None:
+        return None
+    if ext_id:
+        ORDERS[int(oid)]["external_id"] = ext_id
+    ORDERS[int(oid)]["clear_cart_on_paid"] = True
+    ORDERS[int(oid)]["total_goods"] = int(goods_total)
+    ORDERS[int(oid)]["payment_currency"] = str(pay_cur)
+    ORDERS[int(oid)]["payment_total_locked"] = True
+    if int(dl_bonus_applied) > 0:
+        ORDERS[int(oid)]["bonus_applied"] = int(dl_bonus_applied)
+    if int(dl_bonus_points_spent) > 0:
+        ORDERS[int(oid)]["bonus_points_spent"] = int(dl_bonus_points_spent)
+    order_rec = {
+        "id": str(oid),
+        "items": deepcopy(list(lines)),
+        "total": int(total),
+        "total_goods": int(goods_total),
+        "delivery": deepcopy(drec),
+        "status": "В обработке",
+    }
+    if ext_id:
+        order_rec["external_id"] = ext_id
+    USER_ORDERS.setdefault(int(uid), []).append(order_rec)
+    _set_awaiting_payment_order_id(int(uid), ud, int(oid))
+    ud.pop("payment_pending_method", None)
+    ud.pop("pending_order", None)
+    _clear_site_pending_order(int(uid), ud)
+    save_state()
+    return int(oid), int(total), str(pay_cur)
+
+
+async def _present_site_order_checkout_flow(
+    *,
+    bot=None,
+    uid: int,
+    norm: dict,
+    username: Optional[str] = None,
+    msg: Optional[Message] = None,
+    context: Optional[ContextTypes.DEFAULT_TYPE] = None,
+) -> bool:
+    """Checkout с сайта: переход → состав заказа → выбор оплаты (как раньше)."""
+    bot = _resolve_live_bot(bot)
+    if not bot or not uid or not isinstance(norm, dict):
+        return False
+    log = logging.getLogger(__name__)
+    products: List[dict] = []
+    try:
+        products = await load_products() or []
+    except Exception:
+        products = []
+    ud = context.user_data if context is not None else {}
+    body = _format_site_checkout_order_body(
+        int(uid), norm, products, user_data=ud
+    )
+    if not body.strip():
+        return False
+    ctx = context if context is not None else _BotOnlyContext(bot)
+    result = await _begin_site_checkout_order(
+        ctx, int(uid), norm, ud, username=username
+    )
+    if not result:
+        log.warning("site checkout: order not created uid=%s", uid)
+        return False
+    bot_oid, _total, _pay_cur = result
+
+    async def _send(text: str, **kwargs) -> None:
+        if msg is not None:
+            await msg.reply_text(text, **kwargs)
+        else:
+            await bot.send_message(chat_id=int(uid), text=text, **kwargs)
+
+    try:
+        await _send(START_SITE_TRANSITION_TEXT, reply_markup=REPLY_KB)
+        await _send(body, disable_web_page_preview=True)
+        await _send(
+            _site_checkout_payment_message(int(uid), username),
+            reply_markup=_kb_payment_methods(bot_oid),
+            disable_web_page_preview=True,
+        )
+        ext_id = str(norm.get("external_id") or norm.get("order_id") or "").strip()
+        if ext_id:
+            _SITE_CHECKOUT_PUSHED[f"{int(uid)}:{ext_id}"] = time.time()
+        users_touch(int(uid), "payment")
+        return True
+    except Exception:
+        log.exception("site checkout flow failed uid=%s", uid)
+        return False
+
+
 def _format_site_order_confirm_preview(
     uid: int, norm: dict, products: Optional[List[dict]] = None
 ) -> str:
@@ -9428,27 +9697,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Или вернитесь на вкладку с сайтом — вход завершится автоматически.",
                 reply_markup=_account_open_markup(wait_id, uid),
             )
-            pending_oid = (PENDING_SITE_ORDER_BY_USER.get(uid) or "").strip()
-            if pending_oid:
-                order = await _fetch_order_for_deep_link(pending_oid)
-                if order:
-                    await _present_site_order_confirm_prompt(msg, context, uid, order)
-                    return
-            try:
-                await _refresh_user_state_from_site(uid)
-                if await _maybe_prompt_site_cart_confirmation(
-                    context.bot, uid, context.user_data, intro_kind="verified"
-                ):
-                    return
-            except Exception:
-                logging.getLogger(__name__).exception(
-                    "web_login → cart sync failed uid=%s", uid
-                )
             return
         oid = _parse_order_id_from_start_args(list(args))
         if not oid:
             oid = (PENDING_SITE_ORDER_BY_USER.get(uid) or "").strip() or None
         if oid:
+            push_key = f"{uid}:{str(oid).strip()}"
+            pushed_at = _SITE_CHECKOUT_PUSHED.get(push_key)
+            recently_pushed = (
+                isinstance(pushed_at, (int, float))
+                and pushed_at > 0
+                and (time.time() - float(pushed_at)) < 10 * 60
+            )
+            pend = _resolve_awaiting_payment_order_id(uid, context.user_data)
+            if recently_pushed and pend is not None:
+                await msg.reply_text(
+                    "Заказ уже в этом чате выше 👆 Выберите способ оплаты.",
+                    reply_markup=REPLY_KB,
+                )
+                return
+
             order = await _fetch_order_for_deep_link(oid)
             if not order:
                 await msg.reply_text(
@@ -9463,7 +9731,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await _send_start_intro_with_site_button(msg, uid, context.user_data)
                 return
             await _maybe_thank_first_telegram_auth(msg, uid)
-            await _present_site_order_confirm_prompt(msg, context, uid, order)
+            un = (msg.from_user.username or "").strip().lstrip("@") or None
+            ok = await _present_site_order_checkout_flow(
+                msg=msg,
+                context=context,
+                uid=uid,
+                norm=order,
+                username=un,
+            )
+            if not ok:
+                await msg.reply_text(
+                    "Не удалось показать заказ. Попробуйте снова с сайта или напишите в «Связь».",
+                    reply_markup=REPLY_KB,
+                )
             return
         if first.lower() == "login":
             un = (msg.from_user.username or "").strip()
