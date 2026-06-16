@@ -9333,7 +9333,7 @@ def _site_status_from_bot_status(status: str) -> Optional[str]:
 
 
 def _clear_user_cart_after_payment_proof(uid: int, oid: int, o: dict) -> None:
-    """TG-корзина — после нажатия «✅ Оплатить» (callback paid), если у заказа clear_cart_on_paid."""
+    """TG-корзина — после одобрения заказа админом (accept), если у заказа clear_cart_on_paid."""
     if not uid:
         return
     if not o.get("clear_cart_on_paid"):
@@ -9346,7 +9346,7 @@ def _clear_user_cart_after_payment_proof(uid: int, oid: int, o: dict) -> None:
 
 
 async def _notify_site_cart_cleared_after_proof(uid: int, oid: int, o: dict) -> None:
-    """Если задан ILLUCARDS_CART_CLEAR_ON_PROOF_URL — сообщить сайту очистить корзину пользователя."""
+    """Если задан ILLUCARDS_CART_CLEAR_ON_PROOF_URL — очистить корзину на сайте (после accept админом)."""
     if not ILLUCARDS_CART_CLEAR_ON_PROOF_URL:
         return
     if not uid:
@@ -11094,6 +11094,16 @@ async def on_order_status_buttons(
     if not str(o.get("external_id") or "").strip() and o.get("paid"):
         await _ensure_site_order_for_bot_order(oid, o)
     await _sync_site_order_status(o)
+    if want == "accepted":
+        cuid = int(o.get("user_id") or 0)
+        if cuid:
+            _clear_user_cart_after_payment_proof(cuid, int(oid), o)
+            try:
+                asyncio.get_running_loop().create_task(
+                    _notify_site_cart_cleared_after_proof(cuid, int(oid), o)
+                )
+            except RuntimeError:
+                pass
     await q.answer(MSG_ORDER_STATUS_UPDATED, show_alert=False)
     notice = _format_customer_order_status_notice(oid, str(o.get("status") or ""))
     await _notify_order_customer(context, o, notice)
@@ -12498,14 +12508,6 @@ async def on_payment_paid(
         o["payment_pending_method"] = pm
     _clear_crypto_auto_watch(o, uid)
     _clear_checkout_delivery(ud)
-    _cart_clear_site_pricing_hints(uid)
-    _clear_user_cart_after_payment_proof(uid, int(oid), o)
-    try:
-        asyncio.get_running_loop().create_task(
-            _notify_site_cart_cleared_after_proof(uid, int(oid), o)
-        )
-    except RuntimeError:
-        pass
     try:
         await q.message.edit_reply_markup(reply_markup=None)
     except Exception:
