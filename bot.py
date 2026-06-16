@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-17-order-fetch-fallback-v19"
+BOT_BUILD_ID = "2026-06-17-order-persist-v20"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -443,6 +443,8 @@ def _build_state_payload() -> dict:
         "user_messages": USER_MESSAGES,
         "user_site_loyalty": USER_SITE_LOYALTY,
         "username_to_user_id": USERNAME_TO_USER_ID,
+        "pending_site_order_by_user": PENDING_SITE_ORDER_BY_USER,
+        "shared_deep_link_orders": SHARED_DEEP_LINK_ORDERS,
     }
 
 
@@ -495,6 +497,24 @@ def _apply_state_payload(data: dict) -> None:
             uid = 0
         if key and uid:
             USERNAME_TO_USER_ID[key] = uid
+    loaded_pending_site = data.get("pending_site_order_by_user")
+    if isinstance(loaded_pending_site, dict):
+        PENDING_SITE_ORDER_BY_USER.clear()
+        for raw_uid, raw_oid in loaded_pending_site.items():
+            try:
+                uid_i = int(raw_uid or 0)
+            except (TypeError, ValueError):
+                uid_i = 0
+            oid_s = str(raw_oid or "").strip()
+            if uid_i > 0 and oid_s:
+                PENDING_SITE_ORDER_BY_USER[uid_i] = oid_s
+    loaded_deep_link = data.get("shared_deep_link_orders")
+    if isinstance(loaded_deep_link, dict):
+        SHARED_DEEP_LINK_ORDERS.clear()
+        for raw_oid, raw_payload in loaded_deep_link.items():
+            oid_s = str(raw_oid or "").strip()
+            if oid_s and isinstance(raw_payload, dict):
+                SHARED_DEEP_LINK_ORDERS[oid_s] = raw_payload
     try:
         restored_counter = int(data.get("order_counter") or 1)
     except (TypeError, ValueError):
@@ -2967,6 +2987,7 @@ async def _handle_site_order_from_sync_payload(
         merged["delivery"] = str(del_raw).strip().upper()
     register_shared_deep_link_order(order_id, merged)
     PENDING_SITE_ORDER_BY_USER[int(uid)] = order_id
+    save_state()
     products: List[dict] = []
     try:
         products = await load_products() or []
@@ -9690,7 +9711,7 @@ async def _fetch_latest_new_site_order_id(uid: int) -> Optional[str]:
         if not isinstance(raw, dict):
             continue
         st = str(raw.get("status") or "new").strip().lower()
-        if st not in ("new", "confirmed"):
+        if st != "new":
             continue
         oid = str(raw.get("id") or raw.get("order_id") or "").strip()
         if oid:
@@ -9897,6 +9918,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _try_present_pending_site_order(
         msg, context, uid, username=un_plain
     ):
+        return
+    pending_oid = await _resolve_pending_site_order_id(int(uid))
+    if pending_oid:
+        await msg.reply_text(
+            "На сайте есть незавершённый заказ, но бот не смог его загрузить.\n\n"
+            f"Отправьте команду:\n/start order_{pending_oid}\n\n"
+            "Если не помогло — снова нажмите «Оформить заказ через телеграм бот» на сайте.",
+            reply_markup=REPLY_KB,
+        )
+        await _send_start_intro_with_site_button(msg, uid, context.user_data)
         return
     logging.getLogger(__name__).warning(
         "start without order payload and no synced cart: uid=%s args=%s cart=%s pending=%s",
