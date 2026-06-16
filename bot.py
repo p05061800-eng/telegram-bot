@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-17-order-persist-v20"
+BOT_BUILD_ID = "2026-06-17-order-start-payload-v21"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -8841,6 +8841,63 @@ def _fetch_order_from_shared_memory(order_id: str) -> Optional[dict]:
     return None
 
 
+def _site_api_request_headers() -> dict:
+    """Bearer для GET /api/order и /api/orders."""
+    for secret in (ORDER_STATUS_UPDATE_SECRET, SYNC_API_SECRET):
+        if secret:
+            return {"Authorization": f"Bearer {secret}"}
+    return {}
+
+
+async def _fetch_site_orders_for_user(uid: int) -> List[dict]:
+    user_id = int(uid or 0)
+    if not user_id or not ORDER_USER_ORDERS_API_URL:
+        return []
+    safe_uid = urllib.parse.quote(str(user_id), safe="")
+    if "{user_id}" in ORDER_USER_ORDERS_API_URL:
+        url = ORDER_USER_ORDERS_API_URL.replace("{user_id}", safe_uid)
+    else:
+        sep = "&" if "?" in ORDER_USER_ORDERS_API_URL else "?"
+        url = f"{ORDER_USER_ORDERS_API_URL}{sep}user_id={safe_uid}"
+    headers = _site_api_request_headers()
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.get(url, headers=headers or None) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+    except Exception:
+        return []
+    raw_orders = data.get("orders") if isinstance(data, dict) else data
+    if not isinstance(raw_orders, list):
+        return []
+    return [x for x in raw_orders if isinstance(x, dict)]
+
+
+async def _resolve_start_order_id_for_user(uid: int, token: str) -> Optional[str]:
+    """order_3 → UUID по buyer_seq; 32 hex → UUID с дефисами."""
+    tok = str(token or "").strip()
+    if not tok:
+        return None
+    if re.fullmatch(r"\d{1,6}", tok):
+        want = int(tok)
+        for raw in await _fetch_site_orders_for_user(int(uid)):
+            try:
+                seq = int(raw.get("buyer_seq") or 0)
+            except (TypeError, ValueError):
+                seq = 0
+            if seq != want:
+                continue
+            oid = str(raw.get("id") or raw.get("order_id") or "").strip()
+            if oid:
+                return oid
+        return None
+    if re.fullmatch(r"[a-f0-9]{32}", tok, re.I):
+        t = tok.lower()
+        return f"{t[0:8]}-{t[8:12]}-{t[12:16]}-{t[16:20]}-{t[20:32]}"
+    return tok
+
+
 async def _fetch_order_from_deep_link_api(
     order_id: str, products: Optional[List[dict]] = None
 ) -> Optional[dict]:
@@ -8851,8 +8908,7 @@ async def _fetch_order_from_deep_link_api(
     url = template.replace("{id}", safe_id)
     log = logging.getLogger(__name__)
     headers: dict = {}
-    if ORDER_STATUS_UPDATE_SECRET:
-        headers["Authorization"] = f"Bearer {ORDER_STATUS_UPDATE_SECRET}"
+    headers.update(_site_api_request_headers())
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -8895,21 +8951,28 @@ def _deep_link_apply_catalog_prices(order: dict, products: List[dict]) -> None:
     _reconcile_cart_lines_to_catalog(products, raw_items)
 
 
-async def _fetch_order_for_deep_link(order_id: str) -> Optional[dict]:
+async def _fetch_order_for_deep_link(
+    order_id: str, uid: Optional[int] = None
+) -> Optional[dict]:
     products: List[dict] = []
     try:
         products = await load_products() or []
     except Exception:
         products = []
-    o = _fetch_order_from_shared_memory(order_id)
+    oid = str(order_id or "").strip()
+    if uid and oid:
+        resolved = await _resolve_start_order_id_for_user(int(uid), oid)
+        if resolved:
+            oid = resolved
+    o = _fetch_order_from_shared_memory(oid)
     if o:
         if products:
             _deep_link_apply_catalog_prices(o, products)
         return o
-    o = await _fetch_order_from_deep_link_api(order_id, products)
+    o = await _fetch_order_from_deep_link_api(oid, products)
     if o:
         return o
-    o = _find_user_order_snapshot_normalized(order_id)
+    o = _find_user_order_snapshot_normalized(oid)
     if o and products:
         _deep_link_apply_catalog_prices(o, products)
     return o
@@ -9678,36 +9741,10 @@ async def _create_order_from_synced_site_cart(
 async def _fetch_latest_new_site_order_id(uid: int) -> Optional[str]:
     """Последний заказ со статусом new на сайте (если sync/cart не дошёл до бота)."""
     user_id = int(uid or 0)
-    if not user_id or not ORDER_USER_ORDERS_API_URL:
+    if not user_id:
         return None
-    safe_uid = urllib.parse.quote(str(user_id), safe="")
-    if "{user_id}" in ORDER_USER_ORDERS_API_URL:
-        url = ORDER_USER_ORDERS_API_URL.replace("{user_id}", safe_uid)
-    else:
-        sep = "&" if "?" in ORDER_USER_ORDERS_API_URL else "?"
-        url = f"{ORDER_USER_ORDERS_API_URL}{sep}user_id={safe_uid}"
     log = logging.getLogger(__name__)
-    headers: dict = {}
-    if ORDER_STATUS_UPDATE_SECRET:
-        headers["Authorization"] = f"Bearer {ORDER_STATUS_UPDATE_SECRET}"
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-            async with session.get(url, headers=headers or None) as resp:
-                if resp.status != 200:
-                    log.warning(
-                        "latest new order: GET orders HTTP %s uid=%s",
-                        resp.status,
-                        user_id,
-                    )
-                    return None
-                data = await resp.json()
-    except Exception:
-        log.exception("latest new order fetch failed uid=%s", user_id)
-        return None
-    raw_orders = data.get("orders") if isinstance(data, dict) else data
-    if not isinstance(raw_orders, list):
-        return None
-    for raw in raw_orders:
+    for raw in await _fetch_site_orders_for_user(user_id):
         if not isinstance(raw, dict):
             continue
         st = str(raw.get("status") or "new").strip().lower()
@@ -9753,7 +9790,7 @@ async def _try_present_pending_site_order(
             reply_markup=REPLY_KB,
         )
         return True
-    order = await _fetch_order_for_deep_link(oid)
+    order = await _fetch_order_for_deep_link(oid, int(uid))
     if not order:
         return False
     un = username or _site_checkout_username_label(int(uid), username)
@@ -9842,7 +9879,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 return
 
-            order = await _fetch_order_for_deep_link(oid)
+            order = await _fetch_order_for_deep_link(oid, int(uid))
             if not order:
                 await msg.reply_text(
                     "Не удалось связаться с сайтом или подтянуть заказ по ссылке.\n\n"
