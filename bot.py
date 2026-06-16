@@ -9654,6 +9654,45 @@ async def _create_order_from_synced_site_cart(
     return True
 
 
+async def _try_present_pending_site_order(
+    msg: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    uid: int,
+    *,
+    username: Optional[str] = None,
+) -> bool:
+    """Показать заказ с сайта, если он уже синхронизирован или есть в памяти бота."""
+    oid = (PENDING_SITE_ORDER_BY_USER.get(int(uid)) or "").strip()
+    if not oid:
+        return False
+    push_key = f"{int(uid)}:{oid}"
+    pushed_at = _SITE_CHECKOUT_PUSHED.get(push_key)
+    recently_pushed = (
+        isinstance(pushed_at, (int, float))
+        and pushed_at > 0
+        and (time.time() - float(pushed_at)) < 10 * 60
+    )
+    pend = _resolve_awaiting_payment_order_id(int(uid), context.user_data)
+    if recently_pushed and pend is not None:
+        await msg.reply_text(
+            "Заказ уже в этом чате выше 👆 Выберите способ оплаты.",
+            reply_markup=REPLY_KB,
+        )
+        return True
+    order = await _fetch_order_for_deep_link(oid)
+    if not order:
+        return False
+    un = username or _site_checkout_username_label(int(uid), username)
+    ok = await _present_site_order_checkout_flow(
+        msg=msg,
+        context=context,
+        uid=int(uid),
+        norm=order,
+        username=un,
+    )
+    return bool(ok)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not msg or not msg.from_user:
@@ -9697,6 +9736,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Или вернитесь на вкладку с сайтом — вход завершится автоматически.",
                 reply_markup=_account_open_markup(wait_id, uid),
             )
+            un = (msg.from_user.username or "").strip().lstrip("@") or None
+            if await _try_present_pending_site_order(
+                msg, context, uid, username=un
+            ):
+                return
+            if PENDING_SITE_ORDER_BY_USER.get(int(uid)):
+                await msg.reply_text(
+                    "На сайте есть незавершённый заказ, но бот не смог его подтянуть.\n\n"
+                    "Вернитесь в корзину на illucards.by и снова нажмите "
+                    "«Оформить заказ через телеграм бот».",
+                    reply_markup=REPLY_KB,
+                )
             return
         oid = _parse_order_id_from_start_args(list(args))
         if not oid:
@@ -9788,6 +9839,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
         return
     if await _create_order_from_synced_site_cart(msg, context, uid):
+        return
+    un_plain = (msg.from_user.username or "").strip().lstrip("@") or None
+    if await _try_present_pending_site_order(
+        msg, context, uid, username=un_plain
+    ):
         return
     logging.getLogger(__name__).warning(
         "start without order payload and no synced cart: uid=%s args=%s cart=%s pending=%s",
