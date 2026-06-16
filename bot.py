@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-14-order-restore-v18"
+BOT_BUILD_ID = "2026-06-17-order-fetch-fallback-v19"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -9654,6 +9654,58 @@ async def _create_order_from_synced_site_cart(
     return True
 
 
+async def _fetch_latest_new_site_order_id(uid: int) -> Optional[str]:
+    """Последний заказ со статусом new на сайте (если sync/cart не дошёл до бота)."""
+    user_id = int(uid or 0)
+    if not user_id or not ORDER_USER_ORDERS_API_URL:
+        return None
+    safe_uid = urllib.parse.quote(str(user_id), safe="")
+    if "{user_id}" in ORDER_USER_ORDERS_API_URL:
+        url = ORDER_USER_ORDERS_API_URL.replace("{user_id}", safe_uid)
+    else:
+        sep = "&" if "?" in ORDER_USER_ORDERS_API_URL else "?"
+        url = f"{ORDER_USER_ORDERS_API_URL}{sep}user_id={safe_uid}"
+    log = logging.getLogger(__name__)
+    headers: dict = {}
+    if ORDER_STATUS_UPDATE_SECRET:
+        headers["Authorization"] = f"Bearer {ORDER_STATUS_UPDATE_SECRET}"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.get(url, headers=headers or None) as resp:
+                if resp.status != 200:
+                    log.warning(
+                        "latest new order: GET orders HTTP %s uid=%s",
+                        resp.status,
+                        user_id,
+                    )
+                    return None
+                data = await resp.json()
+    except Exception:
+        log.exception("latest new order fetch failed uid=%s", user_id)
+        return None
+    raw_orders = data.get("orders") if isinstance(data, dict) else data
+    if not isinstance(raw_orders, list):
+        return None
+    for raw in raw_orders:
+        if not isinstance(raw, dict):
+            continue
+        st = str(raw.get("status") or "new").strip().lower()
+        if st not in ("new", "confirmed"):
+            continue
+        oid = str(raw.get("id") or raw.get("order_id") or "").strip()
+        if oid:
+            return oid
+    return None
+
+
+async def _resolve_pending_site_order_id(uid: int) -> Optional[str]:
+    """order_id из памяти бота или последний new-заказ с сайта."""
+    oid = (PENDING_SITE_ORDER_BY_USER.get(int(uid)) or "").strip()
+    if oid:
+        return oid
+    return await _fetch_latest_new_site_order_id(int(uid))
+
+
 async def _try_present_pending_site_order(
     msg: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -9662,9 +9714,10 @@ async def _try_present_pending_site_order(
     username: Optional[str] = None,
 ) -> bool:
     """Показать заказ с сайта, если он уже синхронизирован или есть в памяти бота."""
-    oid = (PENDING_SITE_ORDER_BY_USER.get(int(uid)) or "").strip()
+    oid = await _resolve_pending_site_order_id(int(uid))
     if not oid:
         return False
+    PENDING_SITE_ORDER_BY_USER[int(uid)] = oid
     push_key = f"{int(uid)}:{oid}"
     pushed_at = _SITE_CHECKOUT_PUSHED.get(push_key)
     recently_pushed = (
@@ -9730,17 +9783,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     reply_markup=REPLY_KB,
                 )
                 return
+            un = (msg.from_user.username or "").strip().lstrip("@") or None
+            if await _try_present_pending_site_order(
+                msg, context, uid, username=un
+            ):
+                return
             await msg.reply_text(
                 "✅ Вход подтверждён.\n\n"
                 "Нажмите кнопку ниже — откроется личный кабинет на сайте (вход уже выполнен).\n\n"
                 "Или вернитесь на вкладку с сайтом — вход завершится автоматически.",
                 reply_markup=_account_open_markup(wait_id, uid),
             )
-            un = (msg.from_user.username or "").strip().lstrip("@") or None
-            if await _try_present_pending_site_order(
-                msg, context, uid, username=un
-            ):
-                return
             if PENDING_SITE_ORDER_BY_USER.get(int(uid)):
                 await msg.reply_text(
                     "На сайте есть незавершённый заказ, но бот не смог его подтянуть.\n\n"
