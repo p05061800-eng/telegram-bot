@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-17-admin-after-proof-v24"
+BOT_BUILD_ID = "2026-06-17-no-bonuses-v25"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -261,9 +261,6 @@ _FAVORITE_SYNC_PAYLOAD_KEYS: Tuple[str, ...] = (
 # Баннеры витрины с сайта (POST /api/sync/promotions с сайта или GET HOME_PROMOTIONS_JSON_URL)
 HOME_PAGE_PROMOTIONS: List[dict] = []
 USER_ORDERS: dict = {}
-# Бонусы с сайта: в POST /api/sync/cart, /api/sync/state и verify-code JSON передавайте
-# bonusPoints / bonusBalance; при начислении — bonusEarned. Кнопка «⭐ Бонусы» и списание в превью заказа.
-USER_SITE_LOYALTY: Dict[int, dict] = {}
 # Глобальный реестр заказов по порядковому id (память процесса)
 # ORDERS[id] = { user_id, username, items, total, delivery, status, created_at, admin_* }
 # Переписка «адрес после оплаты»: user_states[uid]["postpaid_thread_oid"] = order_id →
@@ -441,7 +438,6 @@ def _build_state_payload() -> dict:
         "user_pref_delivery_country": USER_PREF_DELIVERY_COUNTRY,
         "users": USERS,
         "user_messages": USER_MESSAGES,
-        "user_site_loyalty": USER_SITE_LOYALTY,
         "username_to_user_id": USERNAME_TO_USER_ID,
         "pending_site_order_by_user": PENDING_SITE_ORDER_BY_USER,
         "shared_deep_link_orders": SHARED_DEEP_LINK_ORDERS,
@@ -472,10 +468,6 @@ def _apply_state_payload(data: dict) -> None:
     if loaded_user_messages or not USER_MESSAGES:
         USER_MESSAGES.clear()
         USER_MESSAGES.update(loaded_user_messages)
-    loaded_site_loyalty = _int_key_dict(data.get("user_site_loyalty"))
-    if loaded_site_loyalty or not USER_SITE_LOYALTY:
-        USER_SITE_LOYALTY.clear()
-        USER_SITE_LOYALTY.update(loaded_site_loyalty)
     USERNAME_TO_USER_ID.clear()
     raw_login_map = data.get("username_to_user_id")
     if isinstance(raw_login_map, dict):
@@ -528,7 +520,7 @@ def save_state() -> None:
     if STATE_REDIS_SAVE_BLOCKED:
         has_persistent_data = any(
             bool(data.get(k))
-            for k in ("orders", "user_orders", "user_cart", "user_favorites", "user_site_loyalty")
+            for k in ("orders", "user_orders", "user_cart", "user_favorites")
         )
         if not has_persistent_data:
             logging.getLogger(__name__).error(
@@ -1139,10 +1131,6 @@ MSG_NO_VITRINA_PROMOS = (
     "HOME_PROMOTIONS_JSON_URL на хостинге 👀"
 )
 MSG_PROMO_PARTICIPATION = "Для участия в акции пришлите нам видео с уже имеющимися карточками."
-MSG_LOYALTY_MENU = (
-    "100 бонусов = 100 RUB или 3,5 BYN\n"
-    "Потратить бонусы можно на последующие заказы"
-)
 MSG_ADD_TO_CART_STALE = "Эта карточка устарела в текущем сообщении. Откройте каталог заново и добавьте ещё раз."
 MSG_BUY_HINT = "Можно написать: купить <категория> <номер> или купить <название карточки>."
 MSG_ADMIN_SAY_BAD_ID = (
@@ -1775,19 +1763,11 @@ async def _http_verify_code(request: web.Request) -> web.Response:
         _apply_optional_favorites_from_site_payload(uid, data, products)
         if "orders" in data:
             _user_orders_merge_site(uid, _normalize_sync_orders(data.get("orders")))
-        note_vc = _apply_site_loyalty_from_sync(uid, data)
-        _schedule_loyalty_notify(bot, uid, note_vc)
     resp_vc: Dict[str, object] = {
         "success": True,
         "user_id": uid,
         "username": f"@{key}" if key else "",
     }
-    lb_vc = USER_SITE_LOYALTY.get(uid, {}).get("balance") if uid else None
-    if lb_vc is not None:
-        try:
-            resp_vc["bonus_balance"] = int(lb_vc)
-        except (TypeError, ValueError):
-            pass
     return _login_json_response(resp_vc)
 
 
@@ -1912,458 +1892,12 @@ def _loyalty_find_int(data: dict, keys: Tuple[str, ...], depth: int) -> Optional
     return None
 
 
-def _loyalty_find_balance_int(data: dict, keys: Tuple[str, ...], depth: int) -> Optional[int]:
-    found: List[int] = []
-
-    def walk(node: object, left: int) -> None:
-        if not isinstance(node, dict) or left < 0:
-            return
-        for key in keys:
-            if key in node:
-                val = _coerce_loyalty_int(node.get(key))
-                if val is not None:
-                    found.append(int(val))
-        for nest in _LOYALTY_NEST_KEYS:
-            sub = node.get(nest)
-            if isinstance(sub, dict):
-                walk(sub, left - 1)
-
-    walk(data, depth)
-    positives = [v for v in found if int(v) > 0]
-    if positives:
-        return max(int(v) for v in positives)
-    if found:
-        return max(0, int(found[0]))
-    return None
-
-
-_LOYALTY_PENDING_EARN_TEXT_KEYS: Tuple[str, ...] = (
-    "bonusMessage",
-    "loyaltyMessage",
-    "bonusNotice",
-    "loyalty_note",
-    "bonusInfo",
-    "bonusText",
-    "loyaltyText",
-    "bonusHint",
-    "bonus_hint",
-)
-
-
-def _loyalty_pending_earn_from_text(raw: object) -> Optional[int]:
-    """Вытащить ожидаемое начисление из текста вида «За эту покупку: 300 баллов»."""
-    if raw is None:
-        return None
-    s = str(raw).replace("\xa0", " ").strip()
-    if not s:
-        return None
-    pats = (
-        r"за\s+эту\s+покупк\w*[^0-9]{0,30}([0-9][0-9\s]{0,8})",
-        r"за\s+заказ[^0-9]{0,30}([0-9][0-9\s]{0,8})",
-        r"(?:будет\s+начисл\w*|начисл\w*)[^0-9]{0,30}([0-9][0-9\s]{0,8})",
-        r"(?:will\s+earn|earned?\s+for\s+(?:this\s+)?order)[^0-9]{0,30}([0-9][0-9\s]{0,8})",
-    )
-    for pat in pats:
-        m = re.search(pat, s, re.IGNORECASE)
-        if not m:
-            continue
-        val = _coerce_loyalty_int((m.group(1) or "").replace(" ", ""))
-        if val is not None and int(val) > 0:
-            return int(val)
-    return None
-
-
-def _loyalty_pending_earn_from_text_fields(data: dict) -> Optional[int]:
-    if not isinstance(data, dict):
-        return None
-    for k in _LOYALTY_PENDING_EARN_TEXT_KEYS:
-        if k in data:
-            v = _loyalty_pending_earn_from_text(data.get(k))
-            if v is not None:
-                return v
-    for nest in _LOYALTY_NEST_KEYS:
-        sub = data.get(nest)
-        if isinstance(sub, dict):
-            v = _loyalty_pending_earn_from_text_fields(sub)
-            if v is not None:
-                return v
-    return None
-
-
-_LOYALTY_ITEM_EARN_KEYS: Tuple[str, ...] = (
-    "bonusWillEarn",
-    "bonusForOrder",
-    "bonusForThisOrder",
-    "bonusToEarn",
-    "expectedBonus",
-    "orderBonusEstimate",
-    "orderBonus",
-    "bonusPoints",
-    "pointsEarned",
-    "pointsToEarn",
-    "pointsForOrder",
-    "cashbackEarned",
-    "cashbackEstimate",
-)
-
-
-def _loyalty_pending_earn_from_cart_items(raw_items: object) -> Optional[int]:
-    """Ожидаемое начисление из строк корзины, если сайт не дал top-level поле."""
-    if not isinstance(raw_items, list):
-        return None
-    total = 0
-    seen = False
-    for it in raw_items:
-        if not isinstance(it, dict):
-            continue
-        qty = _cart_line_qty_coerce(it.get("qty") or it.get("quantity") or 1)
-        per_item = None
-        line_total = None
-        for k in _LOYALTY_ITEM_EARN_KEYS:
-            if k not in it:
-                continue
-            val = _coerce_loyalty_int(it.get(k))
-            if val is None or int(val) <= 0:
-                continue
-            # lineBonus / orderBonusTotal обычно уже за всю строку, pointsToEarn чаще за штуку.
-            lk = str(k).lower()
-            if "line" in lk or "total" in lk or "order" in lk:
-                line_total = int(val)
-            else:
-                per_item = int(val)
-            seen = True
-            break
-        if line_total is not None:
-            total += int(line_total)
-        elif per_item is not None:
-            total += int(per_item) * int(qty)
-    if seen and total > 0:
-        return int(total)
-    return None
-
-
-def _parse_site_loyalty_snapshot(data: dict) -> dict:
-    """Сайт может слать бонусы в sync/login JSON — поддерживаем несколько имён полей."""
-    if not isinstance(data, dict):
-        return {}
-    bal_k = (
-        "bonusBalance",
-        "bonus_balance",
-        "loyaltyBalance",
-        "loyalty_balance",
-        "bonusPoints",
-        "bonus_points",
-        "loyaltyPoints",
-        "loyalty_points",
-        "pointsBalance",
-        "walletBalance",
-        "userBonus",
-        "bonusesTotal",
-        "bonusWallet",
-        "cashbackBalance",
-    )
-    earned_k = (
-        "bonusEarned",
-        "bonus_earned",
-        "pointsEarned",
-        "loyaltyEarned",
-        "earnedBonus",
-        "bonusesAdded",
-        "orderBonusEarned",
-        "cashbackEarned",
-        "bonusEarnedThisOrder",
-        "pointsEarnedThisOrder",
-        "creditEarned",
-    )
-    msg = ""
-    for k in ("bonusMessage", "loyaltyMessage", "bonusNotice", "loyalty_note"):
-        v = data.get(k)
-        if isinstance(v, str) and v.strip():
-            msg = v.strip()[:500]
-            break
-    if not msg:
-        for nest in _LOYALTY_NEST_KEYS:
-            sub = data.get(nest)
-            if not isinstance(sub, dict):
-                continue
-            for k in ("bonusMessage", "loyaltyMessage", "bonusNotice"):
-                v = sub.get(k)
-                if isinstance(v, str) and v.strip():
-                    msg = v.strip()[:500]
-                    break
-            if msg:
-                break
-    return {
-        "balance": _loyalty_find_balance_int(data, bal_k, 3),
-        "earned": _loyalty_find_int(data, earned_k, 2),
-        "message": msg,
-    }
-
-
 def _apply_site_loyalty_from_sync(uid: int, data: dict) -> Optional[str]:
-    """
-    Обновляет USER_SITE_LOYALTY. Возвращает текст для уведомления в Telegram,
-    если в payload есть положительное начисление (bonusEarned и т.п.).
-    """
-    if not uid:
-        return None
-    snap = _parse_site_loyalty_snapshot(data)
-    earned_i = snap.get("earned")
-    bal_i = snap.get("balance")
-    msg = str(snap.get("message") or "").strip()
-    prev = USER_SITE_LOYALTY.get(int(uid))
-    if not isinstance(prev, dict):
-        prev = {}
-    prev_bal = prev.get("balance")
-    try:
-        prev_bal_i = int(prev_bal) if prev_bal is not None else None
-    except (TypeError, ValueError):
-        prev_bal_i = None
-    notify: Optional[str] = None
-    if bal_i is not None and int(bal_i) <= 0 and prev_bal_i is not None and int(prev_bal_i) > 0:
-        spent_i = _loyalty_find_int(
-            data,
-            (
-                "bonusPointsSpent",
-                "bonus_points_spent",
-                "pointsSpent",
-                "points_spent",
-                "bonusesSpent",
-                "bonuses_spent",
-                "bonusApplied",
-                "bonus_applied",
-                "bonusDiscount",
-                "bonus_discount",
-            ),
-            2,
-        )
-        if spent_i is None or int(spent_i) <= 0:
-            bal_i = prev_bal_i
-    if earned_i is not None and int(earned_i) > 0:
-        site_oid_raw = (
-            data.get("botOrderId")
-            or data.get("bot_order_id")
-            or data.get("order_id")
-            or data.get("orderId")
-        )
-        try:
-            site_oid = int(site_oid_raw or 0)
-        except (TypeError, ValueError):
-            site_oid = 0
-        order_rec = ORDERS.get(site_oid) if site_oid else None
-        if isinstance(order_rec, dict) and int(order_rec.get("user_id") or 0) == int(uid):
-            order_rec["loyalty_credited"] = True
-            order_rec["loyalty_credited_amount"] = int(earned_i)
-        parts = [f"⭐ Зачислено бонусов: +{int(earned_i)}."]
-        if bal_i is not None:
-            parts.append(f"Всего на бонусном счёте: {int(bal_i)}.")
-        elif prev_bal_i is not None:
-            parts.append(
-                f"Всего на бонусном счёте: {int(prev_bal_i) + int(earned_i)} (по данным бота)."
-            )
-        if msg:
-            parts.append(msg)
-        notify = "\n".join(parts)
-    new_bal = bal_i if bal_i is not None else prev_bal_i
-    if earned_i is not None and int(earned_i) > 0:
-        summed_bal = int(prev_bal_i or 0) + int(earned_i)
-        if new_bal is None:
-            new_bal = summed_bal
-        else:
-            new_bal = max(int(new_bal), summed_bal)
-    hint = msg or str(prev.get("hint") or "").strip()[:400]
-    USER_SITE_LOYALTY[int(uid)] = {
-        "balance": new_bal,
-        "hint": hint,
-        "updated": time.time(),
-        "last_earned": int(earned_i) if earned_i is not None and earned_i > 0 else prev.get("last_earned"),
-    }
-    save_state()
-    return notify
+    return None
 
 
-def _loyalty_cart_footer_lines(uid: int) -> List[str]:
-    rec = USER_SITE_LOYALTY.get(int(uid))
-    if not isinstance(rec, dict):
-        return []
-    out: List[str] = []
-    bal = rec.get("balance")
-    if bal is not None:
-        try:
-            out.append(f"⭐ Бонусный счёт: {int(bal)}")
-        except (TypeError, ValueError):
-            pass
-    hint = str(rec.get("hint") or "").strip()
-    if hint and len(hint) < 300:
-        out.append(hint)
-    return out
-
-
-def _loyalty_balance_int(uid: int) -> int:
-    rec = USER_SITE_LOYALTY.get(int(uid))
-    if not isinstance(rec, dict):
-        return 0
-    try:
-        return max(0, int(rec.get("balance") or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _loyalty_menu_text(uid: int) -> str:
-    bal = _loyalty_balance_int(uid)
-    country = str(USER_PREF_DELIVERY_COUNTRY.get(int(uid or 0)) or "").strip().lower()
-    if country not in DELIVERY_OPTIONS:
-        country = "by"
-    cur = _goods_currency_for_delivery_country(country)
-    discount_txt = _bonus_discount_label(bal, cur)
-    return (
-        f"Текущий баланс: {bal} бонусов.\n"
-        f"{bal} бонусов = {discount_txt}.\n\n"
-        f"{MSG_LOYALTY_MENU}"
-    )
-
-
-def _loyalty_apply_local_debit(uid: int, amount: int) -> None:
-    """После оплаты: уменьшить локальный баланс (сайт пришлёт актуализацию в sync)."""
-    if not uid or int(amount) <= 0:
-        return
-    rec = USER_SITE_LOYALTY.get(int(uid))
-    if not isinstance(rec, dict):
-        return
-    try:
-        bal = max(0, int(rec.get("balance") or 0))
-    except (TypeError, ValueError):
-        bal = 0
-    rec["balance"] = max(0, bal - int(amount))
-    rec["updated"] = time.time()
-    save_state()
-
-
-def _loyalty_apply_local_credit(uid: int, amount: int) -> None:
-    """Fallback для заказов из бота: сайт может быть временно недоступен для синка."""
-    if not uid or int(amount) <= 0:
-        return
-    rec = USER_SITE_LOYALTY.get(int(uid))
-    if not isinstance(rec, dict):
-        rec = {}
-        USER_SITE_LOYALTY[int(uid)] = rec
-    try:
-        bal = max(0, int(rec.get("balance") or 0))
-    except (TypeError, ValueError):
-        bal = 0
-    rec["balance"] = bal + int(amount)
-    rec["last_earned"] = int(amount)
-    rec["updated"] = time.time()
-    save_state()
-
-
-def _loyalty_credit_order_once(o: dict) -> int:
-    if not isinstance(o, dict) or o.get("loyalty_credited"):
-        return 0
-    uid = int(o.get("user_id") or 0)
-    if not uid:
-        return 0
-    try:
-        earn_est = int(o.get("loyalty_earn_estimate") or 0)
-    except (TypeError, ValueError):
-        earn_est = 0
-    if earn_est <= 0:
-        earn_calc = _loyalty_compute_earn_estimate(
-            int(o.get("total") or 0),
-            None,
-            cart_lines=list(o.get("items") or []),
-        )
-        earn_est = int(earn_calc or 0)
-    if earn_est <= 0:
-        return 0
-    _loyalty_apply_local_credit(uid, earn_est)
-    o["loyalty_credited"] = True
-    o["loyalty_credited_amount"] = int(earn_est)
-    save_state()
-    return int(earn_est)
-
-
-def _loyalty_finalize_order_bonuses_once(o: dict) -> None:
-    if not isinstance(o, dict):
-        return
-    uid = int(o.get("user_id") or 0)
-    if not uid:
-        return
-    try:
-        spent = int(o.get("bonus_points_spent") or 0)
-    except (TypeError, ValueError):
-        spent = 0
-    if spent <= 0:
-        try:
-            spent = int(o.get("bonus_applied") or 0)
-        except (TypeError, ValueError):
-            spent = 0
-    if spent > 0 and not o.get("loyalty_debited"):
-        _loyalty_apply_local_debit(uid, int(spent))
-        o["loyalty_debited"] = True
-        o["loyalty_debited_amount"] = int(spent)
-    _loyalty_credit_order_once(o)
-
-
-def _loyalty_credit_due_orders_for_user(uid: int) -> int:
-    if not uid:
-        return 0
-    total = 0
-    for o in list(ORDERS.values()):
-        if not isinstance(o, dict):
-            continue
-        if int(o.get("user_id") or 0) != int(uid):
-            continue
-        st = _norm_bot_order_status(str(o.get("status") or "new"))
-        if st in ("accepted", "shipped", "done"):
-            total += _loyalty_credit_order_once(o)
-    return int(total)
-
-
-_LOYALTY_PENDING_EARN_KEYS: Tuple[str, ...] = (
-    "bonusWillEarn",
-    "bonusesWillEarn",
-    "bonusForOrder",
-    "bonusForThisOrder",
-    "bonusToEarn",
-    "expectedBonus",
-    "orderBonusEstimate",
-    "orderBonus",
-    "loyaltyPointsToEarn",
-    "pointsToEarn",
-    "pointsForOrder",
-    "cashbackEstimate",
-    "bonusAccrualEstimate",
-    "orderBonusAccrual",
-)
-
-
-def _loyalty_pending_earn_from_dict(data: dict) -> Optional[int]:
-    """Явная оценка начисления из JSON заказа/сайта (если есть)."""
-    if not isinstance(data, dict):
-        return None
-    v = _loyalty_find_int(data, _LOYALTY_PENDING_EARN_KEYS, 3)
-    if v is not None and int(v) > 0:
-        return int(v)
-    return _loyalty_pending_earn_from_text_fields(data)
-
-
-def _loyalty_earn_percent_from_env() -> int:
-    """Доля суммы к оплате для оценки начисления, 0…100. 0 — только явные поля заказа; по умолчанию 5."""
-    return max(0, min(100, _env_int("ILLUCARDS_LOYALTY_EARN_PERCENT", 5)))
-
-
-def _loyalty_points_per_unit_from_env() -> int:
-    """Как на сайте IlluCards: баллов за 1 единицу товара. 0 — не использовать правило qty×балл."""
-    return max(0, _env_int("ILLUCARDS_LOYALTY_POINTS_PER_UNIT", 100))
-
-
-def _cart_total_units(lines: List[dict]) -> int:
-    n = 0
-    for x in lines:
-        if isinstance(x, dict):
-            n += int(_cart_line_qty_coerce(x.get("qty")))
-    return max(0, int(n))
+def _schedule_loyalty_notify(bot, uid: int, text: Optional[str]) -> None:
+    pass
 
 
 def _loyalty_compute_earn_estimate(
@@ -2372,153 +1906,33 @@ def _loyalty_compute_earn_estimate(
     *,
     cart_lines: Optional[List[dict]] = None,
 ) -> Optional[int]:
-    """
-    Оценка бонусов с заказа:
-    1) поля/текст сайта (hint + sync);
-    2) сумма по позициям, если в строках корзины есть числа;
-    3) qty × ILLUCARDS_LOYALTY_POINTS_PER_UNIT (по умолчанию 100 — как витрина «за единицу»);
-    4) иначе процент от суммы (ILLUCARDS_LOYALTY_EARN_PERCENT).
-    """
-    pt = max(0, int(pay_total or 0))
-    if pt <= 0:
-        return None
-    cap = max(pt * 3, 500_000)
-    if isinstance(hint, dict):
-        raw = _loyalty_pending_earn_from_dict(hint)
-        if raw is not None:
-            if raw <= cap:
-                return int(raw)
-    if cart_lines:
-        item_sum = _loyalty_pending_earn_from_cart_items(cart_lines)
-        if item_sum is not None and int(item_sum) > 0:
-            if int(item_sum) <= cap:
-                return int(item_sum)
-    ppu = _loyalty_points_per_unit_from_env()
-    if ppu > 0 and cart_lines:
-        units = _cart_total_units(list(cart_lines))
-        if units > 0:
-            return int(units) * int(ppu)
-    pct = _loyalty_earn_percent_from_env()
-    if pct > 0:
-        return (pt * pct) // 100
     return None
 
 
+def _loyalty_finalize_order_bonuses_once(o: dict) -> None:
+    pass
+
+
+def _loyalty_cart_footer_lines(uid: int) -> List[str]:
+    return []
+
+
 def _bonus_discount_units(points: int, currency: str) -> int:
-    cur = str(currency or "").strip().upper()
-    pts = max(0, int(points or 0))
-    if cur == "RUB":
-        return pts
-    return (pts * 7) // 200
-
-
-def _bonus_points_for_discount(discount: int, currency: str) -> int:
-    cur = str(currency or "").strip().upper()
-    amt = max(0, int(discount or 0))
-    if cur == "RUB":
-        return amt
-    return (amt * 200 + 6) // 7
+    return 0
 
 
 def _bonus_discount_label(points: int, currency: str) -> str:
-    pts = max(0, int(points or 0))
-    cur = str(currency or "").strip().upper()
-    if cur == "BYN":
-        return f"{(pts * 3.5 / 100):g} BYN"
-    return f"{_bonus_discount_units(pts, cur)} {cur or 'RUB'}"
+    return ""
 
 
 def _checkout_bonus_cap(uid: int, grand_before_bonus: int, currency: str = "BYN") -> int:
-    by_balance = _loyalty_balance_int(uid)
-    by_total = _bonus_points_for_discount(max(0, int(grand_before_bonus)), currency)
-    return min(by_balance, by_total)
+    return 0
 
 
 def _checkout_bonus_spend_effective(
     user_data: dict, uid: int, grand_before_bonus: int, currency: str = "BYN"
 ) -> int:
-    cap = _checkout_bonus_cap(uid, grand_before_bonus, currency)
-    try:
-        want = int(user_data.get("checkout_bonus_spend") or 0)
-    except (TypeError, ValueError):
-        want = 0
-    return max(0, min(max(0, want), cap))
-
-
-def _checkout_preview_finance(
-    user_data: dict, checkout_uid: int
-) -> Optional[dict]:
-    """Сумма до списания бонусов и валюта для превью оформления."""
-    lines: List[dict] = list(user_data.get("order_checkout") or [])
-    if not lines:
-        return None
-    code = str(user_data.get("delivery_country") or "")
-    opt = DELIVERY_OPTIONS.get(code)
-    if not opt:
-        return None
-    dlabel, damount, dcur = opt[0], opt[1], opt[2]
-    goods_total, _ = _cart_totals(lines)
-    site_labels = {
-        str(x.get("line_currency") or "").strip().upper()
-        for x in lines
-        if x.get("from_site") and str(x.get("line_currency") or "").strip().upper() in ("BYN", "RUB")
-    }
-    if site_labels and all(x.get("from_site") for x in lines) and len(site_labels) == 1:
-        g_cur = site_labels.pop()
-    else:
-        g_cur = _goods_currency_for_delivery_country(code)
-    site_gt_raw = (
-        _cart_get_site_grand_total(checkout_uid, g_cur) if checkout_uid else None
-    )
-    inc = _cart_site_delivery_included(checkout_uid) if checkout_uid else False
-    exp_line = int(goods_total) if inc else int(goods_total) + int(damount)
-    trust_site = False
-    if checkout_uid and site_gt_raw and int(site_gt_raw) > 0:
-        sg = int(site_gt_raw)
-        if not _site_grand_covers_goods(sg, int(goods_total)):
-            trust_site = False
-        elif inc:
-            trust_site = not (exp_line > 0 and sg < exp_line - max(50, exp_line // 40))
-        else:
-            trust_site = exp_line > 0 and abs(sg - exp_line) <= max(100, exp_line // 25)
-    use_site = bool(site_gt_raw and trust_site)
-    grand_show = int(site_gt_raw) if use_site else exp_line
-    return {
-        "lines": lines,
-        "grand_show": int(grand_show),
-        "g_cur": g_cur,
-        "goods_total": int(goods_total),
-        "code": code,
-        "dlabel": dlabel,
-        "dcur": dcur,
-        "damount": int(damount),
-        "inc": bool(inc),
-        "use_site": bool(use_site),
-        "site_gt_raw": int(site_gt_raw) if site_gt_raw else None,
-    }
-
-
-async def _notify_loyalty_earned(bot, uid: int, text: str) -> None:
-    if not bot or not uid or not (text or "").strip():
-        return
-    log = logging.getLogger(__name__)
-    try:
-        await bot.send_message(
-            int(uid),
-            str(text).strip()[:3900],
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        log.exception("loyalty notify → uid=%s", uid)
-
-
-def _schedule_loyalty_notify(bot, uid: int, text: Optional[str]) -> None:
-    if not bot or not uid or not text:
-        return
-    try:
-        asyncio.get_running_loop().create_task(_notify_loyalty_earned(bot, int(uid), text))
-    except RuntimeError:
-        pass
+    return 0
 
 
 def _normalize_sync_cart_items(
@@ -3147,17 +2561,8 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
     if lines or _sync_explicit_clear(data, "clearCart", "clear_cart"):
         _cart_set_items_uid(uid, lines)
     _cart_apply_site_pricing_hints(uid, data)
-    pts, disc = _site_bonus_from_sources(uid, data if isinstance(data, dict) else None)
-    if pts > 0 or disc > 0:
-        crec = _ensure_user_cart(uid)
-        if pts > 0:
-            crec["site_bonus_points_spent"] = int(pts)
-        if disc > 0:
-            crec["site_bonus_applied"] = int(disc)
     _apply_optional_favorites_from_site_payload(uid, data, products)
-    note_loy = _apply_site_loyalty_from_sync(uid, data)
     bot_loy = _resolve_live_bot(request.app.get("bot"))
-    _schedule_loyalty_notify(bot_loy, uid, note_loy)
     skip_buyer_notify = bool(
         data.get("skip_buyer_notify") or data.get("skipBuyerNotify")
     )
@@ -3169,12 +2574,6 @@ async def _http_sync_cart(request: web.Request) -> web.Response:
     if site_order_id:
         body_loy["order_id"] = site_order_id
         body_loy["checkout_pushed"] = bool(checkout_pushed)
-    lb_loy = USER_SITE_LOYALTY.get(uid, {}).get("balance")
-    if lb_loy is not None:
-        try:
-            body_loy["bonus_balance"] = int(lb_loy)
-        except (TypeError, ValueError):
-            pass
     return _login_json_response(body_loy)
 
 
@@ -3236,7 +2635,6 @@ async def _http_get_sync_state(request: web.Request) -> web.Response:
             cart_total, _ = _cart_totals(cart_items)
         except Exception:
             cart_total = 0
-    loyalty = USER_SITE_LOYALTY.get(uid) if isinstance(USER_SITE_LOYALTY.get(uid), dict) else {}
     return _login_json_response(
         {
             "success": True,
@@ -3246,7 +2644,6 @@ async def _http_get_sync_state(request: web.Request) -> web.Response:
             "cart_total": cart_total,
             "favorites": list(USER_FAVORITES.get(uid) or []),
             "favorite_items": len(USER_FAVORITES.get(uid) or []),
-            "bonus_balance": loyalty.get("balance"),
         }
     )
 
@@ -3291,9 +2688,6 @@ async def _http_sync_state(request: web.Request) -> web.Response:
         hp_items = _normalize_home_promotions_list(raw_hp if raw_hp is not None else [])
         apply_home_page_promotions(hp_items)
         hp_n = len(HOME_PAGE_PROMOTIONS)
-    note_st = _apply_site_loyalty_from_sync(uid, data)
-    bot_st = request.app.get("bot")
-    _schedule_loyalty_notify(bot_st, uid, note_st)
     users_touch(uid, "sync")
     body = {
         "success": True,
@@ -3304,12 +2698,6 @@ async def _http_sync_state(request: web.Request) -> web.Response:
     }
     if hp_n >= 0:
         body["home_promotions"] = hp_n
-    lb_st = USER_SITE_LOYALTY.get(uid, {}).get("balance")
-    if lb_st is not None:
-        try:
-            body["bonus_balance"] = int(lb_st)
-        except (TypeError, ValueError):
-            pass
     return _login_json_response(body)
 
 
@@ -4835,19 +4223,7 @@ def _cart_apply_site_pricing_hints(uid: int, data: dict) -> None:
         b["site_delivery_included"] = True
     else:
         b.pop("site_delivery_included", None)
-    pending = _loyalty_pending_earn_from_dict(data)
-    if pending is None:
-        pending = _loyalty_pending_earn_from_cart_items(
-            data.get("cart") if isinstance(data, dict) else None
-        )
-    if pending is None:
-        pending = _loyalty_pending_earn_from_cart_items(
-            data.get("items") if isinstance(data, dict) else None
-        )
-    if pending is not None and int(pending) > 0:
-        b["site_loyalty_pending_earn"] = int(pending)
-    else:
-        b.pop("site_loyalty_pending_earn", None)
+    b.pop("site_loyalty_pending_earn", None)
 
 
 def _cart_clear_site_pricing_hints(uid: int) -> None:
@@ -4863,13 +4239,7 @@ def _cart_clear_site_pricing_hints(uid: int) -> None:
 
 
 def _cart_get_site_loyalty_pending_earn(uid: int) -> Optional[int]:
-    b = USER_CART.get(int(uid))
-    if not isinstance(b, dict):
-        return None
-    v = _coerce_card_price_int(b.get("site_loyalty_pending_earn"))
-    if v <= 0:
-        return None
-    return int(v)
+    return None
 
 
 def _cart_get_site_grand_total(
@@ -5068,45 +4438,13 @@ _SITE_BONUS_APPLIED_KEYS = (
 def _site_bonus_from_sources(
     uid: int, meta: Optional[dict] = None
 ) -> Tuple[int, int]:
-    """(списано бонусов, скидка в валюте заказа если сайт передал сумму)."""
-    sources: List[dict] = []
-    if isinstance(meta, dict):
-        sources.append(meta)
-    b = USER_CART.get(int(uid))
-    if isinstance(b, dict):
-        sources.append(b)
-    pts: Optional[int] = None
-    disc: Optional[int] = None
-    for src in sources:
-        if pts is None:
-            pts = _loyalty_find_int(src, _SITE_BONUS_SPENT_KEYS, 2)
-        if disc is None:
-            disc = _loyalty_find_int(src, _SITE_BONUS_APPLIED_KEYS, 2)
-    b = USER_CART.get(int(uid))
-    if isinstance(b, dict):
-        if pts is None:
-            try:
-                v = int(b.get("site_bonus_points_spent") or 0)
-            except (TypeError, ValueError):
-                v = 0
-            if v > 0:
-                pts = v
-        if disc is None:
-            try:
-                v = int(b.get("site_bonus_applied") or 0)
-            except (TypeError, ValueError):
-                v = 0
-            if v > 0:
-                disc = v
-    points = max(0, int(pts or 0))
-    discount = max(0, int(disc or 0))
-    return points, discount
+    return 0, 0
 
 
 def _site_final_total_from_sources(
     uid: int, meta: Optional[dict], pay_cur: str
 ) -> Optional[int]:
-    """Итог с сайта после бонусов (finalTotal / cartGrandTotalRub и т.д.)."""
+    """Итог с сайта (finalTotal / cartGrandTotalRub и т.д.)."""
     cur = str(pay_cur or "").strip().upper()
     sources: List[dict] = []
     if isinstance(meta, dict):
@@ -5158,13 +4496,7 @@ def _site_final_total_from_sources(
 
 
 def _merge_site_bonus_into_meta(uid: int, meta: Optional[dict]) -> dict:
-    out = deepcopy(meta) if isinstance(meta, dict) else {}
-    pts, disc = _site_bonus_from_sources(uid, out)
-    if pts > 0:
-        out["bonus_points_spent"] = int(pts)
-    if disc > 0:
-        out["bonus_applied"] = int(disc)
-    return out
+    return deepcopy(meta) if isinstance(meta, dict) else {}
 
 
 def _parse_grand_total_from_preview_text(text: str) -> Optional[Tuple[int, str]]:
@@ -5323,15 +4655,6 @@ def _payment_intro_text(
         f"{PAY_FLOW_STEPS}\n\n"
         "👇 Нажмите кнопку ниже"
     )
-    try:
-        est = int(loyalty_earn_estimate) if loyalty_earn_estimate is not None else 0
-    except (TypeError, ValueError):
-        est = 0
-    if est > 0:
-        body += (
-            f"\n\n⭐ Ориентировочно начислится бонусов с заказа: ~{est}. "
-            "Точное значение подтвердит сайт после оплаты."
-        )
     return body
 
 
@@ -5809,12 +5132,6 @@ def _format_admin_order_detail_text(order_id: int, o: dict) -> str:
     ]
     if dline:
         parts.extend(["", dline])
-    try:
-        b_ap = int(o.get("bonus_applied") or 0)
-    except (TypeError, ValueError):
-        b_ap = 0
-    if b_ap > 0:
-        parts.extend(["", f"⭐ Списано бонусов: {b_ap} = {_bonus_discount_label(b_ap, line_cur)}"])
     parts.extend(
         [
             "",
@@ -6423,7 +5740,6 @@ def _format_payment_receipt_text(order_id: int, o: dict) -> str:
         b_ap = 0
     if b_ap > 0:
         lines.append("")
-        lines.append(f"⭐ Списано бонусов: {b_ap} = {_bonus_discount_label(b_ap, line_cur)}")
     lines.append("")
     lines.append(f"💰 Сумма: {_order_resolved_grand_total(o)} {line_cur}")
     lines.extend(
@@ -6434,24 +5750,7 @@ def _format_payment_receipt_text(order_id: int, o: dict) -> str:
             "🙏 Спасибо за покупку!",
         ]
     )
-    cust_rc = int(o.get("user_id") or 0)
-    try:
-        earn_est = int(o.get("loyalty_earn_estimate") or 0)
-    except (TypeError, ValueError):
-        earn_est = 0
-    if earn_est > 0:
-        lines.append("")
-        lines.append(f"⭐ Ожидаемое начисление с этого заказа: ~{earn_est} бонусов.")
-    rec_loy = USER_SITE_LOYALTY.get(cust_rc) if cust_rc else None
     lines.append("")
-    has_known_balance = isinstance(rec_loy, dict) and rec_loy.get("balance") is not None
-    if has_known_balance:
-        bal_rc = _loyalty_balance_int(cust_rc)
-        lines.append(f"⭐ На бонусном счёте сейчас: {bal_rc}.")
-    if isinstance(rec_loy, dict):
-        hint_loy = str(rec_loy.get("hint") or "").strip()
-        if hint_loy and len(hint_loy) < 300:
-            lines.append(hint_loy)
     body = "\n".join(lines)
     if len(body) > 4090:
         body = body[:4086] + "…"
@@ -6767,38 +6066,23 @@ def _cart_totals(lines: List[dict]) -> Tuple[int, int]:
 
 
 def _order_computed_grand_total(o: dict) -> int:
-    """Итог по строкам заказа + сумма доставки минус списанные бонусы."""
+    """Итог по строкам заказа + сумма доставки."""
     goods, _ = _cart_totals(list(o.get("items") or []))
     d = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
     try:
         d_amt = int(d.get("amount") or 0)
     except (TypeError, ValueError):
         d_amt = 0
-    raw = max(0, int(goods) + int(d_amt))
-    try:
-        b_ap = max(0, int(o.get("bonus_applied") or 0))
-    except (TypeError, ValueError):
-        b_ap = 0
-    if b_ap > raw:
-        b_ap = raw
-    return max(0, raw - b_ap)
+    return max(0, int(goods) + int(d_amt))
 
 
 def _order_resolved_grand_total(o: dict) -> int:
     """Итог для отображения и ORDERS: при явном расхождении с позициями — исправляем o['total']."""
     comp = _order_computed_grand_total(o)
     try:
-        bonus_applied = int(o.get("bonus_applied") or 0)
-    except (TypeError, ValueError):
-        bonus_applied = 0
-    try:
         stored = int(o.get("total") or 0)
     except (TypeError, ValueError):
         stored = 0
-    if bonus_applied > 0 and comp >= 0:
-        if stored != comp:
-            o["total"] = int(comp)
-        return int(comp)
     if comp <= 0:
         return max(0, stored)
     if stored <= 0:
@@ -6901,13 +6185,6 @@ def _format_login_site_cart_pending_text(
         xcur = lc if lc in ("BYN", "RUB") else g_cur
         out.append(f"• {name} — {q} шт. × {p} {xcur} = {p * q} {xcur}")
     out.append("")
-    pts, disc = _site_bonus_from_sources(uid, meta)
-    if pts > 0 or disc > 0:
-        b_show = pts if pts > 0 else disc
-        out.append(f"Списано бонусов: {b_show}")
-        if disc > 0:
-            out.append(f"Скидка бонусами: {disc} {pay_cur}")
-        out.append("")
     site_gt_raw = _cart_get_site_grand_total(uid, g_cur)
     if inc and not site_gt_raw:
         out.append(f"🚚 Доставка: {d_label} (уже в сумме на сайте)")
@@ -6925,10 +6202,6 @@ def _format_login_site_cart_pending_text(
         out.append(f"🚚 Доставка: {d_label} (+{d_amt} {d_cur})")
         out.append(f"💰 Товары: {goods} {g_cur}; доставка: {d_amt} {d_cur}")
         out.append(f"💰 Итого: {grand_show} {pay_cur}")
-    foot_pv = _loyalty_cart_footer_lines(uid)
-    if foot_pv:
-        out.append("")
-        out.extend(foot_pv)
     s = "\n".join(out)
     if len(s) > 3500:
         s = s[:3490] + "…"
@@ -7393,7 +6666,6 @@ def _format_user_order_detail(order_id: object, o: dict) -> str:
     except (TypeError, ValueError):
         b_ap = 0
     if b_ap > 0:
-        parts.append(f"⭐ Списано бонусов: {b_ap} = {_bonus_discount_label(b_ap, line_cur)}")
         parts.append("")
     parts.append(f"📦 Количество карточек: {qty} шт.")
     parts.append(f"💰 Итого: {tot} {line_cur}")
@@ -7494,12 +6766,7 @@ def _format_order_preview_with_delivery(
     use_site = bool(fin["use_site"])
     site_gt_raw = fin.get("site_gt_raw")
     grand_show = int(fin["grand_show"])
-    spend_points = 0
-    spend_discount = 0
-    if checkout_uid:
-        spend_points = _checkout_bonus_spend_effective(user_data, checkout_uid, grand_show, g_cur)
-        spend_discount = min(int(grand_show), _bonus_discount_units(spend_points, g_cur))
-    grand_final = max(0, int(grand_show) - int(spend_discount))
+    grand_final = int(grand_show)
     out: List[str] = [
         "📦 Ваш заказ:",
         "",
@@ -7519,23 +6786,14 @@ def _format_order_preview_with_delivery(
     if inc and not site_gt_raw:
         out.append(f"🚚 Доставка: {dlabel} (уже в сумме на сайте)")
         out.append("")
-        if spend_points > 0:
-            out.append(f"⭐ Списание бонусов: −{spend_points} бонусов ({spend_discount} {g_cur})")
-            out.append("")
         out.append(f"💰 Итого: {grand_final} {g_cur}")
     elif use_site:
         out.append(f"🚚 Доставка: {dlabel}")
         out.append("")
-        if spend_points > 0:
-            out.append(f"⭐ Списание бонусов: −{spend_points} бонусов ({spend_discount} {g_cur})")
-            out.append("")
         out.append(f"💰 Итого: {grand_final} {g_cur} (как на сайте)")
     else:
         out.append(f"🚚 Доставка: {dlabel}")
         out.append("")
-        if spend_points > 0:
-            out.append(f"⭐ Списание бонусов: −{spend_points} бонусов ({spend_discount} {g_cur})")
-            out.append("")
         if code == "by" and dcur == "BYN":
             out.append(f"💰 Итого: {grand_final} BYN")
         else:
@@ -7617,15 +6875,6 @@ def _kb_order_preview_actions(uid: int, user_data: dict) -> InlineKeyboardMarkup
             )
         ],
     ]
-    fin = _checkout_preview_finance(user_data, uid)
-    if fin and uid and _checkout_bonus_cap(uid, int(fin["grand_show"]), str(fin["g_cur"])) > 0:
-        rows.append(
-            [
-                InlineKeyboardButton("⭐ Выкл", callback_data="bo:s:0"),
-                InlineKeyboardButton("⭐ 50%", callback_data="bo:s:h"),
-                InlineKeyboardButton("⭐ Макс", callback_data="bo:s:m"),
-            ]
-        )
     return InlineKeyboardMarkup(rows)
 
 
@@ -9032,7 +8281,7 @@ async def _fetch_order_for_deep_link(
 
 
 def _site_order_pricing_hint_payload(norm: dict) -> dict:
-    """Подсказки цен/бонусов в USER_CART после перехода order_* с сайта."""
+    """Подсказки цен в USER_CART после перехода order_* с сайта."""
     d = norm.get("delivery") if isinstance(norm.get("delivery"), dict) else {}
     cc = str(d.get("country") or "by").strip().lower()
     g_cur = _goods_currency_for_delivery_country(cc)
@@ -9057,27 +8306,6 @@ def _site_order_pricing_hint_payload(norm: dict) -> dict:
             payload["grandTotalRub"] = tot_i
         else:
             payload["grandTotalByn"] = tot_i
-    try:
-        b_ap = int(norm.get("bonus_applied") or 0)
-    except (TypeError, ValueError):
-        b_ap = 0
-    if b_ap > 0:
-        payload["bonusApplied"] = b_ap
-        payload["bonus_applied"] = b_ap
-    try:
-        b_ps = int(norm.get("bonus_points_spent") or 0)
-    except (TypeError, ValueError):
-        b_ps = 0
-    if b_ps <= 0:
-        b_ps = b_ap
-    if b_ps > 0:
-        payload["bonusPointsSpent"] = b_ps
-        payload["bonus_points_spent"] = b_ps
-    earn = _loyalty_compute_earn_estimate(
-        tot_i, norm, cart_lines=list(norm.get("items") or [])
-    )
-    if earn is not None and int(earn) > 0:
-        payload["bonusWillEarn"] = int(earn)
     return payload
 
 
@@ -9205,22 +8433,11 @@ def _format_site_checkout_order_body(
         xcur = lc if lc in ("BYN", "RUB") else g_cur
         out.append(f"• {name} — {q} шт. × {p} {xcur} = {p * q} {xcur}")
     out.append("")
-    pts, disc = _site_bonus_from_sources(int(uid), meta)
-    if pts > 0:
-        out.append(f"Списано бонусов: {pts}")
-    if disc > 0:
-        out.append(f"Скидка бонусами: {disc} {pay_cur}")
-    if pts > 0 or disc > 0:
-        out.append("")
     if inc:
         out.append(f"🚚 Доставка: {d_label} (уже в сумме на сайте)")
     else:
         out.append(f"🚚 Доставка: {d_label} — {d_amt} {d_cur}")
     out.append(f"💰 Итого: {grand_show} {pay_cur}")
-    earn = _loyalty_compute_earn_estimate(int(grand_show), norm, cart_lines=lines)
-    if earn is not None and int(earn) > 0:
-        out.append("")
-        out.append(f"⭐ Ориентировочно начислится бонусов с заказа: ~{int(earn)}")
     s = "\n".join(out)
     if len(s) > 3900:
         s = s[:3890] + "…"
@@ -9391,20 +8608,6 @@ def _format_site_order_confirm_preview(
     preview = _format_login_site_cart_pending_text(uid, cc, products or [])
     if not preview.strip():
         return ""
-    extra: List[str] = []
-    try:
-        b_ap = int(norm.get("bonus_applied") or 0)
-    except (TypeError, ValueError):
-        b_ap = 0
-    if b_ap > 0:
-        g_cur = _goods_currency_for_delivery_country(
-            str(d.get("country") or "by").strip().lower()
-        )
-        extra.append(
-            f"⭐ Списано бонусов: {b_ap} ({_bonus_discount_label(b_ap, g_cur)})"
-        )
-    if extra:
-        preview = preview.rstrip() + "\n\n" + "\n".join(extra)
     return preview
 
 
@@ -9708,8 +8911,6 @@ def _format_user_deep_link_order_message(order: dict) -> str:
         and abs(int(hint) - int(computed)) <= max(100, int(computed) // 25)
     ):
         total_show = int(hint)
-    if bonus_applied > 0:
-        out.append(f"⭐ Списано бонусов: {bonus_applied} = {_bonus_discount_label(bonus_applied, g_cur)}")
     if g_cur == "BYN":
         out.append(f"💰 Итого: {total_show} BYN")
     else:
@@ -11321,8 +10522,6 @@ async def on_order_status_buttons(
         await _refresh_admin_order_message(context, oid)
         return
     o["status"] = want
-    if want in ("accepted", "shipped", "done"):
-        _loyalty_finalize_order_bonuses_once(o)
     save_state()
     if want in ("done", "canceled"):
         cuid = int(o.get("user_id") or 0)
@@ -12293,59 +11492,6 @@ async def on_delivery_country_pick(
     )
 
 
-async def on_bonus_spend_pick(
-    update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """bo:s:0|h|m — списание бонусов к оплате в превью заказа."""
-    q = update.callback_query
-    if not q or not q.from_user or not q.data or not q.message:
-        return
-    m = re.match(r"^bo:s:(0|h|m)$", (q.data or "").strip())
-    if not m:
-        return
-    mode = m.group(1)
-    uid = q.from_user.id
-    ud = context.user_data
-    fin = _checkout_preview_finance(ud, uid)
-    if not fin:
-        try:
-            await q.answer("Сначала выберите страну доставки.", show_alert=True)
-        except Exception:
-            pass
-        return
-    cap = _checkout_bonus_cap(uid, int(fin["grand_show"]), str(fin["g_cur"]))
-    if mode == "0":
-        ud["checkout_bonus_spend"] = 0
-    elif mode == "h":
-        ud["checkout_bonus_spend"] = max(0, cap // 2)
-    else:
-        ud["checkout_bonus_spend"] = int(cap)
-    preview = _format_order_preview_with_delivery(ud, uid)
-    if not preview:
-        try:
-            await q.answer()
-        except Exception:
-            pass
-        return
-    try:
-        await q.answer()
-    except Exception:
-        pass
-    try:
-        await q.message.edit_text(
-            preview,
-            reply_markup=_kb_order_preview_actions(uid, ud),
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        try:
-            await q.message.reply_text(
-                preview,
-                reply_markup=_kb_order_preview_actions(uid, ud),
-            )
-        except Exception:
-            pass
-
-
 async def on_send_order_to_admin(
     update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """ta:0 — подтверждение превью: заказ в ORDERS без уведомления админу; дальше оплата, админ — после чека."""
@@ -12471,11 +11617,9 @@ async def on_send_order_to_admin(
         base_tot = int(goods_total) + d_amt
     else:
         base_tot = int(goods_total) + d_amt
-    fin_bo = _checkout_preview_finance(ud, uid)
-    gref = int(fin_bo["grand_show"]) if fin_bo else int(base_tot)
-    spend_points = _checkout_bonus_spend_effective(ud, uid, gref, pay_cur)
-    spend = min(_bonus_discount_units(spend_points, pay_cur), max(0, int(base_tot)))
-    pay_total = max(0, int(base_tot) - int(spend))
+    pay_total = int(base_tot)
+    spend_points = 0
+    spend = 0
     order_rec = {
         "id": "0",
         "items": deepcopy(list(lines)),
@@ -12511,38 +11655,6 @@ async def on_send_order_to_admin(
     if int(spend) > 0:
         ORDERS[int(oid)]["bonus_applied"] = int(spend)
     save_state()
-    if int(pay_total) <= 0 and int(spend_points) > 0:
-        order_rec["status"] = "Принят"
-        order_rec["paid"] = True
-        order_rec["payment_method"] = "bonuses"
-        ORDERS[int(oid)]["paid"] = True
-        ORDERS[int(oid)]["paid_at"] = time.time()
-        ORDERS[int(oid)]["payment_method"] = "bonuses"
-        ORDERS[int(oid)]["status"] = "accepted"
-        ORDERS[int(oid)]["bonus_paid_full"] = True
-        _loyalty_finalize_order_bonuses_once(ORDERS[int(oid)])
-        _user_state_clear_payment_states(uid)
-        _clear_crypto_auto_watch(ORDERS[int(oid)], uid)
-        _clear_checkout_delivery(ud)
-        _cart_clear_site_pricing_hints(uid)
-        _clear_user_cart_after_payment_proof(uid, int(oid), ORDERS[int(oid)])
-        try:
-            asyncio.get_running_loop().create_task(
-                _notify_site_cart_cleared_after_proof(uid, int(oid), ORDERS[int(oid)])
-            )
-        except RuntimeError:
-            pass
-        save_state()
-        await _send_deferred_admin_order_panel(context, int(oid), ORDERS[int(oid)])
-        await q.answer()
-        await q.message.reply_text(
-            "✅ Заказ полностью оплачен бонусами.\n\n"
-            f"⭐ Списано бонусов: {int(spend_points)}.\n"
-            "Мы приняли заказ и передали его администратору.",
-            reply_markup=REPLY_KB,
-        )
-        users_touch(uid, "payment")
-        return
     _set_awaiting_payment_order_id(uid, ud, int(oid))
     await q.answer()
     tot = int(order_rec["total"])
@@ -14225,11 +13337,6 @@ def main() -> None:
         CallbackQueryHandler(
             on_receipt_callback,
             pattern=re.compile(r"^rcpt_(orders|support)$"),
-        )
-    )
-    app.add_handler(
-        CallbackQueryHandler(
-            on_bonus_spend_pick, pattern=re.compile(r"^bo:s:(0|h|m)$")
         )
     )
     app.add_handler(CallbackQueryHandler(on_send_order_to_admin, pattern=re.compile(r"^ta:0$")))
