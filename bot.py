@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-17-deep-link-find-first-v23"
+BOT_BUILD_ID = "2026-06-17-admin-after-proof-v24"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -5996,64 +5996,7 @@ async def _notify_admin_new_order(
     if uid:
         users_touch(uid, activity_only=True)
     save_state()
-    await _notify_admin_pending_payment(context, order_id, rec)
     return order_id
-
-
-async def _notify_admin_pending_payment(
-    context: ContextTypes.DEFAULT_TYPE, order_id: int, o: dict
-) -> None:
-    """Короткое уведомление админу: заказ создан, ждём скрин оплаты."""
-    log = logging.getLogger(__name__)
-    uid = int(o.get("user_id") or 0)
-    un = str(o.get("username") or "").strip().lstrip("@")
-    who = f"@{un}" if un else f"id {uid}"
-    tot, cur = _order_payment_display(o)
-    text = (
-        f"🛒 Новый заказ #{order_id}\n"
-        f"👤 {who}\n"
-        f"💰 К оплате: {tot} {cur}\n\n"
-        "Клиент на шаге оплаты — пришлём чек, когда отправит скрин."
-    )
-    for tgt in _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else []):
-        try:
-            await context.bot.send_message(
-                chat_id=tgt,
-                text=text,
-                disable_web_page_preview=True,
-            )
-            log.info("admin pending payment notify target=%s order=%s", tgt, order_id)
-        except Exception:
-            log.exception(
-                "admin pending payment notify target=%s order=%s", tgt, order_id
-            )
-
-
-async def _notify_admin_awaiting_proof(
-    context: ContextTypes.DEFAULT_TYPE, order_id: int, o: dict
-) -> None:
-    """Клиент нажал «Я оплатил» — скоро пришлёт скрин."""
-    log = logging.getLogger(__name__)
-    uid = int(o.get("user_id") or 0)
-    un = str(o.get("username") or "").strip().lstrip("@")
-    who = f"@{un}" if un else f"id {uid}"
-    text = (
-        f"📸 Ждём чек · Заказ #{order_id}\n"
-        f"👤 {who}\n\n"
-        "Клиент подтвердил оплату — скоро пришлёт скрин."
-    )
-    for tgt in _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else []):
-        try:
-            await context.bot.send_message(
-                chat_id=tgt,
-                text=text,
-                disable_web_page_preview=True,
-            )
-            log.info("admin awaiting proof notify target=%s order=%s", tgt, order_id)
-        except Exception:
-            log.exception(
-                "admin awaiting proof notify target=%s order=%s", tgt, order_id
-            )
 
 
 _RE_PAY_METHOD_CB = re.compile(r"^pay_(card|transfer|crypto)(?::(?P<oid>\d+))?$")
@@ -12809,10 +12752,6 @@ async def on_payment_paid(
     await q.message.reply_text(
         PAY_PROOF_REQUEST, reply_markup=_kb_proof_step_back()
     )
-    try:
-        await _notify_admin_awaiting_proof(context, int(oid), o)
-    except Exception:
-        log.exception("on_payment_paid admin notify uid=%s oid=%s", uid, oid)
     try:
         save_state()
     except Exception:
