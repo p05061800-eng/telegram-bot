@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-17-no-bonuses-v25"
+BOT_BUILD_ID = "2026-05-29-postpaid-checkout-v27"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -1159,7 +1159,19 @@ MSG_PAY_PROOF_TO_ADMIN_FAIL = (
 )
 MSG_PAY_PROOF_RECEIVED = "⏳ Получили скрин, передаём администратору…"
 MSG_PAY_PROOF_OK = (
-    "✅ Чек передан администратору. Ожидайте подтверждения оплаты."
+    "✅ Скрин сохранён. Укажите данные для доставки — после этого заказ уйдёт администратору."
+)
+MSG_POSTPAID_COLLECTED = (
+    "Записали. Можете дописать адрес, ФИО или телефон — или нажмите «✅ Отправить заказ»."
+)
+MSG_POSTPAID_NEED_DETAILS = (
+    "Сначала напишите адрес отделения, ФИО и номер телефона."
+)
+MSG_POSTPAID_SUBMITTED = (
+    "✅ Заказ передан администратору. Ожидайте подтверждения оплаты."
+)
+MSG_POSTPAID_SUBMIT_FAIL = (
+    "Не удалось отправить заказ администратору. Попробуйте ещё раз или напишите в «Связь»."
 )
 MSG_CALLBACK_CATEGORY_INVALID = "Такой категории нет. Откройте каталог заново."
 MSG_CART_CLEARED_TOAST = "Корзина очищена."
@@ -5142,6 +5154,11 @@ def _format_admin_order_detail_text(order_id: int, o: dict) -> str:
             f"🕐 Создан: {tss}",
         ]
     )
+    dd = str(o.get("delivery_details") or "").strip()
+    if not dd:
+        dd = _postpaid_merged_details(o)
+    if dd:
+        parts.extend(["", "📍 Адрес / ФИО / телефон:", dd[:1200]])
     body = "\n".join(parts)
     if len(body) > 4090:
         body = body[:4086] + "…"
@@ -5787,7 +5804,7 @@ async def _send_payment_receipt(
 
 
 def _postpaid_shipping_prompt_for_order(o: dict) -> str:
-    """Текст запроса реквизитов доставки после подтверждения оплаты — по стране из заказа."""
+    """Текст запроса реквизитов доставки после скрина оплаты — по стране из заказа."""
     d = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
     cc = str(d.get("country") or "").strip().lower()
     if cc == "by":
@@ -5795,6 +5812,39 @@ def _postpaid_shipping_prompt_for_order(o: dict) -> str:
     if cc == "ru":
         return MSG_POSTPAID_SHIPPING_RU
     return MSG_POSTPAID_SHIPPING_INTL
+
+
+def _postpaid_append_detail(o: dict, text: str) -> None:
+    chunk = str(text or "").strip()
+    if not chunk:
+        return
+    parts = o.setdefault("delivery_details_parts", [])
+    if not isinstance(parts, list):
+        parts = []
+        o["delivery_details_parts"] = parts
+    parts.append(chunk)
+
+
+def _postpaid_merged_details(o: dict) -> str:
+    parts = o.get("delivery_details_parts")
+    if isinstance(parts, list) and parts:
+        return "\n\n".join(
+            str(x).strip() for x in parts if str(x).strip()
+        ).strip()
+    return str(o.get("delivery_details") or "").strip()
+
+
+def _kb_postpaid_submit(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Отправить заказ",
+                    callback_data=f"ppdone:{int(order_id)}",
+                )
+            ]
+        ]
+    )
 
 
 def _kb_admin_postpaid_reply(order_id: int) -> InlineKeyboardMarkup:
@@ -5894,6 +5944,161 @@ async def _forward_postpaid_client_payload_to_admin(
         except Exception:
             log.exception("postpaid forward order_id=%s", oid)
             return False
+
+
+async def _collect_postpaid_client_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    uid: int,
+    oid: int,
+    body_text: Optional[str],
+    msg: Message,
+    photo_file_id: Optional[str] = None,
+) -> bool:
+    """Собрать адрес/ФИО/телефон до отправки полного заказа админу."""
+    o = ORDERS.get(int(oid))
+    if not o or int(o.get("user_id") or 0) != int(uid):
+        _user_state_pop(uid, "postpaid_thread_oid")
+        try:
+            await msg.reply_text(MSG_POSTPAID_THREAD_STALE)
+        except Exception:
+            pass
+        return True
+    if o.get("checkout_submitted_to_admin"):
+        return await _forward_postpaid_client_payload_to_admin(
+            context,
+            uid=uid,
+            oid=int(oid),
+            body_text=body_text,
+            msg=msg,
+            photo_file_id=photo_file_id,
+        )
+    chunk = str(body_text or "").strip()
+    if photo_file_id:
+        extra = "[приложено фото]"
+        chunk = f"{chunk}\n{extra}".strip() if chunk else extra
+    if not chunk:
+        try:
+            await msg.reply_text(
+                MSG_POSTPAID_NEED_DETAILS,
+                reply_markup=_kb_postpaid_submit(int(oid)),
+            )
+        except Exception:
+            pass
+        return True
+    _postpaid_append_detail(o, chunk)
+    save_state()
+    try:
+        await msg.reply_text(
+            MSG_POSTPAID_COLLECTED,
+            reply_markup=_kb_postpaid_submit(int(oid)),
+        )
+    except Exception:
+        pass
+    return True
+
+
+async def _sync_site_order_checkout_complete(order_id: int, order: dict) -> None:
+    """После адреса: paid + delivery_details + file_id на сайте (ЛК и корзина)."""
+    ext = str(order.get("external_id") or "").strip()
+    if not ext:
+        try:
+            await _ensure_site_order_for_bot_order(int(order_id), order)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "site order mirror failed bot_order=%s", order_id
+            )
+        ext = str(order.get("external_id") or "").strip()
+    url = ORDER_STATUS_UPDATE_API_URL
+    if not ext or not url:
+        return
+    details = _postpaid_merged_details(order)
+    if not details:
+        return
+    order["delivery_details"] = details
+    headers = {"Content-Type": "application/json"}
+    if ORDER_STATUS_UPDATE_SECRET:
+        headers["Authorization"] = f"Bearer {ORDER_STATUS_UPDATE_SECRET}"
+    payload: Dict[str, object] = {
+        "order_id": ext,
+        "status": "paid",
+        "delivery_details": details,
+    }
+    fid = str(order.get("proof_file_id") or "").strip()
+    if fid:
+        payload["telegram_payment_proof_file_id"] = fid
+    log = logging.getLogger(__name__)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status >= 300:
+                    body = await resp.text()
+                    log.warning(
+                        "site checkout complete sync failed order=%s HTTP %s %s",
+                        ext,
+                        resp.status,
+                        body[:300],
+                    )
+    except Exception:
+        log.exception("site checkout complete sync failed order=%s", ext)
+
+
+async def _finalize_order_submission_to_admin(
+    context: ContextTypes.DEFAULT_TYPE,
+    uid: int,
+    oid: int,
+) -> Tuple[bool, str]:
+    """Скрин + адрес + карточка заказа админу; синк на сайт; очистка корзины."""
+    log = logging.getLogger(__name__)
+    o = ORDERS.get(int(oid))
+    if not o or int(o.get("user_id") or 0) != int(uid):
+        return False, "stale"
+    if o.get("checkout_submitted_to_admin"):
+        return True, "already"
+    details = _postpaid_merged_details(o)
+    if not details:
+        return False, "empty"
+    fid = str(o.get("proof_file_id") or "").strip()
+    if not fid or not o.get("payment_proof_submitted"):
+        return False, "no_proof"
+    o["delivery_details"] = details
+    try:
+        await _sync_site_order_checkout_complete(int(oid), o)
+    except Exception:
+        log.exception("finalize site sync uid=%s oid=%s", uid, oid)
+    try:
+        cap = _format_payment_proof_caption(int(oid), o, int(uid))
+    except Exception:
+        log.exception("finalize proof caption uid=%s oid=%s", uid, oid)
+        cap = f"📸 Чек оплаты · Заказ #{oid}\n👤 id: {uid}"
+    ok = False
+    try:
+        ok = await asyncio.wait_for(
+            _send_or_edit_admin_payment_proof(
+                context, int(oid), o, fid, cap, customer_msg=None
+            ),
+            timeout=45.0,
+        )
+    except asyncio.TimeoutError:
+        log.error("finalize admin proof timeout uid=%s oid=%s", uid, oid)
+    except Exception:
+        log.exception("finalize admin proof uid=%s oid=%s", uid, oid)
+    if not ok:
+        return False, "admin_fail"
+    try:
+        await _send_admin_order_panel(context, int(oid), o, force_new=True)
+    except Exception:
+        log.exception("finalize admin panel uid=%s oid=%s", uid, oid)
+    o["checkout_submitted_to_admin"] = True
+    if o.get("clear_cart_on_paid"):
+        _clear_user_cart_after_payment_proof(int(uid), int(oid), o)
+        try:
+            await _notify_site_cart_cleared_after_proof(int(uid), int(oid), o)
+        except Exception:
+            log.exception("finalize site cart clear uid=%s oid=%s", uid, oid)
+    _clear_postpaid_thread_if_matches(int(uid), int(oid))
+    save_state()
+    return True, "ok"
 
 
 def _kb_payment_admin_review(order_id: int, uid: int) -> InlineKeyboardMarkup:
@@ -7604,6 +7809,41 @@ def _deep_link_raw_grand_total(raw: dict) -> int:
     return 0
 
 
+_DEEP_LINK_ITEM_CONTAINER_KEYS = frozenset(
+    {"items", "lines", "lineitems", "cart", "products"}
+)
+
+
+def _deep_link_has_explicit_delivery_country(raw: dict) -> bool:
+    """Сайт явно задал страну доставки — не переопределять регион по priceRub в строках."""
+    if not isinstance(raw, dict):
+        return False
+    for cand in _deep_link_candidate_dicts(raw):
+        d = cand.get("delivery")
+        if isinstance(d, dict):
+            for key in (
+                "country",
+                "code",
+                "countryCode",
+                "country_code",
+                "region",
+            ):
+                v = d.get(key)
+                if v is None:
+                    continue
+                if str(v).strip():
+                    return True
+        elif d is not None and str(d).strip():
+            return True
+        for key in ("delivery_country", "deliveryCountry", "deliveryRegion"):
+            v = cand.get(key)
+            if v is None:
+                continue
+            if str(v).strip():
+                return True
+    return False
+
+
 def _deep_link_force_region_from_payload(raw: dict) -> str:
     seen = False
 
@@ -7614,6 +7854,8 @@ def _deep_link_force_region_from_payload(raw: dict) -> str:
         if isinstance(node, dict):
             for k, v in node.items():
                 ks = str(k or "").strip().lower()
+                if ks in _DEEP_LINK_ITEM_CONTAINER_KEYS:
+                    continue
                 if ks in (
                     "pricerub",
                     "price_rub",
@@ -7865,9 +8107,12 @@ def _normalize_deep_link_order(
     if not raw_items:
         return None
     region_bot = _deep_link_delivery_bot_code(raw)
-    forced_region = _deep_link_force_region_from_payload(raw)
-    if forced_region:
-        region_bot = forced_region
+    explicit_delivery = _deep_link_has_explicit_delivery_country(raw)
+    forced_region = ""
+    if not explicit_delivery:
+        forced_region = _deep_link_force_region_from_payload(raw)
+        if forced_region:
+            region_bot = forced_region
     total_currency_hint = str(
         _deep_link_find_first(
             raw,
@@ -7883,7 +8128,7 @@ def _normalize_deep_link_order(
         )
         or ""
     ).strip().upper()
-    if region_bot == "by" and total_currency_hint == "RUB":
+    if not explicit_delivery and region_bot == "by" and total_currency_hint == "RUB":
         region_bot = "ru"
     items_out: List[dict] = []
     for it in raw_items:
@@ -7979,7 +8224,7 @@ def _normalize_deep_link_order(
     norm_country, norm_label, norm_amount, norm_currency = _delivery_option_for_site_code(
         country or label or region_bot
     )
-    if forced_region:
+    if forced_region and not explicit_delivery:
         norm_country = forced_region
         norm_currency = _goods_currency_for_delivery_country(forced_region)
     if norm_country != region_bot:
@@ -8673,7 +8918,7 @@ def _site_status_from_bot_status(status: str) -> Optional[str]:
 
 
 def _clear_user_cart_after_payment_proof(uid: int, oid: int, o: dict) -> None:
-    """TG-корзина — после одобрения заказа админом (accept), если у заказа clear_cart_on_paid."""
+    """TG-корзина — после «Отправить заказ» (адрес + скрин), если clear_cart_on_paid."""
     if not uid:
         return
     if not o.get("clear_cart_on_paid"):
@@ -10530,16 +10775,6 @@ async def on_order_status_buttons(
     if not str(o.get("external_id") or "").strip() and o.get("paid"):
         await _ensure_site_order_for_bot_order(oid, o)
     await _sync_site_order_status(o)
-    if want == "accepted":
-        cuid = int(o.get("user_id") or 0)
-        if cuid:
-            _clear_user_cart_after_payment_proof(cuid, int(oid), o)
-            try:
-                asyncio.get_running_loop().create_task(
-                    _notify_site_cart_cleared_after_proof(cuid, int(oid), o)
-                )
-            except RuntimeError:
-                pass
     await q.answer(MSG_ORDER_STATUS_UPDATED, show_alert=False)
     notice = _format_customer_order_status_notice(oid, str(o.get("status") or ""))
     await _notify_order_customer(context, o, notice)
@@ -11847,6 +12082,20 @@ async def on_payment_paid(
     ):
         await q.message.reply_text(PAY_PROOF_WAIT, reply_markup=REPLY_KB)
         return
+    if o.get("payment_proof_submitted") and not o.get("checkout_submitted_to_admin"):
+        await q.message.reply_text(
+            MSG_POSTPAID_NEED_DETAILS,
+            reply_markup=_kb_postpaid_submit(int(oid)),
+        )
+        _user_state_set(uid, "postpaid_thread_oid", int(oid))
+        return
+    if (
+        o.get("payment_proof_submitted")
+        and not o.get("paid")
+        and o.get("checkout_submitted_to_admin")
+    ):
+        await q.message.reply_text(PAY_PROOF_WAIT, reply_markup=REPLY_KB)
+        return
     _set_awaiting_proof_session(uid, ud, int(oid))
     try:
         save_state()
@@ -12154,7 +12403,7 @@ async def on_customer_proof_media(
                 reply_markup=REPLY_KB,
             )
         else:
-            ok = await _forward_postpaid_client_payload_to_admin(
+            ok = await _collect_postpaid_client_message(
                 context,
                 uid=uid,
                 oid=int(pp_oid),
@@ -12162,12 +12411,7 @@ async def on_customer_proof_media(
                 msg=msg,
                 photo_file_id=fid,
             )
-            if ok:
-                try:
-                    await msg.reply_text(MSG_POSTPAID_FORWARDED_OK)
-                except Exception:
-                    pass
-            else:
+            if not ok:
                 await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
         raise ApplicationHandlerStop
 
@@ -12285,7 +12529,7 @@ async def _on_user_photo_body(
         fid = msg.photo[-1].file_id if msg.photo else None
         if not fid:
             return
-        ok = await _forward_postpaid_client_payload_to_admin(
+        ok = await _collect_postpaid_client_message(
             context,
             uid=uid,
             oid=int(pp_oid),
@@ -12293,12 +12537,7 @@ async def _on_user_photo_body(
             msg=msg,
             photo_file_id=fid,
         )
-        if ok:
-            try:
-                await msg.reply_text(MSG_POSTPAID_FORWARDED_OK)
-            except Exception:
-                pass
-        else:
+        if not ok:
             try:
                 await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
             except Exception:
@@ -12417,32 +12656,11 @@ async def _on_payment_proof_photo_body(
         o.pop("payment_proof_admin_chat_id", None)
         o.pop("payment_proof_admin_message_id", None)
     _clear_crypto_auto_watch(o, uid, persist=False)
-    try:
-        cap = _format_payment_proof_caption(oid, o, uid)
-    except Exception:
-        log.exception("payment_proof_photo caption uid=%s oid=%s", uid, oid)
-        cap = f"📸 Чек оплаты · Заказ #{oid}\n👤 id: {uid}"
     o["proof_file_id"] = file_id
-    ok = False
-    try:
-        ok = await asyncio.wait_for(
-            _send_or_edit_admin_payment_proof(
-                context, oid, o, file_id, cap, customer_msg=msg
-            ),
-            timeout=45.0,
-        )
-    except asyncio.TimeoutError:
-        log.error("payment_proof_photo admin send timeout uid=%s oid=%s", uid, oid)
-    except Exception:
-        log.exception("payment_proof_photo admin send uid=%s oid=%s", uid, oid)
-    if not ok:
-        o.pop("proof_file_id", None)
-        o.pop("payment_proof_admin_chat_id", None)
-        o.pop("payment_proof_admin_message_id", None)
-        _set_awaiting_proof_session(uid, ud, int(oid))
-        await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
-        return
     o["payment_proof_submitted"] = True
+    o.pop("checkout_submitted_to_admin", None)
+    o.pop("delivery_details_parts", None)
+    o.pop("delivery_details", None)
     _user_state_pop(uid, "awaiting_proof", persist=False)
     _clear_awaiting_payment_order_id(uid, ud, persist=False)
     try:
@@ -12470,11 +12688,20 @@ async def _on_payment_proof_photo_body(
         save_state()
     except Exception:
         log.exception("payment_proof_photo save_state uid=%s oid=%s", uid, oid)
+    prompt = _postpaid_shipping_prompt_for_order(o)
     try:
-        await msg.reply_text(MSG_PAY_PROOF_OK, reply_markup=REPLY_KB)
+        await msg.reply_text(
+            prompt,
+            reply_markup=_kb_postpaid_submit(int(oid)),
+        )
+        _user_state_set(uid, "postpaid_thread_oid", int(oid))
     except Exception:
-        log.exception("payment_proof_photo customer ok uid=%s oid=%s", uid, oid)
-    log.info("payment_proof_photo ok uid=%s oid=%s", uid, oid)
+        log.exception("payment_proof_photo shipping prompt uid=%s oid=%s", uid, oid)
+    try:
+        save_state()
+    except Exception:
+        log.exception("payment_proof_photo save_state2 uid=%s oid=%s", uid, oid)
+    log.info("payment_proof_photo ok uid=%s oid=%s awaiting_shipping", uid, oid)
 
 
 async def on_admin_confirm_payment(
@@ -12533,29 +12760,86 @@ async def on_admin_confirm_payment(
         )
     except Exception:
         pass
-    # Карточка заказа админу — как на скрине, сразу под подтверждением чека.
-    try:
-        panel_text = _format_admin_order_detail_text(oid, o)
-        panel_kb = _kb_order_admin_actions(oid, str(o.get("status") or "new"))
-        panel = await q.message.reply_text(
-            panel_text,
-            reply_markup=panel_kb,
-            disable_web_page_preview=True,
-        )
-        o["admin_chat_id"] = int(panel.chat_id)
-        o["admin_message_id"] = int(panel.message_id)
-    except Exception:
-        logging.getLogger(__name__).exception(
-            "confirm_payment admin panel reply order_id=%s", oid
-        )
-        await _send_admin_order_panel(context, oid, o, force_new=True)
+    # Карточка заказа админу — если ещё не отправляли на шаге «Отправить заказ».
+    if not o.get("admin_message_id"):
+        try:
+            panel_text = _format_admin_order_detail_text(oid, o)
+            panel_kb = _kb_order_admin_actions(oid, str(o.get("status") or "new"))
+            panel = await q.message.reply_text(
+                panel_text,
+                reply_markup=panel_kb,
+                disable_web_page_preview=True,
+            )
+            o["admin_chat_id"] = int(panel.chat_id)
+            o["admin_message_id"] = int(panel.message_id)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "confirm_payment admin panel reply order_id=%s", oid
+            )
+            await _send_admin_order_panel(context, oid, o, force_new=True)
     if cust:
         await _send_payment_receipt(context.bot, cust, oid, o)
-        await _send_customer_plain(
-            context.bot, cust, _postpaid_shipping_prompt_for_order(o)
-        )
-        _user_state_set(cust, "postpaid_thread_oid", int(oid))
     save_state()
+    raise ApplicationHandlerStop
+
+
+async def on_postpaid_submit(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Клиент нажал «✅ Отправить заказ» после адреса/ФИО/телефона."""
+    q = update.callback_query
+    if not q or not q.from_user or not q.data:
+        return
+    m = re.match(r"^ppdone:(\d+)$", (q.data or "").strip())
+    if not m:
+        return
+    uid = int(q.from_user.id)
+    try:
+        oid = int(m.group(1))
+    except ValueError:
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+    o = ORDERS.get(oid)
+    if not o or int(o.get("user_id") or 0) != uid:
+        try:
+            await q.answer(MSG_POSTPAID_THREAD_STALE, show_alert=True)
+        except Exception:
+            pass
+        return
+    if not _postpaid_merged_details(o):
+        try:
+            await q.answer(MSG_POSTPAID_NEED_DETAILS, show_alert=True)
+        except Exception:
+            pass
+        if q.message:
+            try:
+                await q.message.reply_text(
+                    MSG_POSTPAID_NEED_DETAILS,
+                    reply_markup=_kb_postpaid_submit(oid),
+                )
+            except Exception:
+                pass
+        return
+    try:
+        await q.answer("Отправляем заказ…")
+    except Exception:
+        pass
+    ok, reason = await _finalize_order_submission_to_admin(context, uid, oid)
+    if not ok:
+        if q.message:
+            try:
+                await q.message.reply_text(MSG_POSTPAID_SUBMIT_FAIL, reply_markup=REPLY_KB)
+            except Exception:
+                pass
+        return
+    if q.message:
+        try:
+            await q.message.reply_text(MSG_POSTPAID_SUBMITTED, reply_markup=REPLY_KB)
+        except Exception:
+            pass
     raise ApplicationHandlerStop
 
 
@@ -12628,9 +12912,13 @@ async def on_admin_reject_payment(
     _clear_crypto_auto_watch(o, cust)
     o["payment_proof_submitted"] = False
     o.pop("proof_file_id", None)
+    o.pop("checkout_submitted_to_admin", None)
+    o.pop("delivery_details_parts", None)
+    o.pop("delivery_details", None)
     o.pop("payment_proof_admin_chat_id", None)
     o.pop("payment_proof_admin_message_id", None)
     if cust:
+        _user_state_pop(cust, "postpaid_thread_oid")
         _user_state_set(cust, "awaiting_proof", int(oid))
         await _send_customer_plain(
             context.bot, cust, PAY_ADMIN_REJECTED_CLIENT
@@ -12876,19 +13164,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text(MSG_EMPTY_INPUT)
             return
         else:
-            ok = await _forward_postpaid_client_payload_to_admin(
+            ok = await _collect_postpaid_client_message(
                 context,
                 uid=uid,
                 oid=int(thread_oid),
                 body_text=text,
                 msg=msg,
             )
-            if ok:
-                try:
-                    await msg.reply_text(MSG_POSTPAID_FORWARDED_OK)
-                except Exception:
-                    pass
-            else:
+            if not ok:
                 try:
                     await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
                 except Exception:
@@ -13194,6 +13477,13 @@ def main() -> None:
     )
     app.add_handler(
         CallbackQueryHandler(
+            on_postpaid_submit,
+            pattern=re.compile(r"^ppdone:\d+$"),
+        ),
+        group=-1,
+    )
+    app.add_handler(
+        CallbackQueryHandler(
             on_admin_confirm_payment,
             pattern=re.compile(r"^confirm_payment_\d+$"),
         ),
@@ -13319,6 +13609,12 @@ def main() -> None:
     app.add_handler(
         CallbackQueryHandler(
             on_payment_paid, pattern=re.compile(r"^paid(:\d+)?$")
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_postpaid_submit,
+            pattern=re.compile(r"^ppdone:\d+$"),
         )
     )
     app.add_handler(
