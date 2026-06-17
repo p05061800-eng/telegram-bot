@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-17-order-checkout-hint-v22"
+BOT_BUILD_ID = "2026-06-17-deep-link-find-first-v23"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -1831,13 +1831,14 @@ def _site_api_auth_ok(request: web.Request, data: dict) -> bool:
 
 
 def _resolve_sync_uid(data: dict) -> int:
-    raw_uid = data.get("user_id")
-    try:
-        uid = int(raw_uid or 0)
-    except (TypeError, ValueError):
-        uid = 0
-    if uid > 0:
-        return uid
+    for key in ("user_id", "telegram_user_id", "telegramUserId"):
+        raw_uid = data.get(key)
+        try:
+            uid = int(raw_uid or 0)
+        except (TypeError, ValueError):
+            uid = 0
+        if uid > 0:
+            return uid
     raw_username = data.get("username")
     if raw_username is None:
         return 0
@@ -8372,6 +8373,23 @@ def _deep_link_candidate_dicts(raw: dict) -> List[dict]:
         if isinstance(v, dict):
             out.append(v)
     return out
+
+
+def _deep_link_find_first(raw: dict, keys: tuple) -> object:
+    """Первое непустое значение по ключам в raw и вложенных объектах заказа."""
+    if not isinstance(raw, dict):
+        return None
+    for cand in _deep_link_candidate_dicts(raw):
+        for key in keys:
+            if key not in cand:
+                continue
+            val = cand.get(key)
+            if val is None:
+                continue
+            if isinstance(val, str) and not val.strip():
+                continue
+            return val
+    return None
 
 
 def _deep_link_raw_grand_total(raw: dict) -> int:
