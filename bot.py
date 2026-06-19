@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-05-29-postpaid-checkout-v28"
+BOT_BUILD_ID = "2026-06-18-payment-callback-v29"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -5376,7 +5376,9 @@ def _parse_order_id_from_payment_message(text: str) -> Optional[int]:
 def _message_looks_like_order_payment_step(text: str) -> bool:
     t = str(text or "")
     return bool(t.strip()) and (
-        "Оплата по заказу" in t or _message_looks_like_payment_step(t)
+        "Оплата по заказу" in t
+        or _message_looks_like_payment_step(t)
+        or _message_looks_like_payment_requisites(t)
     )
 
 
@@ -5658,18 +5660,26 @@ def _resolve_payment_order_id(
     message_text: Optional[str] = None,
 ) -> Optional[int]:
     """ID заказа на шаге оплаты: callback_data → текст сообщения → сессия."""
-    for oid_raw in (
-        _oid_from_pay_callback(callback_data or ""),
-        _parse_order_id_from_payment_message(message_text or ""),
-    ):
-        if oid_raw is None:
-            continue
+    cb_oid = _oid_from_pay_callback(callback_data or "")
+    candidates: List[int] = []
+    if cb_oid is not None:
+        candidates.append(int(cb_oid))
+    msg_oid = _parse_order_id_from_payment_message(message_text or "")
+    if msg_oid is not None and msg_oid not in candidates:
+        candidates.append(int(msg_oid))
+    for oid_raw in candidates:
         o = _ensure_order_in_orders(int(oid_raw), int(uid))
-        if not isinstance(o, dict) and _message_looks_like_order_payment_step(
-            message_text or ""
-        ):
-            o = _stub_order_for_payment_step(int(oid_raw), int(uid), message_text or "")
-            ORDERS[int(oid_raw)] = o
+        if not isinstance(o, dict):
+            if cb_oid is not None and int(oid_raw) == int(cb_oid):
+                o = _stub_order_for_payment_step(
+                    int(oid_raw), int(uid), message_text or ""
+                )
+                ORDERS[int(oid_raw)] = o
+            elif _message_looks_like_order_payment_step(message_text or ""):
+                o = _stub_order_for_payment_step(
+                    int(oid_raw), int(uid), message_text or ""
+                )
+                ORDERS[int(oid_raw)] = o
         if (
             isinstance(o, dict)
             and int(o.get("user_id") or 0) == int(uid)
@@ -9597,6 +9607,24 @@ def _message_looks_like_payment_step(text: str) -> bool:
         "💳 Карта · 📱 Перевод",
         ORDER_AUTO_ACK,
         "Оплата по заказу",
+        "Заказ уже в этом чате",
+    )
+    return any(m in t for m in markers)
+
+
+def _message_looks_like_payment_requisites(text: str) -> bool:
+    """Сообщение с реквизитами или просьбой прислать скрин (после pay_card / paid)."""
+    t = str(text or "")
+    if not t.strip():
+        return False
+    markers = (
+        "💳 Оплата картой",
+        "📱 Перевод на номер",
+        "₿ Крипто",
+        "📸 Отправьте скрин оплаты",
+        "После оплаты нажмите",
+        "9112 3810 0954 6243",
+        "DANIL PARFIONAU",
     )
     return any(m in t for m in markers)
 
@@ -10071,6 +10099,36 @@ async def _run_site_confirm_order(
     log.info("confirm_order ok uid=%s oid=%s total=%s", uid_cb, oid, total)
 
 
+async def on_checkout_payment_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Ранний роутер pay_* / paid:* (до catch-all unhandled)."""
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    data = (q.data or "").strip()
+    log = logging.getLogger(__name__)
+    if _RE_PAY_METHOD_CB.match(data):
+        log.info(
+            "checkout_payment_route method uid=%s data=%r",
+            q.from_user.id if q.from_user else 0,
+            data,
+        )
+        await on_payment_method(update, context)
+        raise ApplicationHandlerStop
+    if _RE_PAY_CANCEL_CB.match(data):
+        await on_payment_cancel(update, context)
+        raise ApplicationHandlerStop
+    if _RE_PAID_CB.match(data):
+        log.info(
+            "checkout_payment_route paid uid=%s data=%r",
+            q.from_user.id if q.from_user else 0,
+            data,
+        )
+        await on_payment_paid(update, context)
+        raise ApplicationHandlerStop
+
+
 async def on_callback_query_unhandled(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -10081,12 +10139,6 @@ async def on_callback_query_unhandled(
     data = (q.data or "").strip()
     uid = int(q.from_user.id) if q.from_user else 0
     log = logging.getLogger(__name__)
-    log.warning(
-        "unhandled callback_query uid=%s data=%r chat_msg=%s",
-        uid,
-        data,
-        q.message.message_id if q.message else None,
-    )
     if _RE_PAY_METHOD_CB.match(data):
         await on_payment_method(update, context)
         return
@@ -10096,6 +10148,12 @@ async def on_callback_query_unhandled(
     if _RE_PAID_CB.match(data):
         await on_payment_paid(update, context)
         return
+    log.warning(
+        "unhandled callback_query uid=%s data=%r chat_msg=%s",
+        uid,
+        data,
+        q.message.message_id if q.message else None,
+    )
     if re.match(r"^(accept|sent|cancel|done|delmsg)_\d+$", data):
         await on_order_status_buttons(update, context)
         return
@@ -12057,7 +12115,7 @@ async def on_payment_paid(
         return
     uid = int(q.from_user.id)
     ud = context.user_data if isinstance(context.user_data, dict) else {}
-    _refresh_orders_state_from_redis()
+    log.info("payment_paid uid=%s data=%r", uid, q.data)
     await _callback_ack(q)
     msg_txt = (q.message.text or q.message.caption or "") if q.message else ""
     oid = _resolve_payment_order_id(
@@ -12068,6 +12126,10 @@ async def on_payment_paid(
         if oid_cb is not None:
             oid = int(oid_cb)
             _bind_payment_order_session(uid, ud, oid)
+            o_stub = _ensure_order_in_orders(int(oid), uid)
+            if not isinstance(o_stub, dict):
+                o_stub = _stub_order_for_payment_step(int(oid), uid, msg_txt)
+                ORDERS[int(oid)] = o_stub
     if oid is None:
         await q.message.reply_text(
             "Не удалось открыть шаг со скрином. Нажмите «✅ Оплатить» на свежем сообщении с реквизитами.",
@@ -13478,6 +13540,13 @@ def main() -> None:
     )
     app.add_error_handler(on_ptb_error)
 
+    app.add_handler(
+        CallbackQueryHandler(
+            on_checkout_payment_callback,
+            pattern=re.compile(r"^(pay_(card|transfer|crypto)|pay_cancel|paid)(:\d+)?$"),
+        ),
+        group=-2,
+    )
     app.add_handler(
         TypeHandler(Update, track_user_activity, block=False),
         group=-1,
