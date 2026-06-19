@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-19-proof-photo-v30"
+BOT_BUILD_ID = "2026-05-29-admin-checkout-v31"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -12488,8 +12488,6 @@ async def on_customer_proof_media(
     if not msg or not msg.from_user:
         return
     uid = int(msg.from_user.id)
-    if is_admin(uid):
-        raise ApplicationHandlerStop
     ud = context.user_data if isinstance(context.user_data, dict) else {}
     file_id = _image_file_id_from_message(msg)
     log.info(
@@ -12669,7 +12667,7 @@ async def _on_user_photo_body(
         )
         return
     pp_oid = _user_state_get(uid, "postpaid_thread_oid")
-    if uid and pp_oid is not None and not is_admin(uid):
+    if uid and pp_oid is not None:
         cap = (msg.caption or "").strip() if msg.caption else ""
         fid = msg.photo[-1].file_id if msg.photo else None
         if not fid:
@@ -13309,7 +13307,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     thread_oid = _user_state_get(uid, "postpaid_thread_oid")
-    if thread_oid is not None and uid and not is_admin(uid):
+    if thread_oid is not None and uid:
         if text in REPLY_MENU_TEXTS:
             _user_state_pop(uid, "postpaid_thread_oid")
         elif not text.strip():
