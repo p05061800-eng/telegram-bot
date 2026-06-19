@@ -102,7 +102,7 @@ def _start_flask_health_server() -> None:
 
     @app.get("/health")
     def health() -> tuple:
-        return jsonify({"ok": True}), 200
+        return jsonify({"ok": True, "build": BOT_BUILD_ID, "admin_id": int(ADMIN_ID or 0)}), 200
 
     raw_port = (os.getenv("PORT") or "10000").strip()
     try:
@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-05-29-admin-5879163640"
+BOT_BUILD_ID = "2026-05-29-client-proof-v32"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -399,7 +399,7 @@ def _state_redis_command(args: List[object]) -> Optional[object]:
             return None
     url, token = cred
     try:
-        logging.getLogger(__name__).info(
+        logging.getLogger(__name__).debug(
             "Redis state REST command: cmd=%s url_configured=%s token_configured=%s",
             str(args[0] if args else "").upper(),
             bool(url),
@@ -3245,7 +3245,9 @@ async def _http_login_page(request: web.Request) -> web.Response:
 
 async def _http_health(request: web.Request) -> web.Response:
     """Лёгкий GET для UptimeRobot / Render / балансировщиков (без HTML и без БД)."""
-    return web.json_response({"ok": True})
+    return web.json_response(
+        {"ok": True, "build": BOT_BUILD_ID, "admin_id": int(ADMIN_ID or 0)}
+    )
 
 
 async def _run_login_http_api(bot) -> None:
@@ -3334,6 +3336,21 @@ async def on_ptb_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
     log.error("Необработанная ошибка в обработчике: %s", err, exc_info=err)
+    if not isinstance(update, Update):
+        return
+    try:
+        if update.callback_query and update.callback_query.message:
+            await update.callback_query.message.reply_text(
+                "Не удалось обработать кнопку. Попробуйте ещё раз или оформите заказ заново.",
+                reply_markup=REPLY_KB,
+            )
+        elif update.effective_message:
+            await update.effective_message.reply_text(
+                "Не удалось обработать сообщение. Попробуйте ещё раз.",
+                reply_markup=REPLY_KB,
+            )
+    except Exception:
+        log.exception("on_ptb_error user notify failed")
 
 
 ILLUCARDS_BASE = _illucards_site_base_url()
@@ -5506,12 +5523,54 @@ def _resolve_proof_order_record(
     return stub
 
 
-def _resolve_proof_order_id_aggressive(
-    uid: int, ud: Optional[dict] = None
+def _proof_order_id_from_reply_context(
+    uid: int, ud: Optional[dict], msg: Optional[Message]
 ) -> Optional[int]:
-    """ID заказа для чека: сессия → Redis user_states → последний неоплаченный."""
+    """Привязать чек к заказу по ответу на сообщение с реквизитами / «пришлите скрин»."""
+    if not msg or not msg.reply_to_message or not uid:
+        return None
+    rt = msg.reply_to_message.text or msg.reply_to_message.caption or ""
+    if not rt.strip():
+        return None
+    if not (
+        _is_reply_to_proof_request(msg)
+        or _message_looks_like_order_payment_step(rt)
+        or _message_looks_like_payment_requisites(rt)
+    ):
+        return None
+    oid = _parse_order_id_from_payment_message(rt)
+    if oid is None:
+        m = re.search(r"#(\d+)", rt)
+        if m:
+            try:
+                oid = int(m.group(1))
+            except (TypeError, ValueError):
+                oid = None
+    if oid is None:
+        return None
+    ud_d = ud if isinstance(ud, dict) else {}
+    o = _ensure_order_in_orders(int(oid), int(uid))
+    if not isinstance(o, dict):
+        o = _stub_order_for_payment_step(int(oid), int(uid), rt)
+        ORDERS[int(oid)] = o
+    elif int(o.get("user_id") or 0) not in (0, int(uid)):
+        return None
+    if o.get("paid"):
+        return None
+    _bind_proof_upload_session(int(uid), ud_d, int(oid))
+    return int(oid)
+
+
+def _resolve_proof_order_id_aggressive(
+    uid: int, ud: Optional[dict] = None, msg: Optional[Message] = None
+) -> Optional[int]:
+    """ID заказа для чека: сессия → Redis user_states → ответ на реквизиты → последний неоплаченный."""
     _refresh_orders_state_from_redis()
     ud_d = ud if isinstance(ud, dict) else {}
+    if msg is not None:
+        from_reply = _proof_order_id_from_reply_context(uid, ud_d, msg)
+        if from_reply is not None:
+            return int(from_reply)
     oid = _resolve_proof_order_id_for_photo(uid, ud_d)
     if oid is not None:
         return int(oid)
@@ -10184,6 +10243,23 @@ async def on_callback_query_unhandled(
     if _RE_PAID_CB.match(data):
         await on_payment_paid(update, context)
         return
+    if _is_bot_checkout_payment_callback(data):
+        log.warning(
+            "checkout_callback_retry uid=%s data=%r",
+            uid,
+            data,
+        )
+        if _RE_PAY_METHOD_CB.match(data):
+            await on_payment_method(update, context)
+            return
+        if _RE_PAID_CB.match(data):
+            await on_payment_paid(update, context)
+            return
+        if _RE_PAY_CANCEL_CB.match(data):
+            await on_payment_cancel(update, context)
+            return
+        await _callback_ack(q)
+        return
     log.warning(
         "unhandled callback_query uid=%s data=%r chat_msg=%s",
         uid,
@@ -10201,9 +10277,6 @@ async def on_callback_query_unhandled(
         return
     if re.match(r"^oam:rep:\d+$", data):
         await on_order_admin_action(update, context)
-        return
-    if _is_bot_checkout_payment_callback(data):
-        await _callback_ack(q)
         return
     msg_text = (q.message.text or q.message.caption or "") if q.message else ""
     if _message_looks_like_admin_order_card(msg_text):
@@ -12486,60 +12559,97 @@ async def on_customer_proof_media(
     log = logging.getLogger(__name__)
     msg = update.effective_message
     if not msg or not msg.from_user:
-        return
+        raise ApplicationHandlerStop
     uid = int(msg.from_user.id)
     ud = context.user_data if isinstance(context.user_data, dict) else {}
-    file_id = _image_file_id_from_message(msg)
-    log.info(
-        "proof_media uid=%s msg_id=%s photo=%s doc=%s file=%s",
-        uid,
-        msg.message_id,
-        bool(msg.photo),
-        bool(msg.document),
-        bool(file_id),
-    )
+    try:
+        file_id = _image_file_id_from_message(msg)
+        log.info(
+            "proof_media uid=%s msg_id=%s photo=%s doc=%s file=%s reply=%s",
+            uid,
+            msg.message_id,
+            bool(msg.photo),
+            bool(msg.document),
+            bool(file_id),
+            bool(msg.reply_to_message),
+        )
 
-    if user_support_state.get(uid):
-        ok = await _forward_support_photo_to_admin(context, msg, uid)
-        if ok:
-            user_support_state.pop(uid, None)
-            m_ok = await msg.reply_text(MSG_SUPPORT_THANKS)
-            _track_temp_message(uid, m_ok)
-        else:
-            await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
-        raise ApplicationHandlerStop
+        if user_support_state.get(uid):
+            ok = await _forward_support_photo_to_admin(context, msg, uid)
+            if ok:
+                user_support_state.pop(uid, None)
+                m_ok = await msg.reply_text(MSG_SUPPORT_THANKS)
+                _track_temp_message(uid, m_ok)
+            else:
+                await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
+            raise ApplicationHandlerStop
 
-    pp_oid = _user_state_get(uid, "postpaid_thread_oid")
-    if pp_oid is not None:
-        cap = (msg.caption or "").strip() if msg.caption else ""
-        fid = file_id or (msg.photo[-1].file_id if msg.photo else None)
-        if not fid:
+        pp_oid = _user_state_get(uid, "postpaid_thread_oid")
+        if pp_oid is not None:
+            cap = (msg.caption or "").strip() if msg.caption else ""
+            fid = file_id or (msg.photo[-1].file_id if msg.photo else None)
+            if not fid:
+                await msg.reply_text(
+                    "Пришлите фото или картинку (PNG/JPG), не PDF.",
+                    reply_markup=REPLY_KB,
+                )
+            else:
+                ok = await _collect_postpaid_client_message(
+                    context,
+                    uid=uid,
+                    oid=int(pp_oid),
+                    body_text=cap or None,
+                    msg=msg,
+                    photo_file_id=fid,
+                )
+                if not ok:
+                    await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
+            raise ApplicationHandlerStop
+
+        _refresh_orders_state_from_redis()
+        proof_oid = _resolve_proof_order_id_aggressive(uid, ud, msg)
+        if proof_oid is None:
+            latest = _find_latest_unpaid_order_id(uid)
+            if latest is not None:
+                proof_oid = int(latest)
+
+        if file_id and proof_oid is not None:
+            _bind_proof_upload_session(uid, ud, int(proof_oid))
+            try:
+                await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
+            except Exception:
+                log.exception("proof_media ack uid=%s", uid)
+            try:
+                await _on_payment_proof_photo_body(update, context)
+            except Exception:
+                log.exception("proof_media body uid=%s oid=%s", uid, proof_oid)
+                try:
+                    await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
+                except Exception:
+                    pass
+            raise ApplicationHandlerStop
+
+        if not file_id:
+            if _user_wants_proof_upload(uid, ud, msg):
+                await msg.reply_text(
+                    "Не вижу изображение. Пришлите скрин как фото (PNG/JPG), не PDF.",
+                    reply_markup=REPLY_KB,
+                )
+            else:
+                await msg.reply_text(
+                    "Сначала выберите способ оплаты и нажмите «✅ Оплатить», затем пришлите скрин.",
+                    reply_markup=REPLY_KB,
+                )
+            raise ApplicationHandlerStop
+
+        wants_proof = _user_wants_proof_upload(uid, ud, msg)
+        if not wants_proof:
             await msg.reply_text(
-                "Пришлите фото или картинку (PNG/JPG), не PDF.",
+                "Сначала нажмите «✅ Оплатить» на сообщении с реквизитами, затем пришлите скрин.",
                 reply_markup=REPLY_KB,
             )
-        else:
-            ok = await _collect_postpaid_client_message(
-                context,
-                uid=uid,
-                oid=int(pp_oid),
-                body_text=cap or None,
-                msg=msg,
-                photo_file_id=fid,
-            )
-            if not ok:
-                await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
-        raise ApplicationHandlerStop
+            raise ApplicationHandlerStop
 
-    _refresh_orders_state_from_redis()
-    proof_oid = _resolve_proof_order_id_aggressive(uid, ud)
-    if proof_oid is None:
-        latest = _find_latest_unpaid_order_id(uid)
-        if latest is not None:
-            proof_oid = int(latest)
-
-    if file_id and proof_oid is not None:
-        _bind_proof_upload_session(uid, ud, int(proof_oid))
         try:
             await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
         except Exception:
@@ -12547,42 +12657,15 @@ async def on_customer_proof_media(
         try:
             await _on_payment_proof_photo_body(update, context)
         except Exception:
-            log.exception("proof_media body uid=%s oid=%s", uid, proof_oid)
+            log.exception("proof_media body uid=%s", uid)
             try:
                 await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
             except Exception:
                 pass
-        raise ApplicationHandlerStop
-
-    if not file_id:
-        if _user_wants_proof_upload(uid, ud, msg):
-            await msg.reply_text(
-                "Не вижу изображение. Пришлите скрин как фото (PNG/JPG), не PDF.",
-                reply_markup=REPLY_KB,
-            )
-        else:
-            await msg.reply_text(
-                "Сначала выберите способ оплаты и нажмите «✅ Я оплатил», затем пришлите скрин.",
-                reply_markup=REPLY_KB,
-            )
-        raise ApplicationHandlerStop
-
-    wants_proof = _user_wants_proof_upload(uid, ud, msg)
-    if not wants_proof:
-        await msg.reply_text(
-            "Сначала нажмите «✅ Оплатить» на сообщении с реквизитами, затем пришлите скрин.",
-            reply_markup=REPLY_KB,
-        )
-        raise ApplicationHandlerStop
-
-    try:
-        await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
+    except ApplicationHandlerStop:
+        raise
     except Exception:
-        log.exception("proof_media ack uid=%s", uid)
-    try:
-        await _on_payment_proof_photo_body(update, context)
-    except Exception:
-        log.exception("proof_media body uid=%s", uid)
+        log.exception("proof_media fatal uid=%s", uid)
         try:
             await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
         except Exception:
@@ -12616,7 +12699,7 @@ async def _on_user_photo_body(
     uid = msg.from_user.id if msg.from_user else 0
     ud = context.user_data if isinstance(context.user_data, dict) else {}
     file_id_peek = _image_file_id_from_message(msg)
-    proof_peek = _resolve_proof_order_id_aggressive(uid, ud) if uid else None
+    proof_peek = _resolve_proof_order_id_aggressive(uid, ud, msg) if uid else None
     log.info(
         "user_photo uid=%s proof_oid=%s has_file=%s photo=%s doc=%s",
         uid,
@@ -12637,7 +12720,7 @@ async def _on_user_photo_body(
                 reply_markup=REPLY_KB,
             )
         return
-    proof_oid = _resolve_proof_order_id_aggressive(uid, ud) if uid else None
+    proof_oid = _resolve_proof_order_id_aggressive(uid, ud, msg) if uid else None
     if uid and file_id_peek:
         if proof_oid is not None:
             await on_payment_proof_photo(update, context)
@@ -12709,12 +12792,18 @@ async def on_payment_flow_non_text(
         raise ApplicationHandlerStop
     uid = int(msg.from_user.id)
     ud = context.user_data if isinstance(context.user_data, dict) else {}
-    if _resolve_proof_order_id_aggressive(uid, ud) is None:
-        return
-    await msg.reply_text(
-        "Пришлите скрин оплаты как фото или картинку (PNG/JPG), не стикер и не PDF.",
-        reply_markup=REPLY_KB,
-    )
+    _refresh_orders_state_from_redis()
+    proof_oid = _resolve_proof_order_id_aggressive(uid, ud, msg)
+    if proof_oid is not None or _find_latest_unpaid_order_id(uid) is not None:
+        await msg.reply_text(
+            "Пришлите скрин оплаты как фото или картинку (PNG/JPG), не стикер и не PDF.",
+            reply_markup=REPLY_KB,
+        )
+    elif _user_wants_proof_upload(uid, ud, msg):
+        await msg.reply_text(
+            "Пришлите скрин оплаты как фото или картинку (PNG/JPG), не стикер и не PDF.",
+            reply_markup=REPLY_KB,
+        )
     raise ApplicationHandlerStop
 
 
@@ -12752,7 +12841,7 @@ async def _on_payment_proof_photo_body(
     if not uid:
         return
     _refresh_orders_state_from_redis()
-    oid_raw = _resolve_proof_order_id_aggressive(uid, ud)
+    oid_raw = _resolve_proof_order_id_aggressive(uid, ud, msg)
     if oid_raw is None:
         await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
         return
@@ -13592,7 +13681,7 @@ def main() -> None:
     app = (
         Application.builder()
         .token(token)
-        .concurrent_updates(False)
+        .concurrent_updates(True)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
@@ -13607,7 +13696,7 @@ def main() -> None:
         group=-2,
     )
     app.add_handler(
-        TypeHandler(Update, track_user_activity, block=False),
+        TypeHandler(Update, track_user_activity, block=True),
         group=-1,
     )
     app.add_handler(
