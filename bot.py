@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-20-admin-after-shipping-v35"
+BOT_BUILD_ID = "2026-06-20-submit-proof-recover-v36"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -1228,6 +1228,9 @@ MSG_POSTPAID_SUBMITTED = (
 )
 MSG_POSTPAID_SUBMIT_FAIL = (
     "Не удалось отправить заказ администратору. Попробуйте ещё раз или напишите в «Связь»."
+)
+MSG_POSTPAID_RESEND_PROOF = (
+    "Скрин оплаты не сохранился. Пришлите фото чека ещё раз, затем нажмите «✅ Отправить заказ»."
 )
 MSG_CALLBACK_CATEGORY_INVALID = "Такой категории нет. Откройте каталог заново."
 MSG_CART_CLEARED_TOAST = "Корзина очищена."
@@ -5994,6 +5997,57 @@ def _postpaid_merged_details(o: dict) -> str:
     return str(o.get("delivery_details") or "").strip()
 
 
+def _order_has_payment_proof(o: dict) -> bool:
+    return bool(str(o.get("proof_file_id") or "").strip()) and bool(
+        o.get("payment_proof_submitted")
+    )
+
+
+def _recover_payment_proof_on_order(uid: int, oid: int) -> bool:
+    """Подтянуть proof_file_id в заказ перед отправкой админу (после рестарта / рассинхрона)."""
+    try:
+        uid_i = int(uid)
+        oid_i = int(oid)
+    except (TypeError, ValueError):
+        return False
+    o = _ensure_order_in_orders(oid_i, uid_i) or ORDERS.get(oid_i)
+    if not isinstance(o, dict) or int(o.get("user_id") or 0) != uid_i:
+        return False
+    if _order_has_payment_proof(o):
+        return True
+    donor: Optional[dict] = None
+    if int(oid_i) in ORDERS and _order_has_payment_proof(ORDERS[oid_i]):
+        donor = ORDERS[oid_i]
+    if donor is None:
+        best_ts = 0.0
+        for raw_oid, rec in ORDERS.items():
+            if not isinstance(rec, dict):
+                continue
+            if int(rec.get("user_id") or 0) != uid_i or rec.get("paid"):
+                continue
+            if not _order_has_payment_proof(rec):
+                continue
+            try:
+                ts = float(rec.get("created_at") or 0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts >= best_ts:
+                best_ts = ts
+                donor = rec
+    if not isinstance(donor, dict):
+        return False
+    fid = str(donor.get("proof_file_id") or "").strip()
+    if not fid:
+        return False
+    o["proof_file_id"] = fid
+    o["payment_proof_submitted"] = True
+    pm = donor.get("payment_pending_method")
+    if pm and not o.get("payment_pending_method"):
+        o["payment_pending_method"] = pm
+    ORDERS[oid_i] = o
+    return True
+
+
 def _kb_postpaid_submit(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -6210,7 +6264,8 @@ async def _finalize_order_submission_to_admin(
 ) -> Tuple[bool, str]:
     """Скрин + адрес + карточка заказа админу; синк на сайт; очистка корзины."""
     log = logging.getLogger(__name__)
-    o = ORDERS.get(int(oid))
+    _refresh_orders_state_from_redis(force=True)
+    o = _ensure_order_in_orders(int(oid), int(uid)) or ORDERS.get(int(oid))
     if not o or int(o.get("user_id") or 0) != int(uid):
         return False, "stale"
     if o.get("checkout_submitted_to_admin"):
@@ -6218,6 +6273,8 @@ async def _finalize_order_submission_to_admin(
     details = _postpaid_merged_details(o)
     if not details:
         return False, "empty"
+    if not _order_has_payment_proof(o):
+        _recover_payment_proof_on_order(int(uid), int(oid))
     fid = str(o.get("proof_file_id") or "").strip()
     if not fid or not o.get("payment_proof_submitted"):
         return False, "no_proof"
@@ -10102,19 +10159,22 @@ async def _run_site_confirm_order(
     pay_cur = "BYN"
     if uid_cb:
         ap = _user_state_get(uid_cb, "awaiting_proof")
-        if ap is not None:
+        pp_thr = _user_state_get(uid_cb, "postpaid_thread_oid")
+        if ap is not None and pp_thr is None:
             try:
                 po = ORDERS.get(int(ap))
             except (TypeError, ValueError):
                 po = None
             if not po or int(po.get("user_id") or 0) != int(uid_cb) or po.get("paid"):
                 _user_state_pop(uid_cb, "awaiting_proof")
-            else:
+            elif not _order_has_payment_proof(po):
                 if acked and q.message:
                     await q.message.reply_text(MSG_PAY_NEED_PROOF_FIRST)
                 else:
                     await _callback_ack(q, MSG_PAY_NEED_PROOF_FIRST, show_alert=True)
                 return
+            else:
+                _user_state_pop(uid_cb, "awaiting_proof")
         pend = _resolve_awaiting_payment_order_id(uid_cb, ud)
         if pend is not None:
             po = _ensure_order_in_orders(int(pend), uid_cb) or ORDERS.get(int(pend))
@@ -11992,7 +12052,8 @@ async def on_send_order_to_admin(
     ud = context.user_data
     uid_chk = q.from_user.id if q.from_user else 0
     ap = _user_state_get(uid_chk, "awaiting_proof")
-    if ap is not None:
+    pp_thr = _user_state_get(uid_chk, "postpaid_thread_oid")
+    if ap is not None and pp_thr is None:
         try:
             po = ORDERS.get(int(ap))
         except (TypeError, ValueError):
@@ -12000,12 +12061,14 @@ async def on_send_order_to_admin(
             po = None
         if po is None or int(po.get("user_id") or 0) != int(uid_chk) or po.get("paid"):
             _user_state_pop(uid_chk, "awaiting_proof")
-        elif po is not None and not po.get("paid"):
+        elif not _order_has_payment_proof(po):
             if acked and q.message:
                 await q.message.reply_text(MSG_PAY_NEED_PROOF_FIRST)
             else:
                 await _callback_ack(q, MSG_PAY_NEED_PROOF_FIRST, show_alert=True)
             return
+        else:
+            _user_state_pop(uid_chk, "awaiting_proof")
     pend = _resolve_awaiting_payment_order_id(uid_chk, ud)
     if pend is not None:
         po = ORDERS.get(int(pend))
@@ -13025,6 +13088,10 @@ async def _on_payment_proof_photo_body(
     o.pop("checkout_submitted_to_admin", None)
     o.pop("delivery_details_parts", None)
     o.pop("delivery_details", None)
+    try:
+        save_state()
+    except Exception:
+        log.exception("payment_proof_photo proof save uid=%s oid=%s", uid, oid)
     _user_state_pop(uid, "awaiting_proof", persist=False)
     _clear_awaiting_payment_order_id(uid, ud, persist=False)
     uname = getattr(msg.from_user, "username", None) if msg.from_user else None
@@ -13185,7 +13252,20 @@ async def on_postpaid_submit(
     if not ok:
         if q.message:
             try:
-                await q.message.reply_text(MSG_POSTPAID_SUBMIT_FAIL, reply_markup=REPLY_KB)
+                if reason == "no_proof":
+                    await q.message.reply_text(
+                        MSG_POSTPAID_RESEND_PROOF,
+                        reply_markup=_kb_postpaid_submit(oid),
+                    )
+                elif reason == "empty":
+                    await q.message.reply_text(
+                        MSG_POSTPAID_NEED_DETAILS,
+                        reply_markup=_kb_postpaid_submit(oid),
+                    )
+                else:
+                    await q.message.reply_text(
+                        MSG_POSTPAID_SUBMIT_FAIL, reply_markup=REPLY_KB
+                    )
             except Exception:
                 pass
         return
@@ -13433,6 +13513,28 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             msg.text,
         )
 
+    thread_oid = _user_state_get(uid, "postpaid_thread_oid")
+    if thread_oid is not None and uid:
+        if text in REPLY_MENU_TEXTS:
+            _user_state_pop(uid, "postpaid_thread_oid")
+        elif not text.strip():
+            await msg.reply_text(MSG_EMPTY_INPUT)
+            return
+        else:
+            ok = await _collect_postpaid_client_message(
+                context,
+                uid=uid,
+                oid=int(thread_oid),
+                body_text=text,
+                msg=msg,
+            )
+            if not ok:
+                try:
+                    await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
+                except Exception:
+                    pass
+            return
+
     if _user_state_get(uid, "awaiting_proof") is not None:
         if text in REPLY_MENU_TEXTS:
             _user_state_pop(uid, "awaiting_proof")
@@ -13508,28 +13610,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             user_data.pop("reply_to", None)
             await msg.reply_text(MSG_ADMIN_SAY_OK)
-            return
-
-    thread_oid = _user_state_get(uid, "postpaid_thread_oid")
-    if thread_oid is not None and uid:
-        if text in REPLY_MENU_TEXTS:
-            _user_state_pop(uid, "postpaid_thread_oid")
-        elif not text.strip():
-            await msg.reply_text(MSG_EMPTY_INPUT)
-            return
-        else:
-            ok = await _collect_postpaid_client_message(
-                context,
-                uid=uid,
-                oid=int(thread_oid),
-                body_text=text,
-                msg=msg,
-            )
-            if not ok:
-                try:
-                    await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
-                except Exception:
-                    pass
             return
 
     if text == BTN_CHAT:
