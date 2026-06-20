@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-20-shipping-intl-text-v39"
+BOT_BUILD_ID = "2026-06-20-instant-shipping-reply-v40"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -6046,6 +6046,29 @@ def _recover_payment_proof_on_order(uid: int, oid: int) -> bool:
     return True
 
 
+def _find_active_postpaid_order_id(uid: int) -> Optional[int]:
+    """Заказ со скрином, ждёт адрес (postpaid_thread мог потеряться после рестарта)."""
+    best_oid: Optional[int] = None
+    best_ts = 0.0
+    for raw_oid, rec in ORDERS.items():
+        if not isinstance(rec, dict):
+            continue
+        if int(rec.get("user_id") or 0) != int(uid):
+            continue
+        if rec.get("paid") or rec.get("checkout_submitted_to_admin"):
+            continue
+        if not _order_has_payment_proof(rec):
+            continue
+        try:
+            ts = float(rec.get("created_at") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts >= best_ts:
+            best_ts = ts
+            best_oid = int(raw_oid)
+    return best_oid
+
+
 def _kb_postpaid_submit(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -6236,9 +6259,31 @@ async def _collect_postpaid_client_message(
             pass
         return True
     _postpaid_append_detail(o, chunk)
-    save_state()
-    ok, reason = await _finalize_order_submission_to_admin(context, uid, int(oid))
-    await _reply_postpaid_finalize_to_client(msg, ok=ok, reason=reason)
+    details = _postpaid_merged_details(o)
+    o["delivery_details"] = details
+    try:
+        save_state()
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "postpaid collect save uid=%s oid=%s", uid, oid
+        )
+    try:
+        await msg.reply_text(MSG_POSTPAID_SUBMITTED, reply_markup=REPLY_KB)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "postpaid collect ack uid=%s oid=%s", uid, oid
+        )
+    try:
+        ok, reason = await _finalize_order_submission_to_admin(
+            context, uid, int(oid), delivery_details=details
+        )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "postpaid finalize uid=%s oid=%s", uid, oid
+        )
+        ok, reason = False, "admin_fail"
+    if not ok and reason not in ("already", "ok"):
+        await _reply_postpaid_finalize_to_client(msg, ok=ok, reason=reason)
     return True
 
 
@@ -6291,6 +6336,8 @@ async def _finalize_order_submission_to_admin(
     context: ContextTypes.DEFAULT_TYPE,
     uid: int,
     oid: int,
+    *,
+    delivery_details: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """Скрин + адрес + карточка заказа админу; синк на сайт; очистка корзины."""
     log = logging.getLogger(__name__)
@@ -6300,7 +6347,7 @@ async def _finalize_order_submission_to_admin(
         return False, "stale"
     if o.get("checkout_submitted_to_admin"):
         return True, "already"
-    details = _postpaid_merged_details(o)
+    details = str(delivery_details or "").strip() or _postpaid_merged_details(o)
     if not details:
         return False, "empty"
     if not _order_has_payment_proof(o):
@@ -6309,6 +6356,8 @@ async def _finalize_order_submission_to_admin(
     if not fid or not o.get("payment_proof_submitted"):
         return False, "no_proof"
     o["delivery_details"] = details
+    if not o.get("delivery_details_parts"):
+        o["delivery_details_parts"] = [details]
     try:
         await _sync_site_order_checkout_complete(int(oid), o)
     except Exception:
@@ -12877,12 +12926,7 @@ async def on_customer_proof_media(
                 if ok:
                     raise ApplicationHandlerStop
 
-        # Мгновенный ответ — до save_state / Redis (иначе «тишина» 10–30 с).
-        try:
-            await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
-        except Exception:
-            log.exception("proof_media instant ack uid=%s", uid)
-
+        # Сохранение и ответ клиенту — в _on_payment_proof_photo_body (без дубля «получили скрин»).
         proof_oid = _resolve_payment_step_order_id(uid, ud, msg)
         if proof_oid is not None:
             _bind_proof_upload_session(uid, ud, int(proof_oid), persist=False)
@@ -13594,6 +13638,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     thread_oid = _user_state_get(uid, "postpaid_thread_oid")
+    if thread_oid is None and uid:
+        thread_oid = _find_active_postpaid_order_id(uid)
+        if thread_oid is not None:
+            _user_state_set(uid, "postpaid_thread_oid", int(thread_oid))
     if thread_oid is not None and uid:
         if text in REPLY_MENU_TEXTS:
             _user_state_pop(uid, "postpaid_thread_oid")
@@ -13601,13 +13649,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text(MSG_EMPTY_INPUT)
             return
         else:
-            ok = await _collect_postpaid_client_message(
-                context,
-                uid=uid,
-                oid=int(thread_oid),
-                body_text=text,
-                msg=msg,
-            )
+            try:
+                ok = await _collect_postpaid_client_message(
+                    context,
+                    uid=uid,
+                    oid=int(thread_oid),
+                    body_text=text,
+                    msg=msg,
+                )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "postpaid text uid=%s oid=%s", uid, thread_oid
+                )
+                try:
+                    await msg.reply_text(MSG_POSTPAID_SUBMIT_FAIL, reply_markup=REPLY_KB)
+                except Exception:
+                    pass
+                return
             if not ok:
                 try:
                     await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
