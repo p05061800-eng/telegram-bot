@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-checkout-repush-v46"
+BOT_BUILD_ID = "2026-06-21-shipping-address-v47"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -5172,6 +5172,13 @@ def _ensure_order_in_orders(oid: int, uid: int) -> Optional[dict]:
         pc = str(rec.get("payment_currency") or "").strip().upper()
         if pc in ("BYN", "RUB"):
             rebuilt["payment_currency"] = pc
+        fid = str(rec.get("proof_file_id") or "").strip()
+        if fid:
+            rebuilt["proof_file_id"] = fid
+        if rec.get("payment_proof_submitted"):
+            rebuilt["payment_proof_submitted"] = True
+        if rec.get("delivery_details"):
+            rebuilt["delivery_details"] = str(rec.get("delivery_details"))
         try:
             cgt = int(rec.get("checkout_grand_total") or 0)
         except (TypeError, ValueError):
@@ -6147,6 +6154,7 @@ def _resolve_postpaid_thread_oid(
     uid: int, user_data: Optional[dict]
 ) -> Optional[int]:
     """Активный заказ «ждём адрес» — user_data, user_states, ORDERS, awaiting_payment."""
+    _refresh_orders_state_from_redis()
     ud = user_data if isinstance(user_data, dict) else {}
     raw = ud.get("postpaid_thread_oid")
     if raw is not None:
@@ -6222,14 +6230,65 @@ def _kb_postpaid_submit(order_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def _sync_order_record_to_user_orders(uid: int, oid: int, o: dict) -> None:
+    """Сохранить снимок заказа в USER_ORDERS (переживает рестарт / rebuild ORDERS)."""
+    try:
+        uid_i = int(uid)
+        oid_s = str(int(oid))
+    except (TypeError, ValueError):
+        return
+    if not isinstance(o, dict):
+        return
+    lst = USER_ORDERS.setdefault(uid_i, [])
+    for rec in lst:
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("id") or "").strip() != oid_s:
+            continue
+        rec["items"] = deepcopy(list(o.get("items") or rec.get("items") or []))
+        if o.get("total") is not None:
+            rec["total"] = int(o.get("total") or 0)
+        if o.get("checkout_grand_total") is not None:
+            rec["checkout_grand_total"] = int(o.get("checkout_grand_total") or 0)
+        if o.get("checkout_grand_currency"):
+            rec["checkout_grand_currency"] = str(o.get("checkout_grand_currency"))
+        if o.get("payment_currency"):
+            rec["payment_currency"] = str(o.get("payment_currency"))
+        if o.get("delivery"):
+            rec["delivery"] = deepcopy(o.get("delivery"))
+        if o.get("delivery_details"):
+            rec["delivery_details"] = str(o.get("delivery_details"))
+        if o.get("proof_file_id"):
+            rec["proof_file_id"] = str(o.get("proof_file_id"))
+        if o.get("payment_proof_submitted"):
+            rec["payment_proof_submitted"] = True
+        if o.get("checkout_fingerprint"):
+            rec["checkout_fingerprint"] = str(o.get("checkout_fingerprint"))
+        return
+    USER_ORDERS[uid_i].append(
+        {
+            "id": oid_s,
+            "items": deepcopy(list(o.get("items") or [])),
+            "total": int(o.get("total") or 0),
+            "delivery": deepcopy(o.get("delivery") if isinstance(o.get("delivery"), dict) else {}),
+            "status": str(o.get("status") or "new"),
+            "proof_file_id": str(o.get("proof_file_id") or ""),
+            "payment_proof_submitted": bool(o.get("payment_proof_submitted")),
+        }
+    )
+
+
 def _postpaid_shipping_collect_active(uid: int, oid: int) -> bool:
     """Сбор адреса после скрина — только если чек уже сохранён (или заказ уже у админа)."""
-    o = ORDERS.get(int(oid))
+    o = _ensure_order_in_orders(int(oid), int(uid)) or ORDERS.get(int(oid))
     if not o or int(o.get("user_id") or 0) != int(uid):
         return False
     if o.get("checkout_submitted_to_admin"):
         return True
-    return _order_has_payment_proof(o)
+    if not _order_has_payment_proof(o):
+        _recover_payment_proof_on_order(int(uid), int(oid))
+        o = _ensure_order_in_orders(int(oid), int(uid)) or ORDERS.get(int(oid))
+    return bool(o and _order_has_payment_proof(o))
 
 
 def _delivery_text_looks_valid(text: str) -> bool:
@@ -6384,8 +6443,14 @@ async def _collect_postpaid_client_message(
             photo_file_id=photo_file_id,
         )
     if not _postpaid_shipping_collect_active(uid, int(oid)):
+        _recover_payment_proof_on_order(int(uid), int(oid))
+    if not _postpaid_shipping_collect_active(uid, int(oid)):
         _user_state_pop(uid, "postpaid_thread_oid")
-        return False
+        try:
+            await msg.reply_text(MSG_POSTPAID_RESEND_PROOF, reply_markup=REPLY_KB)
+        except Exception:
+            pass
+        return True
     chunk = str(body_text or "").strip()
     if photo_file_id and not chunk:
         try:
@@ -6402,6 +6467,7 @@ async def _collect_postpaid_client_message(
     _postpaid_append_detail(o, chunk)
     details = _postpaid_merged_details(o)
     o["delivery_details"] = details
+    _sync_order_record_to_user_orders(int(uid), int(oid), o)
     log.info(
         "postpaid collect submit uid=%s oid=%s details_len=%s",
         uid,
@@ -6412,31 +6478,35 @@ async def _collect_postpaid_client_message(
         await msg.reply_text(MSG_POSTPAID_SUBMITTED, reply_markup=REPLY_KB)
     except Exception:
         log.exception("postpaid collect ack uid=%s oid=%s", uid, oid)
-    try:
-        await asyncio.to_thread(save_state)
-    except Exception:
-        log.exception("postpaid collect save uid=%s oid=%s", uid, oid)
-    try:
-        ok, reason = await _finalize_order_submission_to_admin(
-            context, uid, int(oid), delivery_details=details
-        )
-    except Exception:
-        log.exception("postpaid finalize uid=%s oid=%s", uid, oid)
-        ok, reason = False, "admin_fail"
-    log.info(
-        "postpaid finalize done uid=%s oid=%s ok=%s reason=%s",
-        uid,
-        oid,
-        ok,
-        reason,
-    )
-    if not ok and reason not in ("already", "ok"):
-        await _reply_postpaid_finalize_to_client(msg, ok=ok, reason=reason)
-    else:
+
+    async def _finalize_postpaid_submission() -> None:
         try:
             await asyncio.to_thread(save_state)
         except Exception:
-            log.exception("postpaid finalize save uid=%s oid=%s", uid, oid)
+            log.exception("postpaid collect save uid=%s oid=%s", uid, oid)
+        try:
+            ok, reason = await _finalize_order_submission_to_admin(
+                context, uid, int(oid), delivery_details=details
+            )
+        except Exception:
+            log.exception("postpaid finalize uid=%s oid=%s", uid, oid)
+            ok, reason = False, "admin_fail"
+        log.info(
+            "postpaid finalize done uid=%s oid=%s ok=%s reason=%s",
+            uid,
+            oid,
+            ok,
+            reason,
+        )
+        if not ok and reason not in ("already", "ok"):
+            await _reply_postpaid_finalize_to_client(msg, ok=ok, reason=reason)
+        else:
+            try:
+                await asyncio.to_thread(save_state)
+            except Exception:
+                log.exception("postpaid finalize save uid=%s oid=%s", uid, oid)
+
+    asyncio.create_task(_finalize_postpaid_submission())
     return True
 
 
@@ -13623,6 +13693,7 @@ async def _on_payment_proof_photo_body(
     o.pop("checkout_submitted_to_admin", None)
     o.pop("delivery_details_parts", None)
     o.pop("delivery_details", None)
+    _sync_order_record_to_user_orders(int(uid), int(oid), o)
     try:
         save_state()
     except Exception:
@@ -14020,13 +14091,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = msg.text.strip()
     user_data = context.user_data
     uid = msg.from_user.id if msg.from_user else 0
-    if uid:
-        _remember_user_message(
-            uid,
-            getattr(msg.from_user, "username", None) if msg.from_user else None,
-            "text",
-            msg.text,
-        )
 
     thread_oid = _resolve_postpaid_thread_oid(uid, user_data)
     if thread_oid is not None and uid:
@@ -14063,10 +14127,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             if not ok:
                 try:
-                    await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
+                    await msg.reply_text(MSG_SEND_SUPPORT_FAIL, reply_markup=REPLY_KB)
                 except Exception:
                     pass
             return
+
+    if uid:
+        _remember_user_message(
+            uid,
+            getattr(msg.from_user, "username", None) if msg.from_user else None,
+            "text",
+            msg.text,
+            persist=False,
+        )
 
     if _user_state_get(uid, "awaiting_proof") is not None:
         if text in REPLY_MENU_TEXTS:
