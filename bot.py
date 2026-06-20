@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-payment-total-fin-v45"
+BOT_BUILD_ID = "2026-06-21-checkout-repush-v46"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -238,6 +238,7 @@ SITE_LOGIN_PENDING_ORDER: Dict[int, str] = {}
 PENDING_SITE_ORDER_BY_USER: Dict[int, str] = {}
 # Уже отправленный в чат checkout с сайта (uid:order_id → timestamp), без дублей при /start.
 _SITE_CHECKOUT_PUSHED: Dict[str, float] = {}
+_SITE_CHECKOUT_PUSHED_FP: Dict[str, str] = {}
 _SITE_CHECKOUT_DEDUP_SEC = 600.0
 USER_FAVORITES: dict = {}
 # Списки избранного в POST /api/sync/state, /api/sync/cart, /api/verify-code (ключ «items» сюда
@@ -9054,6 +9055,83 @@ def _normalize_site_order_ref(raw: object) -> str:
     return str(raw or "").strip()
 
 
+def _site_order_checkout_fingerprint(
+    uid: int,
+    norm: dict,
+    user_data: Optional[dict] = None,
+) -> str:
+    """Сигнатура checkout: доставка + состав + итог (для повторной отправки при изменениях)."""
+    if not isinstance(norm, dict):
+        return ""
+    ud = user_data if isinstance(user_data, dict) else {}
+    lines = list(norm.get("items") or [])
+    d = norm.get("delivery") if isinstance(norm.get("delivery"), dict) else {}
+    cc = str(d.get("country") or "").strip().lower()
+    meta = _prepare_site_checkout_meta(int(uid), norm)
+    if cc not in DELIVERY_OPTIONS:
+        cc = _checkout_delivery_cc(int(uid), ud, meta)
+    total, pay_cur, _ = _resolve_site_confirm_pricing(
+        int(uid),
+        ud,
+        lines,
+        meta,
+        delivery_cc=cc if cc in DELIVERY_OPTIONS else None,
+    )
+    bits: List[str] = [cc, str(int(total)), str(pay_cur)]
+    for x in sorted(
+        lines,
+        key=lambda i: str(
+            (i or {}).get("ref") or (i or {}).get("name") or ""
+        ),
+    ):
+        if not isinstance(x, dict):
+            continue
+        bits.append(
+            f"{x.get('ref') or x.get('name')}:"
+            f"{int(x.get('qty') or 1)}:{int(x.get('price') or 0)}"
+        )
+    return "|".join(bits)
+
+
+def _order_checkout_fingerprint_from_record(
+    uid: int,
+    order: dict,
+    user_data: Optional[dict] = None,
+) -> str:
+    if not isinstance(order, dict):
+        return ""
+    return _site_order_checkout_fingerprint(
+        int(uid),
+        {
+            "items": order.get("items"),
+            "delivery": order.get("delivery"),
+            "external_id": order.get("external_id"),
+        },
+        user_data,
+    )
+
+
+def _site_checkout_existing_fingerprint(
+    uid: int,
+    order_ref: Optional[str],
+) -> str:
+    ref = _normalize_site_order_ref(order_ref)
+    if not ref:
+        return ""
+    existing = _find_unpaid_bot_order_by_external_id(int(uid), ref)
+    if existing is None and re.fullmatch(r"\d+", ref):
+        pend = _normalize_site_order_ref(PENDING_SITE_ORDER_BY_USER.get(int(uid)))
+        if pend:
+            existing = _find_unpaid_bot_order_by_external_id(int(uid), pend)
+    if existing is None:
+        return ""
+    po = ORDERS.get(int(existing)) or {}
+    stored = str(po.get("checkout_fingerprint") or "").strip()
+    if stored:
+        return stored
+    return _order_checkout_fingerprint_from_record(int(uid), po)
+
+
 def _site_checkout_push_keys(uid: int, order_ref: Optional[str]) -> List[str]:
     """Ключи дедупа: UUID, compact UUID, buyer_seq и pending с сайта."""
     uid_i = int(uid)
@@ -9079,18 +9157,38 @@ def _site_checkout_push_keys(uid: int, order_ref: Optional[str]) -> List[str]:
     return out
 
 
-def _mark_site_checkout_pushed(uid: int, order_ref: str) -> None:
+def _mark_site_checkout_pushed(
+    uid: int, order_ref: str, *, fingerprint: str = ""
+) -> None:
     ts = time.time()
+    fp = str(fingerprint or "").strip()
     for key in _site_checkout_push_keys(uid, order_ref):
         _SITE_CHECKOUT_PUSHED[key] = ts
+        if fp:
+            _SITE_CHECKOUT_PUSHED_FP[key] = fp
 
 
-def _site_checkout_recently_pushed(uid: int, order_ref: Optional[str] = None) -> bool:
+def _site_checkout_recently_pushed(
+    uid: int,
+    order_ref: Optional[str] = None,
+    norm: Optional[dict] = None,
+) -> bool:
     now = time.time()
+    new_fp = _site_order_checkout_fingerprint(int(uid), norm) if norm else ""
+    old_fp = _site_checkout_existing_fingerprint(int(uid), order_ref)
+    if new_fp and old_fp and new_fp != old_fp:
+        return False
     for key in _site_checkout_push_keys(uid, order_ref):
         ts = _SITE_CHECKOUT_PUSHED.get(key)
-        if isinstance(ts, (int, float)) and (now - float(ts)) < _SITE_CHECKOUT_DEDUP_SEC:
-            return True
+        if not isinstance(ts, (int, float)):
+            continue
+        if (now - float(ts)) >= _SITE_CHECKOUT_DEDUP_SEC:
+            continue
+        if new_fp:
+            pushed_fp = str(_SITE_CHECKOUT_PUSHED_FP.get(key) or "").strip()
+            if pushed_fp and pushed_fp != new_fp:
+                continue
+        return True
     ref = _normalize_site_order_ref(order_ref)
     if ref:
         existing = _find_unpaid_bot_order_by_external_id(int(uid), ref)
@@ -9103,6 +9201,8 @@ def _site_checkout_recently_pushed(uid: int, order_ref: Optional[str] = None) ->
             if not po.get("paid") and not po.get("checkout_submitted_to_admin"):
                 pend_pay = _resolve_awaiting_payment_order_id(int(uid), {})
                 if pend_pay is not None and int(pend_pay) == int(existing):
+                    if new_fp and old_fp and new_fp != old_fp:
+                        return False
                     return True
     return False
 
@@ -9260,6 +9360,7 @@ async def _begin_site_checkout_order(
         return None
     meta = _prepare_site_checkout_meta(int(uid), norm)
     ext_id = str(meta.get("external_id") or "").strip()
+    checkout_fp = _site_order_checkout_fingerprint(int(uid), norm, ud)
     d_norm = norm.get("delivery") if isinstance(norm.get("delivery"), dict) else {}
     cc_norm = str(d_norm.get("country") or "").strip().lower()
     existing = _find_unpaid_bot_order_by_external_id(int(uid), ext_id) if ext_id else None
@@ -9281,6 +9382,7 @@ async def _begin_site_checkout_order(
         po["delivery"] = deepcopy(drec)
         po["items"] = deepcopy(list(lines))
         po["total_goods"] = int(goods_total)
+        po["checkout_fingerprint"] = str(checkout_fp)
         ORDERS[int(existing)] = po
         _set_awaiting_payment_order_id(int(uid), ud, int(existing))
         save_state()
@@ -9335,6 +9437,7 @@ async def _begin_site_checkout_order(
     ORDERS[int(oid)]["checkout_grand_total"] = int(total)
     ORDERS[int(oid)]["checkout_grand_currency"] = str(pay_cur)
     ORDERS[int(oid)]["payment_total_locked"] = True
+    ORDERS[int(oid)]["checkout_fingerprint"] = str(checkout_fp)
     if int(dl_bonus_applied) > 0:
         ORDERS[int(oid)]["bonus_applied"] = int(dl_bonus_applied)
     if int(dl_bonus_points_spent) > 0:
@@ -9379,7 +9482,13 @@ async def _present_site_order_checkout_flow(
     ext_id = str(
         norm.get("external_id") or norm.get("order_id") or norm.get("id") or ""
     ).strip()
-    if _site_checkout_recently_pushed(int(uid), ext_id or None):
+    ud = context.user_data if context is not None else {}
+    checkout_fp = _site_order_checkout_fingerprint(int(uid), norm, ud)
+    old_fp = _site_checkout_existing_fingerprint(int(uid), ext_id or None)
+    order_updated = bool(
+        checkout_fp and old_fp and checkout_fp != old_fp
+    )
+    if _site_checkout_recently_pushed(int(uid), ext_id or None, norm=norm):
         log.info("skip duplicate site checkout uid=%s order=%s", uid, ext_id)
         if msg is not None:
             try:
@@ -9394,7 +9503,6 @@ async def _present_site_order_checkout_flow(
         products = await load_products() or []
     except Exception:
         products = []
-    ud = context.user_data if context is not None else {}
     body = _format_site_checkout_order_body(
         int(uid), norm, products, user_data=ud
     )
@@ -9416,6 +9524,11 @@ async def _present_site_order_checkout_flow(
             await bot.send_message(chat_id=int(uid), text=text, **kwargs)
 
     try:
+        if order_updated:
+            await _send(
+                "🔄 Заказ обновлён — проверьте доставку и сумму.",
+                reply_markup=REPLY_KB,
+            )
         await _send(START_SITE_TRANSITION_TEXT, reply_markup=REPLY_KB)
         await _send(body, disable_web_page_preview=True)
         await _send(
@@ -9424,7 +9537,7 @@ async def _present_site_order_checkout_flow(
             disable_web_page_preview=True,
         )
         if ext_id:
-            _mark_site_checkout_pushed(int(uid), ext_id)
+            _mark_site_checkout_pushed(int(uid), ext_id, fingerprint=checkout_fp)
         users_touch(int(uid), "payment")
         return True
     except Exception:
@@ -9862,7 +9975,10 @@ async def _try_present_pending_site_order(
     if not oid:
         return False
     PENDING_SITE_ORDER_BY_USER[int(uid)] = oid
-    if _site_checkout_recently_pushed(int(uid), oid):
+    order = await _fetch_order_for_deep_link(oid, int(uid))
+    if not order:
+        return False
+    if _site_checkout_recently_pushed(int(uid), oid, norm=order):
         try:
             await msg.reply_text(
                 MSG_SITE_CHECKOUT_ALREADY_SHOWN, reply_markup=REPLY_KB
@@ -9870,9 +9986,6 @@ async def _try_present_pending_site_order(
         except Exception:
             pass
         return True
-    order = await _fetch_order_for_deep_link(oid, int(uid))
-    if not order:
-        return False
     un = username or _site_checkout_username_label(int(uid), username)
     ok = await _present_site_order_checkout_flow(
         msg=msg,
@@ -9945,12 +10058,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             oid = (PENDING_SITE_ORDER_BY_USER.get(uid) or "").strip() or None
         if oid:
             resolved_oid = _resolve_site_order_ref_from_start(uid, str(oid).strip())
-            if _site_checkout_recently_pushed(uid, resolved_oid or str(oid).strip()):
-                await msg.reply_text(
-                    MSG_SITE_CHECKOUT_ALREADY_SHOWN, reply_markup=REPLY_KB
-                )
-                return
-
             order = await _fetch_order_for_deep_link(resolved_oid or oid, int(uid))
             if not order:
                 await msg.reply_text(
@@ -9964,6 +10071,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 await _send_start_intro_with_site_button(msg, uid, context.user_data)
                 return
+            if _site_checkout_recently_pushed(
+                uid, resolved_oid or str(oid).strip(), norm=order
+            ):
+                await msg.reply_text(
+                    MSG_SITE_CHECKOUT_ALREADY_SHOWN, reply_markup=REPLY_KB
+                )
+                return
+
             await _maybe_thank_first_telegram_auth(msg, uid)
             un = (msg.from_user.username or "").strip().lstrip("@") or None
             ok = await _present_site_order_checkout_flow(
