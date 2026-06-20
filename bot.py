@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-payment-total-delivery-v44"
+BOT_BUILD_ID = "2026-06-21-payment-total-fin-v45"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -4464,7 +4464,15 @@ def _site_cart_checkout_finance(
     inc = _cart_site_delivery_included(uid)
     exp_line = int(goods) if inc else int(goods) + int(d_amt)
     trust_site = False
-    if site_gt_raw and int(site_gt_raw) > 0:
+    req_cc = str(delivery_cc or "by").strip().lower()
+    cart_cc = _cart_price_region_for_user(int(uid), user_data)
+    if (
+        req_cc in DELIVERY_OPTIONS
+        and cart_cc in DELIVERY_OPTIONS
+        and req_cc != cart_cc
+    ):
+        trust_site = False
+    elif site_gt_raw and int(site_gt_raw) > 0:
         sg = int(site_gt_raw)
         if not _site_grand_covers_goods(sg, int(goods)):
             trust_site = False
@@ -4612,6 +4620,13 @@ def _order_payment_display(o: dict) -> Tuple[int, str]:
     if pay_cur not in ("BYN", "RUB"):
         pay_cur = _payment_currency_for_order(o)
     try:
+        checkout_tot = int(o.get("checkout_grand_total") or 0)
+    except (TypeError, ValueError):
+        checkout_tot = 0
+    checkout_cur = str(o.get("checkout_grand_currency") or "").strip().upper()
+    if checkout_tot > 0 and checkout_cur in ("BYN", "RUB"):
+        return int(checkout_tot), checkout_cur
+    try:
         stored = int(o.get("total") or 0)
     except (TypeError, ValueError):
         stored = 0
@@ -4626,6 +4641,33 @@ def _order_payment_display(o: dict) -> Tuple[int, str]:
 
 def _user_has_unpaid_order(uid: int) -> bool:
     return _find_latest_unpaid_order_id(int(uid)) is not None
+
+
+def _checkout_lines_from_sources(
+    uid: int,
+    ud: dict,
+    meta: Optional[dict],
+    order: Optional[dict],
+    lines: Optional[List[dict]] = None,
+) -> List[dict]:
+    """Строки заказа для итога: norm/meta → заказ → корзина."""
+    if isinstance(meta, dict):
+        lh = meta.get("loyalty_hint")
+        if isinstance(lh, dict):
+            raw = lh.get("items")
+            if isinstance(raw, list) and raw:
+                return deepcopy(list(raw))
+        raw = meta.get("items")
+        if isinstance(raw, list) and raw:
+            return deepcopy(list(raw))
+    if isinstance(order, dict):
+        raw = order.get("items")
+        if isinstance(raw, list) and raw:
+            return deepcopy(list(raw))
+    if lines:
+        return deepcopy(list(lines))
+    cart = _cart_get_lines_uid(int(uid), ud)
+    return deepcopy(list(cart)) if cart else []
 
 
 def _checkout_delivery_cc(
@@ -4682,17 +4724,12 @@ def _resolve_site_confirm_pricing(
     }
     fin = _site_cart_checkout_finance(uid, list(lines), cc, ud)
     pay_cur = str(fin["g_cur"])
-    goods = int(fin["goods"])
-    final_total = _site_final_total_from_sources(uid, meta_m, pay_cur)
-    if final_total and int(final_total) > 0 and _site_grand_covers_goods(int(final_total), goods):
-        total = int(final_total)
-    else:
-        total = int(fin["grand_show"])
-        pts, disc = _site_bonus_from_sources(uid, meta_m)
-        if disc <= 0 and pts > 0:
-            disc = _bonus_discount_units(pts, pay_cur)
-        if disc > 0:
-            total = max(0, int(total) - int(disc))
+    total = int(fin["grand_show"])
+    pts, disc = _site_bonus_from_sources(uid, meta_m)
+    if disc <= 0 and pts > 0:
+        disc = _bonus_discount_units(pts, pay_cur)
+    if disc > 0:
+        total = max(0, int(total) - int(disc))
     return int(total), pay_cur, drec
 
 
@@ -4825,7 +4862,7 @@ def _refresh_unpaid_order_payment(
     if not isinstance(o, dict):
         return 0, "BYN"
     meta_m = _merge_site_bonus_into_meta(uid, meta if isinstance(meta, dict) else {})
-    use_lines = list(lines or []) or list(o.get("items") or [])
+    use_lines = _checkout_lines_from_sources(uid, ud, meta_m, o, lines)
     if use_lines:
         drec_o = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
         cc_o = str(drec_o.get("country") or "").strip().lower()
@@ -4854,9 +4891,14 @@ def _refresh_unpaid_order_payment(
             o["bonus_points_spent"] = int(b_ps)
         if int(total) > 0:
             o["total"] = int(total)
+            o["checkout_grand_total"] = int(total)
+            o["checkout_grand_currency"] = str(pay_cur)
             o["payment_currency"] = str(pay_cur)
             o["payment_total_locked"] = True
         return int(o.get("total") or 0), str(o.get("payment_currency") or pay_cur)
+    existing_tot, existing_cur = _order_payment_display(o)
+    if existing_tot > 0 and o.get("payment_total_locked"):
+        return int(existing_tot), str(existing_cur)
     total = 0
     pay_cur = "BYN"
     parsed: Optional[Tuple[int, str]] = None
@@ -4866,16 +4908,10 @@ def _refresh_unpaid_order_payment(
             break
     if parsed:
         total, pay_cur = int(parsed[0]), str(parsed[1])
-    else:
-        try:
-            locked = int(meta_m.get("preview_pay_total") or 0)
-        except (TypeError, ValueError):
-            locked = 0
-        locked_cur = str(meta_m.get("preview_pay_currency") or "").strip().upper()
-        if locked > 0 and locked_cur in ("BYN", "RUB"):
-            total, pay_cur = int(locked), locked_cur
     if total > 0:
         o["total"] = int(total)
+        o["checkout_grand_total"] = int(total)
+        o["checkout_grand_currency"] = str(pay_cur)
         o["payment_currency"] = str(pay_cur)
         o["payment_total_locked"] = True
     return int(o.get("total") or 0), str(o.get("payment_currency") or pay_cur)
@@ -5135,6 +5171,15 @@ def _ensure_order_in_orders(oid: int, uid: int) -> Optional[dict]:
         pc = str(rec.get("payment_currency") or "").strip().upper()
         if pc in ("BYN", "RUB"):
             rebuilt["payment_currency"] = pc
+        try:
+            cgt = int(rec.get("checkout_grand_total") or 0)
+        except (TypeError, ValueError):
+            cgt = 0
+        cgc = str(rec.get("checkout_grand_currency") or "").strip().upper()
+        if cgt > 0 and cgc in ("BYN", "RUB"):
+            rebuilt["checkout_grand_total"] = int(cgt)
+            rebuilt["checkout_grand_currency"] = str(cgc)
+            rebuilt["payment_total_locked"] = True
         if rec.get("bonus_applied") is not None:
             try:
                 rebuilt["bonus_applied"] = int(rec.get("bonus_applied"))
@@ -5439,6 +5484,16 @@ async def _notify_admin_new_order(
         rec["bonus_applied"] = int(bonus_applied)
     if int(bonus_points_spent) > 0:
         rec["bonus_points_spent"] = int(bonus_points_spent)
+    if int(total) > 0:
+        pay_cur = str(drec.get("currency") or "").strip().upper()
+        if pay_cur not in ("BYN", "RUB"):
+            pay_cur = _goods_currency_for_delivery_country(
+                str(drec.get("country") or "by")
+            )
+        rec["checkout_grand_total"] = int(total)
+        rec["checkout_grand_currency"] = str(pay_cur)
+        rec["payment_currency"] = str(pay_cur)
+        rec["payment_total_locked"] = True
     ORDERS[order_id] = rec
     if uid:
         users_touch(uid, activity_only=True)
@@ -9200,7 +9255,7 @@ async def _begin_site_checkout_order(
     """Создать заказ в боте и открыть шаг оплаты (без кнопки «Подтвердить»)."""
     ud = user_data if isinstance(user_data, dict) else {}
     _apply_site_order_norm_to_user_cart(int(uid), norm)
-    lines = list(_cart_get_lines_uid(int(uid), ud))
+    lines = deepcopy(list(norm.get("items") or _cart_get_lines_uid(int(uid), ud)))
     if not lines:
         return None
     meta = _prepare_site_checkout_meta(int(uid), norm)
@@ -9219,6 +9274,8 @@ async def _begin_site_checkout_order(
         )
         goods_total, _ = _cart_totals(list(lines))
         po["total"] = int(total)
+        po["checkout_grand_total"] = int(total)
+        po["checkout_grand_currency"] = str(pay_cur)
         po["payment_currency"] = str(pay_cur)
         po["payment_total_locked"] = True
         po["delivery"] = deepcopy(drec)
@@ -9275,6 +9332,8 @@ async def _begin_site_checkout_order(
     ORDERS[int(oid)]["clear_cart_on_paid"] = True
     ORDERS[int(oid)]["total_goods"] = int(goods_total)
     ORDERS[int(oid)]["payment_currency"] = str(pay_cur)
+    ORDERS[int(oid)]["checkout_grand_total"] = int(total)
+    ORDERS[int(oid)]["checkout_grand_currency"] = str(pay_cur)
     ORDERS[int(oid)]["payment_total_locked"] = True
     if int(dl_bonus_applied) > 0:
         ORDERS[int(oid)]["bonus_applied"] = int(dl_bonus_applied)
@@ -9284,9 +9343,13 @@ async def _begin_site_checkout_order(
         "id": str(oid),
         "items": deepcopy(list(lines)),
         "total": int(total),
+        "checkout_grand_total": int(total),
+        "checkout_grand_currency": str(pay_cur),
         "total_goods": int(goods_total),
         "delivery": deepcopy(drec),
         "status": "В обработке",
+        "payment_currency": str(pay_cur),
+        "payment_total_locked": True,
     }
     if ext_id:
         order_rec["external_id"] = ext_id
@@ -12581,7 +12644,13 @@ async def on_payment_method(
             uid,
             ud,
             preview_text=_get_site_pending_preview(uid) or msg_txt,
-            lines=list(o.get("items") or []) or _cart_get_lines_uid(uid, ud),
+            lines=_checkout_lines_from_sources(
+                uid,
+                ud,
+                _get_site_pending_meta(uid, ud),
+                o,
+                _cart_get_lines_uid(uid, ud),
+            ),
             meta=_get_site_pending_meta(uid, ud),
         )
         if o.get("paid"):
