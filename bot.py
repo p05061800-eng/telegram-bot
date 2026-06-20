@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-shipping-text-reply-v42"
+BOT_BUILD_ID = "2026-06-21-payment-total-match-v43"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -4794,9 +4794,35 @@ def _refresh_unpaid_order_payment(
     lines: Optional[List[dict]] = None,
     meta: Optional[dict] = None,
 ) -> Tuple[int, str]:
-    """Подтянуть итог/валюту оплаты из текущего превью (не из устаревшего ORDERS)."""
+    """Подтянуть итог/валюту оплаты — те же правила, что в «💰 Итого» checkout-сообщения."""
     if not isinstance(o, dict):
         return 0, "BYN"
+    meta_m = _merge_site_bonus_into_meta(uid, meta if isinstance(meta, dict) else {})
+    if lines:
+        total, pay_cur, drec = _resolve_site_confirm_pricing(
+            uid, ud, list(lines), meta_m
+        )
+        o["delivery"] = deepcopy(drec)
+        goods, _ = _cart_totals(list(lines))
+        o["items"] = deepcopy(list(lines))
+        o["total_goods"] = int(goods)
+        try:
+            b_ap = int(meta_m.get("bonus_applied") or 0)
+        except (TypeError, ValueError):
+            b_ap = 0
+        if b_ap > 0:
+            o["bonus_applied"] = int(b_ap)
+        try:
+            b_ps = int(meta_m.get("bonus_points_spent") or 0)
+        except (TypeError, ValueError):
+            b_ps = 0
+        if b_ps > 0:
+            o["bonus_points_spent"] = int(b_ps)
+        if int(total) > 0:
+            o["total"] = int(total)
+            o["payment_currency"] = str(pay_cur)
+            o["payment_total_locked"] = True
+        return int(o.get("total") or 0), str(o.get("payment_currency") or pay_cur)
     total = 0
     pay_cur = "BYN"
     parsed: Optional[Tuple[int, str]] = None
@@ -4807,7 +4833,6 @@ def _refresh_unpaid_order_payment(
     if parsed:
         total, pay_cur = int(parsed[0]), str(parsed[1])
     else:
-        meta_m = _merge_site_bonus_into_meta(uid, meta if isinstance(meta, dict) else {})
         try:
             locked = int(meta_m.get("preview_pay_total") or 0)
         except (TypeError, ValueError):
@@ -4815,27 +4840,6 @@ def _refresh_unpaid_order_payment(
         locked_cur = str(meta_m.get("preview_pay_currency") or "").strip().upper()
         if locked > 0 and locked_cur in ("BYN", "RUB"):
             total, pay_cur = int(locked), locked_cur
-        elif lines:
-            total, pay_cur, drec = _resolve_site_confirm_pricing(
-                uid, ud, list(lines), meta_m
-            )
-            o["delivery"] = deepcopy(drec)
-            goods, _ = _cart_totals(list(lines))
-            o["items"] = deepcopy(list(lines))
-            o["total_goods"] = int(goods)
-        if isinstance(meta_m, dict):
-            try:
-                b_ap = int(meta_m.get("bonus_applied") or 0)
-            except (TypeError, ValueError):
-                b_ap = 0
-            if b_ap > 0:
-                o["bonus_applied"] = int(b_ap)
-            try:
-                b_ps = int(meta_m.get("bonus_points_spent") or 0)
-            except (TypeError, ValueError):
-                b_ps = 0
-            if b_ps > 0:
-                o["bonus_points_spent"] = int(b_ps)
     if total > 0:
         o["total"] = int(total)
         o["payment_currency"] = str(pay_cur)
@@ -9170,10 +9174,18 @@ async def _begin_site_checkout_order(
     existing = _find_unpaid_bot_order_by_external_id(int(uid), ext_id) if ext_id else None
     if existing is not None:
         po = ORDERS.get(int(existing)) or {}
-        tot, pay_cur = _order_payment_display(po)
+        total, pay_cur, drec = _resolve_site_confirm_pricing(int(uid), ud, lines, meta)
+        goods_total, _ = _cart_totals(list(lines))
+        po["total"] = int(total)
+        po["payment_currency"] = str(pay_cur)
+        po["payment_total_locked"] = True
+        po["delivery"] = deepcopy(drec)
+        po["items"] = deepcopy(list(lines))
+        po["total_goods"] = int(goods_total)
+        ORDERS[int(existing)] = po
         _set_awaiting_payment_order_id(int(uid), ud, int(existing))
         save_state()
-        return int(existing), int(tot), str(pay_cur)
+        return int(existing), int(total), str(pay_cur)
     total, pay_cur, drec = _resolve_site_confirm_pricing(int(uid), ud, lines, meta)
     goods_total, _ = _cart_totals(list(lines))
     dl_bonus_applied = 0
