@@ -3865,6 +3865,22 @@ SUPPORT_INTRO_TEXT = (
 )
 
 
+async def _activate_user_support_chat(
+    msg: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    uid: int,
+    *,
+    reply_markup=None,
+) -> None:
+    """Режим «Связь»: с сайта (?start=support), кнопка меню или чек."""
+    await _delete_user_temp_messages(context.bot, uid)
+    _clear_checkout_delivery(context.user_data)
+    context.user_data.pop("pending_order", None)
+    _user_state_pop(uid, "postpaid_thread_oid")
+    user_support_state[uid] = True
+    await msg.reply_text(SUPPORT_INTRO_TEXT, reply_markup=reply_markup)
+
+
 def _format_caption(p: dict) -> str:
     name = p.get("name") or "Без названия"
     category = p.get("category") or ""
@@ -10206,7 +10222,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _is_web_login_start_payload(jl) or _is_web_login_start_payload(fl)
     )
     is_order_link = bool(args) and bool(_parse_order_id_from_start_args(list(args)))
-    if not is_web_login and not is_order_link:
+    is_support_link = bool(args) and (fl == "support" or jl == "support")
+    if not is_web_login and not is_order_link and not is_support_link:
         await _reply_site_transition_notice(msg, uid)
     if args:
         if is_web_login:
@@ -10295,6 +10312,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 _telegram_login_code_message(code),
                 reply_markup=REPLY_KB,
             )
+            return
+        if fl == "support" or jl == "support":
+            await _maybe_thank_first_telegram_auth(msg, uid)
+            await _activate_user_support_chat(msg, context, uid, reply_markup=REPLY_KB)
             return
         if jl in START_IGNORED_DEEP_LINK or fl in START_IGNORED_DEEP_LINK:
             if await _maybe_prompt_site_cart_confirmation(
@@ -14038,8 +14059,7 @@ async def on_receipt_callback(
         body, kb = await _format_mine_orders_text_and_kb(uid)
         await q.message.reply_text(body, reply_markup=kb)
     else:
-        user_support_state[uid] = True
-        await q.message.reply_text(SUPPORT_INTRO_TEXT)
+        await _activate_user_support_chat(q.message, context, uid)
 
 
 async def on_admin_reject_payment(
@@ -14430,12 +14450,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not uid:
             await msg.reply_text(FALLBACK_USER_TEXT)
             return
-        await _delete_user_temp_messages(context.bot, uid)
-        _clear_checkout_delivery(user_data)
-        user_data.pop("pending_order", None)
-        _user_state_pop(uid, "postpaid_thread_oid")
-        user_support_state[uid] = True
-        await msg.reply_text(SUPPORT_INTRO_TEXT)
+        await _activate_user_support_chat(msg, context, uid)
         return
 
     if uid and user_support_state.get(uid):
