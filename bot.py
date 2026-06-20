@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-shipping-address-v47"
+BOT_BUILD_ID = "2026-06-21-shipping-session-v48"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -1264,6 +1264,7 @@ MSG_POSTPAID_THREAD_CLOSED = (
     "По этому заказу оформление завершено. Общие вопросы — кнопка «Связь»."
 )
 MSG_POSTPAID_THREAD_STALE = "Заказ не найден. Если нужна помощь — «Связь»."
+MSG_POSTPAID_FORWARDED_OK = "✅ Сообщение передано менеджеру."
 MSG_CALLBACK_STALE_ORDER = (
     "Кнопка от старого сообщения или сессия заказа уже неактивна. "
     "Отправьте /start или откройте ссылку с сайта ещё раз."
@@ -6154,18 +6155,22 @@ def _resolve_postpaid_thread_oid(
     uid: int, user_data: Optional[dict]
 ) -> Optional[int]:
     """Активный заказ «ждём адрес» — user_data, user_states, ORDERS, awaiting_payment."""
-    _refresh_orders_state_from_redis()
     ud = user_data if isinstance(user_data, dict) else {}
-    raw = ud.get("postpaid_thread_oid")
-    if raw is not None:
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            pass
-    tid = _user_state_get(uid, "postpaid_thread_oid")
-    if tid is not None:
-        ud["postpaid_thread_oid"] = int(tid)
-        return int(tid)
+    for src in (
+        ud.get("postpaid_thread_oid"),
+        ud.get("awaiting_shipping_oid"),
+    ):
+        if src is not None:
+            try:
+                return int(src)
+            except (TypeError, ValueError):
+                pass
+    for key in ("postpaid_thread_oid", "awaiting_shipping_oid"):
+        tid = _user_state_get(uid, key)
+        if tid is not None:
+            ud["postpaid_thread_oid"] = int(tid)
+            ud["awaiting_shipping_oid"] = int(tid)
+            return int(tid)
     active = _find_active_postpaid_order_id(uid)
     if active is not None:
         return int(active)
@@ -6191,7 +6196,37 @@ def _bind_postpaid_thread_oid(
     oid_i = int(oid)
     if isinstance(user_data, dict):
         user_data["postpaid_thread_oid"] = oid_i
-    _user_state_set(uid, "postpaid_thread_oid", oid_i, persist=persist)
+        user_data["awaiting_shipping_oid"] = oid_i
+    b = _user_state_bucket(uid)
+    b["postpaid_thread_oid"] = oid_i
+    b["awaiting_shipping_oid"] = oid_i
+    if persist:
+        try:
+            save_state()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "bind_postpaid save_state uid=%s oid=%s", uid, oid_i
+            )
+
+
+def _clear_postpaid_thread_if_matches(uid: int, order_id: int) -> None:
+    try:
+        oid_i = int(order_id)
+    except (TypeError, ValueError):
+        return
+    cleared = False
+    for key in ("postpaid_thread_oid", "awaiting_shipping_oid"):
+        tid = _user_state_get(uid, key)
+        if tid is not None and int(tid) == oid_i:
+            _user_state_pop(uid, key, persist=False)
+            cleared = True
+    if cleared:
+        try:
+            save_state()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "clear_postpaid save_state uid=%s oid=%s", uid, oid_i
+            )
 
 
 def _find_active_postpaid_order_id(uid: int) -> Optional[int]:
@@ -6205,6 +6240,12 @@ def _find_active_postpaid_order_id(uid: int) -> Optional[int]:
             continue
         if rec.get("paid") or rec.get("checkout_submitted_to_admin"):
             continue
+        if not _order_has_payment_proof(rec):
+            try:
+                _recover_payment_proof_on_order(int(uid), int(raw_oid))
+            except Exception:
+                pass
+            rec = ORDERS.get(int(raw_oid)) or rec
         if not _order_has_payment_proof(rec):
             continue
         try:
@@ -6319,12 +6360,6 @@ def _kb_admin_postpaid_reply(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("💬 Ответить", callback_data=f"oam:rep:{order_id}")]]
     )
-
-
-def _clear_postpaid_thread_if_matches(uid: int, order_id: int) -> None:
-    tid = _user_state_get(uid, "postpaid_thread_oid")
-    if tid is not None and int(tid) == int(order_id):
-        _user_state_pop(uid, "postpaid_thread_oid")
 
 
 async def _forward_postpaid_client_payload_to_admin(
@@ -12971,7 +13006,8 @@ async def _on_payment_paid_body(
         return
     if o.get("payment_proof_submitted") and not o.get("checkout_submitted_to_admin"):
         await q.message.reply_text(_postpaid_shipping_prompt_for_order(o))
-        _user_state_set(uid, "postpaid_thread_oid", int(oid))
+        _bind_postpaid_thread_oid(uid, ud, int(oid), persist=False)
+        asyncio.create_task(asyncio.to_thread(save_state))
         return
     if (
         o.get("payment_proof_submitted")
@@ -13669,7 +13705,7 @@ async def _on_payment_proof_photo_body(
         return
     _user_state_pop(uid, "postpaid_thread_oid")
     if o.get("checkout_submitted_to_admin") and o.get("payment_proof_submitted"):
-        _user_state_set(uid, "postpaid_thread_oid", int(oid))
+        _bind_postpaid_thread_oid(uid, ud, int(oid), persist=False)
         await msg.reply_text(MSG_POSTPAID_FORWARDED_OK)
         return
     if o.get("paid"):
@@ -13694,27 +13730,9 @@ async def _on_payment_proof_photo_body(
     o.pop("delivery_details_parts", None)
     o.pop("delivery_details", None)
     _sync_order_record_to_user_orders(int(uid), int(oid), o)
-    try:
-        save_state()
-    except Exception:
-        log.exception("payment_proof_photo proof save uid=%s oid=%s", uid, oid)
     _user_state_pop(uid, "awaiting_proof", persist=False)
     _clear_awaiting_payment_order_id(uid, ud, persist=False)
     uname = getattr(msg.from_user, "username", None) if msg.from_user else None
-    try:
-        _remember_user_message(
-            uid,
-            uname,
-            "photo",
-            f"📸 Чек оплаты заказ #{oid}",
-            persist=False,
-        )
-    except Exception:
-        log.exception("remember payment proof uid=%s oid=%s", uid, oid)
-    try:
-        save_state()
-    except Exception:
-        log.exception("payment_proof_photo save_state uid=%s oid=%s", uid, oid)
     prompt = _postpaid_shipping_prompt_for_order(o)
     try:
         await msg.reply_text(prompt)
@@ -13722,15 +13740,29 @@ async def _on_payment_proof_photo_body(
             uid,
             ud if isinstance(ud, dict) else None,
             int(oid),
-            persist=True,
+            persist=False,
         )
     except Exception:
         log.exception("payment_proof_photo shipping prompt uid=%s oid=%s", uid, oid)
-    try:
-        save_state()
-    except Exception:
-        log.exception("payment_proof_photo save_state2 uid=%s oid=%s", uid, oid)
     log.info("payment_proof_photo ok uid=%s oid=%s awaiting_shipping", uid, oid)
+
+    async def _persist_proof_state() -> None:
+        try:
+            _remember_user_message(
+                uid,
+                uname,
+                "photo",
+                f"📸 Чек оплаты заказ #{oid}",
+                persist=False,
+            )
+        except Exception:
+            log.exception("remember payment proof uid=%s oid=%s", uid, oid)
+        try:
+            await asyncio.to_thread(save_state)
+        except Exception:
+            log.exception("payment_proof_photo save_state uid=%s oid=%s", uid, oid)
+
+    asyncio.create_task(_persist_proof_state())
 
 
 async def on_admin_confirm_payment(
@@ -14091,13 +14123,33 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = msg.text.strip()
     user_data = context.user_data
     uid = msg.from_user.id if msg.from_user else 0
+    log = logging.getLogger(__name__)
 
     thread_oid = _resolve_postpaid_thread_oid(uid, user_data)
+    if thread_oid is None and uid and len(text) >= 8 and text not in REPLY_MENU_TEXTS:
+        recovered = _find_active_postpaid_order_id(int(uid))
+        if recovered is not None:
+            thread_oid = int(recovered)
+            _bind_postpaid_thread_oid(uid, user_data, thread_oid, persist=False)
+            log.info(
+                "postpaid recovered from ORDERS uid=%s oid=%s text_len=%s",
+                uid,
+                thread_oid,
+                len(text),
+            )
+    if thread_oid is not None:
+        log.info(
+            "on_text shipping uid=%s oid=%s text_len=%s",
+            uid,
+            thread_oid,
+            len(text),
+        )
     if thread_oid is not None and uid:
         _bind_postpaid_thread_oid(uid, user_data, int(thread_oid), persist=False)
         if text in REPLY_MENU_TEXTS:
-            _user_state_pop(uid, "postpaid_thread_oid")
-            user_data.pop("postpaid_thread_oid", None)
+            for key in ("postpaid_thread_oid", "awaiting_shipping_oid"):
+                _user_state_pop(uid, key, persist=False)
+                user_data.pop(key, None)
         elif not text.strip():
             await msg.reply_text(MSG_EMPTY_INPUT)
             return
