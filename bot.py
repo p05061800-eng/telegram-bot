@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-shipping-fix-v52"
+BOT_BUILD_ID = "2026-06-21-shipping-fix-v53"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -3813,6 +3813,20 @@ class _MainReplyMenuFilter(filters.MessageFilter):
 
 MAIN_REPLY_MENU_FILTER = _MainReplyMenuFilter()
 
+
+class _SupportClientTextFilter(filters.MessageFilter):
+    __slots__ = ()
+
+    def filter(self, message) -> bool:
+        if not message or not getattr(message, "text", None) or not message.from_user:
+            return False
+        if _match_reply_menu_text(message.text) is not None:
+            return False
+        return bool(user_support_state.get(int(message.from_user.id)))
+
+
+SUPPORT_CLIENT_TEXT_FILTER = _SupportClientTextFilter()
+
 # Старые ссылки вида ?start=web_login — не показывать как «заказ», обрабатывать как обычный /start
 START_IGNORED_DEEP_LINK = frozenset({"web_login"})
 
@@ -3894,6 +3908,96 @@ SUPPORT_INTRO_TEXT = (
 )
 
 
+def _support_reply_kb(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "💬",
+                    callback_data=f"sup:rep:{uid}",
+                )
+            ],
+        ],
+    )
+
+
+async def _notify_admin_support_opened(
+    context: ContextTypes.DEFAULT_TYPE,
+    uid: int,
+    username: Optional[str] = None,
+) -> None:
+    """Клиент нажал «Связь» — короткое уведомление админу."""
+    log = logging.getLogger(__name__)
+    uname = str(username or "").strip().lstrip("@")
+    body = f"💬 Клиент нажал «Связь»\n\n👤 id {int(uid)}"
+    if uname:
+        body += f" @{uname}"
+    body += "\n\nЖдём сообщение от клиента в этом чате."
+    kb = _support_reply_kb(int(uid))
+    targets = _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else [])
+    for tgt in targets:
+        try:
+            await context.bot.send_message(
+                tgt,
+                body,
+                disable_web_page_preview=True,
+                reply_markup=kb,
+            )
+            return
+        except Exception:
+            log.exception("support opened notify target=%s uid=%s", tgt, uid)
+
+
+async def _forward_client_support_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    msg: Message,
+    uid: int,
+    *,
+    body_text: Optional[str] = None,
+    photo_file_id: Optional[str] = None,
+) -> bool:
+    """Текст/фото клиента из режима «Связь» → ORDER_NOTIFY_TARGET."""
+    log = logging.getLogger(__name__)
+    chunk = str(body_text if body_text is not None else (msg.text or "")).strip()
+    uname = (msg.from_user.username or "").strip() if msg.from_user else ""
+    head = f"💬 Сообщение от клиента\n\n👤 id {int(uid)}"
+    if uname:
+        head += f" @{uname}"
+    kb = _support_reply_kb(int(uid))
+    targets = _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else [])
+
+    async def _send_to(tgt) -> bool:
+        if photo_file_id:
+            cap = head
+            if chunk:
+                cap = f"{head}\n\n{chunk}"
+            await context.bot.send_photo(
+                tgt,
+                photo_file_id,
+                caption=cap[:1024],
+                reply_markup=kb,
+            )
+        else:
+            body = head
+            if chunk:
+                body = f"{head}\n\n{chunk}"
+            await context.bot.send_message(
+                tgt,
+                body[:4096],
+                disable_web_page_preview=True,
+                reply_markup=kb,
+            )
+        return True
+
+    for tgt in targets:
+        try:
+            await _send_to(tgt)
+            return True
+        except Exception:
+            log.exception("клиент → поддержка: target=%s uid=%s", tgt, uid)
+    return False
+
+
 async def _activate_user_support_chat(
     msg: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3905,9 +4009,14 @@ async def _activate_user_support_chat(
     await _delete_user_temp_messages(context.bot, uid)
     _clear_checkout_delivery(context.user_data)
     context.user_data.pop("pending_order", None)
-    _user_state_pop(uid, "postpaid_thread_oid")
+    _clear_shipping_session_keys(uid, context.user_data)
     user_support_state[uid] = True
     await msg.reply_text(SUPPORT_INTRO_TEXT, reply_markup=reply_markup)
+    await _notify_admin_support_opened(
+        context,
+        uid,
+        getattr(msg.from_user, "username", None) if msg.from_user else None,
+    )
 
 
 def _format_caption(p: dict) -> str:
@@ -6142,6 +6251,15 @@ def _postpaid_shipping_prompt_for_order(o: dict) -> str:
     return MSG_POSTPAID_SHIPPING_INTL
 
 
+def _postpaid_need_details_message_for_order(o: dict, *, text: str = "") -> str:
+    """Повторный запрос адреса — тот же текст, что после скрина (не «СДЭК» для UA)."""
+    prompt = _postpaid_shipping_prompt_for_order(o)
+    chunk = str(text or "").strip()
+    if chunk and len(chunk) < 8:
+        return f"Слишком короткое сообщение ({len(chunk)} симв.). {prompt}"
+    return prompt
+
+
 def _postpaid_append_detail(o: dict, text: str) -> None:
     chunk = str(text or "").strip()
     if not chunk:
@@ -6620,15 +6738,16 @@ async def _collect_postpaid_client_message(
             pass
         return True
     chunk = str(body_text or "").strip()
+    need_details = _postpaid_need_details_message_for_order(o, text=chunk)
     if photo_file_id and not chunk:
         try:
-            await msg.reply_text(MSG_POSTPAID_NEED_DETAILS)
+            await msg.reply_text(need_details)
         except Exception:
             pass
         return True
     if not _delivery_text_looks_valid(chunk):
         try:
-            await msg.reply_text(MSG_POSTPAID_NEED_DETAILS)
+            await msg.reply_text(need_details)
         except Exception:
             pass
         return True
@@ -11756,7 +11875,7 @@ async def on_order_status_buttons(
             await q.answer("Эта кнопка только для администратора.", show_alert=True)
         except Exception:
             pass
-        return
+        raise ApplicationHandlerStop
     action, oid_s = m.group(1), m.group(2)
     try:
         oid = int(oid_s)
@@ -11790,7 +11909,7 @@ async def on_order_status_buttons(
         }.get(action)
         if not want:
             await q.answer()
-            return
+            raise ApplicationHandlerStop
         st_norm = _norm_bot_order_status(str(o.get("status") or "new"))
         if st_norm == want:
             await q.answer("Статус уже такой.", show_alert=False)
@@ -13523,13 +13642,18 @@ async def on_customer_proof_media(
 
     try:
         if user_support_state.get(uid):
-            ok = await _forward_support_photo_to_admin(context, msg, uid)
+            ok = await _forward_client_support_message(
+                context,
+                msg,
+                uid,
+                photo_file_id=file_id,
+                body_text=(msg.caption or "").strip() if msg.caption else None,
+            )
             if ok:
-                user_support_state.pop(uid, None)
-                m_ok = await msg.reply_text(MSG_SUPPORT_THANKS)
+                m_ok = await msg.reply_text(MSG_SUPPORT_THANKS, reply_markup=REPLY_KB)
                 _track_temp_message(uid, m_ok)
             else:
-                await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
+                await msg.reply_text(MSG_SEND_SUPPORT_FAIL, reply_markup=REPLY_KB)
             raise ApplicationHandlerStop
 
         pp_oid = _user_state_get(uid, "postpaid_thread_oid")
@@ -13565,9 +13689,12 @@ async def on_customer_proof_media(
                     raise ApplicationHandlerStop
             else:
                 cap = (msg.caption or "").strip() if msg.caption else ""
+                o_pp = ORDERS.get(int(pp_oid)) or {}
                 if not _delivery_text_looks_valid(cap):
                     try:
-                        await msg.reply_text(MSG_POSTPAID_NEED_DETAILS)
+                        await msg.reply_text(
+                            _postpaid_need_details_message_for_order(o_pp, text=cap)
+                        )
                     except Exception:
                         pass
                     raise ApplicationHandlerStop
@@ -13741,9 +13868,12 @@ async def _on_user_photo_body(
                     pass
             return
         cap = (msg.caption or "").strip() if msg.caption else ""
+        o_pp = ORDERS.get(int(pp_oid)) or {}
         if not _delivery_text_looks_valid(cap):
             try:
-                await msg.reply_text(MSG_POSTPAID_NEED_DETAILS)
+                await msg.reply_text(
+                    _postpaid_need_details_message_for_order(o_pp, text=cap)
+                )
             except Exception:
                 pass
             return
@@ -13953,12 +14083,12 @@ async def on_admin_confirm_payment(
             await q.answer()
         except Exception:
             pass
-        return
+        raise ApplicationHandlerStop
     try:
         oid = int(m.group(1))
     except ValueError:
         await q.answer()
-        return
+        raise ApplicationHandlerStop
     o = _restore_order_for_admin(q, oid)
     if not o:
         await _reply_admin_order_stale(q, oid)
@@ -13968,13 +14098,13 @@ async def on_admin_confirm_payment(
             await q.answer()
         except Exception:
             pass
-        return
+        raise ApplicationHandlerStop
     if not o.get("payment_proof_submitted"):
         try:
             await q.answer()
         except Exception:
             pass
-        return
+        raise ApplicationHandlerStop
     o["paid"] = True
     o["paid_at"] = time.time()
     cust = int(o.get("user_id") or 0)
@@ -14111,12 +14241,12 @@ async def on_admin_reject_payment(
             await q.answer()
         except Exception:
             pass
-        return
+        raise ApplicationHandlerStop
     try:
         oid = int(m.group(1))
     except ValueError:
         await q.answer()
-        return
+        raise ApplicationHandlerStop
     o = _restore_order_for_admin(q, oid)
     if not o:
         await _reply_admin_order_stale(q, oid)
@@ -14126,13 +14256,13 @@ async def on_admin_reject_payment(
             await q.answer()
         except Exception:
             pass
-        return
+        raise ApplicationHandlerStop
     if not o.get("payment_proof_submitted"):
         try:
             await q.answer()
         except Exception:
             pass
-        return
+        raise ApplicationHandlerStop
     cust = int(o.get("user_id") or 0)
     cud = _user_data_for(context.application, cust) if cust else {}
     _clear_crypto_auto_watch(o, cust)
@@ -14290,6 +14420,30 @@ async def on_view_cart_callback(
             log_vc.exception("vc:0 fallback reply failed")
 
 
+async def on_support_client_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Сообщения в режиме «Связь» — до shipping/on_text."""
+    msg = update.effective_message
+    if not msg or not msg.from_user:
+        return
+    uid = int(msg.from_user.id)
+    if not user_support_state.get(uid):
+        return
+    ok = await _forward_client_support_message(context, msg, uid)
+    if not ok:
+        try:
+            await msg.reply_text(MSG_SEND_SUPPORT_FAIL, reply_markup=REPLY_KB)
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
+    try:
+        await msg.reply_text(MSG_SUPPORT_THANKS, reply_markup=REPLY_KB)
+    except Exception:
+        pass
+    raise ApplicationHandlerStop
+
+
 async def _handle_main_reply_menu(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -14361,6 +14515,9 @@ async def _try_handle_postpaid_shipping_text(
     """Адрес после скрина оплаты. True — обработано, дальше on_text не нужен."""
     msg = update.effective_message
     if not msg or not msg.text or not msg.from_user:
+        return False
+    uid = int(msg.from_user.id)
+    if user_support_state.get(uid):
         return False
     if _match_reply_menu_text(msg.text) is not None:
         return False
@@ -14552,53 +14709,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     if uid and user_support_state.get(uid):
-        if text in REPLY_MENU_TEXTS:
+        if _is_reply_menu_text(text):
             user_support_state.pop(uid, None)
         elif not text.strip():
             await msg.reply_text(MSG_EMPTY_INPUT)
             return
         else:
-            body = "💬 Сообщение от клиента:\n\n" + msg.text
-            uname = (msg.from_user.username or "").strip() if msg.from_user else ""
-            tail = f"\n\n👤 id {uid}"
-            if uname:
-                tail += f" @{uname}"
-            body = (body + tail)[:4096]
-            log = logging.getLogger(__name__)
-            sup_kb = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "💬",
-                            callback_data=f"sup:rep:{uid}",
-                        )
-                    ],
-                ],
-            )
-            try:
-                await context.bot.send_message(
-                    ORDER_NOTIFY_TARGET,
-                    body,
-                    disable_web_page_preview=True,
-                    reply_markup=sup_kb,
-                )
-            except Exception:
-                log.exception("клиент → поддержка: target=%s", ORDER_NOTIFY_TARGET)
-                # Fallback: если кастомный target недоступен, шлём админу по user_id.
-                try:
-                    await context.bot.send_message(
-                        ADMIN_ID,
-                        body,
-                        disable_web_page_preview=True,
-                        reply_markup=sup_kb,
-                    )
-                except Exception:
-                    log.exception("клиент → поддержка fallback admin_id=%s", ADMIN_ID)
-                    await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
-                    return
-            user_support_state.pop(uid, None)
-            m_ok = await msg.reply_text(MSG_SUPPORT_THANKS)
-            _track_temp_message(uid, m_ok)
+            ok = await _forward_client_support_message(context, msg, uid)
+            if not ok:
+                await msg.reply_text(MSG_SEND_SUPPORT_FAIL, reply_markup=REPLY_KB)
+                return
+            await msg.reply_text(MSG_SUPPORT_THANKS, reply_markup=REPLY_KB)
             return
 
     if uid and await _handle_buy_quick_text(msg, context, text, uid):
@@ -14802,6 +14923,10 @@ def main() -> None:
         group=-1,
     )
     app.add_handler(
+        MessageHandler(SUPPORT_CLIENT_TEXT_FILTER, on_support_client_text),
+        group=-1,
+    )
+    app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             on_postpaid_shipping_text,
@@ -14832,6 +14957,7 @@ def main() -> None:
         CallbackQueryHandler(
             on_order_status_buttons,
             pattern=re.compile(r"^(accept|sent|cancel|done|delmsg)_\d+$"),
+            block=False,
         ),
         group=-1,
     )
@@ -14839,6 +14965,7 @@ def main() -> None:
         CallbackQueryHandler(
             on_order_admin_action,
             pattern=re.compile(r"^oam:rep:\d+$"),
+            block=False,
         ),
         group=-1,
     )
@@ -14846,6 +14973,7 @@ def main() -> None:
         CallbackQueryHandler(
             on_postpaid_submit,
             pattern=re.compile(r"^ppdone:\d+$"),
+            block=False,
         ),
         group=-1,
     )
@@ -14853,6 +14981,7 @@ def main() -> None:
         CallbackQueryHandler(
             on_admin_confirm_payment,
             pattern=re.compile(r"^confirm_payment_\d+$"),
+            block=False,
         ),
         group=-1,
     )
@@ -14860,6 +14989,7 @@ def main() -> None:
         CallbackQueryHandler(
             on_admin_reject_payment,
             pattern=re.compile(r"^reject_payment_\d+$"),
+            block=False,
         ),
         group=-1,
     )
