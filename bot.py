@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-20-proof-before-shipping-v38"
+BOT_BUILD_ID = "2026-06-20-shipping-intl-text-v39"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -1253,7 +1253,7 @@ MSG_POSTPAID_SHIPPING_RU = (
     "Напишите адрес отделения СДЭК или Яндекс, ФИО и номер телефона одним сообщением."
 )
 MSG_POSTPAID_SHIPPING_INTL = (
-    "Напишите домашний адрес, ФИО и почтовый индекс латиницей одним сообщением."
+    "Напишите домашний адрес, ФИО и почтовый индекс одним сообщением."
 )
 MSG_POSTPAID_FORWARDED_OK = "Передали администратору."
 MSG_POSTPAID_THREAD_CLOSED = (
