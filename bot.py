@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-shipping-fix-v51"
+BOT_BUILD_ID = "2026-06-21-shipping-fix-v52"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -3775,14 +3775,43 @@ REPLY_MENU_TEXTS = frozenset(
 
 def _normalize_reply_menu_text(text: str) -> str:
     """Старые reply-клавиатуры (📜) → актуальные подписи кнопок."""
+    matched = _match_reply_menu_text(text)
+    return matched if matched is not None else str(text or "").strip()
+
+
+def _match_reply_menu_text(text: str) -> Optional[str]:
+    """Распознать нажатие reply-клавиатуры (точно или по подписи)."""
     t = str(text or "").strip()
-    if t == BTN_MY_ORDERS_LEGACY:
+    if not t:
+        return None
+    if t in REPLY_MENU_TEXTS:
+        return BTN_MY_ORDERS if t == BTN_MY_ORDERS_LEGACY else t
+    low = t.casefold()
+    if "связ" in low:
+        return BTN_CHAT
+    if "мои заказ" in low or "мои заказы" in low:
         return BTN_MY_ORDERS
-    return t
+    if "достав" in low:
+        return BTN_DELIVERY
+    return None
 
 
 def _is_reply_menu_text(text: str) -> bool:
-    return _normalize_reply_menu_text(text) in REPLY_MENU_TEXTS
+    return _match_reply_menu_text(text) is not None
+
+
+class _MainReplyMenuFilter(filters.MessageFilter):
+    __slots__ = ()
+
+    def filter(self, message) -> bool:
+        return bool(
+            message
+            and getattr(message, "text", None)
+            and _match_reply_menu_text(message.text) is not None
+        )
+
+
+MAIN_REPLY_MENU_FILTER = _MainReplyMenuFilter()
 
 # Старые ссылки вида ?start=web_login — не показывать как «заказ», обрабатывать как обычный /start
 START_IGNORED_DEEP_LINK = frozenset({"web_login"})
@@ -7460,7 +7489,14 @@ def _find_user_site_order_by_token(uid: int, token: str) -> Optional[dict]:
 async def _format_mine_orders_text_and_kb(
     user_id: int,
 ) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
-    await _refresh_user_site_orders_from_site(user_id)
+    try:
+        await asyncio.wait_for(
+            _refresh_user_site_orders_from_site(user_id), timeout=8.0
+        )
+    except asyncio.TimeoutError:
+        logging.getLogger(__name__).warning(
+            "my_orders site sync timeout user_id=%s", user_id
+        )
     reg = _user_orders_registry_for_user(user_id)
     site_recs = _user_site_orders_for_list(user_id)
     if not reg and not site_recs:
@@ -14254,6 +14290,68 @@ async def on_view_cart_callback(
             log_vc.exception("vc:0 fallback reply failed")
 
 
+async def _handle_main_reply_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    menu_text: str,
+) -> None:
+    """💬 Связь / 📋 Мои заказы / 🚚 Доставка — reply-клавиатура внизу."""
+    msg = update.effective_message
+    if not msg or not msg.from_user:
+        return
+    uid = int(msg.from_user.id)
+    text = str(menu_text or "").strip()
+    user_data = context.user_data if isinstance(context.user_data, dict) else {}
+    log = logging.getLogger(__name__)
+    log.info("reply_menu uid=%s btn=%r", uid, text)
+    _clear_shipping_session_keys(uid, user_data)
+    _user_state_pop(uid, "awaiting_proof", persist=False)
+    cc_raw = _user_state_get(uid, "crypto_check")
+    if cc_raw is not None:
+        try:
+            co = ORDERS.get(int(cc_raw))
+        except (TypeError, ValueError):
+            co = None
+            _user_state_pop(uid, "crypto_check")
+        if co is not None and not co.get("paid"):
+            _clear_crypto_auto_watch(co, uid)
+    if uid and user_support_state.get(uid) and text != BTN_CHAT:
+        user_support_state.pop(uid, None)
+    _clear_checkout_delivery(user_data)
+    user_data.pop("pending_order", None)
+    if text == BTN_CHAT:
+        if not uid:
+            await msg.reply_text(FALLBACK_USER_TEXT, reply_markup=REPLY_KB)
+            return
+        await _activate_user_support_chat(msg, context, uid, reply_markup=REPLY_KB)
+        return
+    if text == BTN_MY_ORDERS:
+        await _delete_user_temp_messages(context.bot, uid)
+        if not uid:
+            await msg.reply_text(FALLBACK_USER_TEXT, reply_markup=REPLY_KB)
+            return
+        body, kb = await _format_mine_orders_text_and_kb(uid)
+        await msg.reply_text(body, reply_markup=kb or REPLY_KB)
+        return
+    if text == BTN_DELIVERY:
+        await msg.reply_text(_delivery_info_text(), reply_markup=REPLY_KB)
+        return
+
+
+async def on_reply_menu_buttons(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Reply-меню — group -1, до shipping/on_text."""
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    menu = _match_reply_menu_text(msg.text)
+    if menu is None:
+        return
+    await _handle_main_reply_menu(update, context, menu)
+    raise ApplicationHandlerStop
+
+
 async def _try_handle_postpaid_shipping_text(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -14264,7 +14362,9 @@ async def _try_handle_postpaid_shipping_text(
     msg = update.effective_message
     if not msg or not msg.text or not msg.from_user:
         return False
-    text = _normalize_reply_menu_text(msg.text)
+    if _match_reply_menu_text(msg.text) is not None:
+        return False
+    text = str(msg.text or "").strip()
     if not text:
         return False
     uid = int(msg.from_user.id)
@@ -14353,9 +14453,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     if not msg or not msg.text:
         return
+    menu = _match_reply_menu_text(msg.text)
     text = _normalize_reply_menu_text(msg.text)
     user_data = context.user_data
     log.info("on_text uid=%s text_len=%s", uid, len(text))
+
+    if menu is not None:
+        await _handle_main_reply_menu(update, context, menu)
+        return
 
     if await _try_handle_postpaid_shipping_text(update, context, log_prefix="on_text"):
         return
@@ -14445,13 +14550,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             user_data.pop("reply_to", None)
             await msg.reply_text(MSG_ADMIN_SAY_OK)
             return
-
-    if text == BTN_CHAT:
-        if not uid:
-            await msg.reply_text(FALLBACK_USER_TEXT)
-            return
-        await _activate_user_support_chat(msg, context, uid)
-        return
 
     if uid and user_support_state.get(uid):
         if text in REPLY_MENU_TEXTS:
@@ -14552,21 +14650,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 log_cart.exception("Корзина: не удалось отправить сообщение об ошибке")
         return
 
-    if text == BTN_MY_ORDERS:
-        await _delete_user_temp_messages(context.bot, uid)
-        if not uid:
-            await msg.reply_text(FALLBACK_USER_TEXT)
-            return
-        body, kb = await _format_mine_orders_text_and_kb(uid)
-        await msg.reply_text(body, reply_markup=kb)
-        return
-
     if text == BTN_CATALOG:
         await send_catalog(update, context)
-        return
-
-    if text == BTN_DELIVERY:
-        await msg.reply_text(_delivery_info_text())
         return
 
     if text == BTN_POPULAR:
@@ -14712,6 +14797,10 @@ def main() -> None:
     )
     app.add_error_handler(on_ptb_error)
 
+    app.add_handler(
+        MessageHandler(MAIN_REPLY_MENU_FILTER, on_reply_menu_buttons),
+        group=-1,
+    )
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -14904,7 +14993,9 @@ def main() -> None:
     )
     app.add_handler(CallbackQueryHandler(on_pick_category, pattern=re.compile(r"^c:(\d+|all)$")))
     app.add_handler(CallbackQueryHandler(on_callback_query_unhandled), group=99)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, on_text, block=False)
+    )
 
     # Краткие сбои Telegram / наложение деплоев: повторить bootstrap (delete_webhook и т.д.).
     poll_bootstrap_retries = _env_int("TELEGRAM_POLLING_BOOTSTRAP_RETRIES", 35)
