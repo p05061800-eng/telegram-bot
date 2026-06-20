@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-payment-total-match-v43"
+BOT_BUILD_ID = "2026-06-21-payment-total-delivery-v44"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -4628,17 +4628,51 @@ def _user_has_unpaid_order(uid: int) -> bool:
     return _find_latest_unpaid_order_id(int(uid)) is not None
 
 
+def _checkout_delivery_cc(
+    uid: int,
+    ud: dict,
+    meta: Optional[dict],
+    order: Optional[dict] = None,
+) -> str:
+    """Страна доставки для итога: заказ → meta/norm → корзина."""
+    for d in (
+        (order or {}).get("delivery") if isinstance(order, dict) else None,
+        (meta or {}).get("delivery") if isinstance(meta, dict) else None,
+    ):
+        if isinstance(d, dict):
+            cc = str(d.get("country") or "").strip().lower()
+            if cc in DELIVERY_OPTIONS:
+                return cc
+    if isinstance(meta, dict):
+        lh = meta.get("loyalty_hint")
+        if isinstance(lh, dict):
+            d2 = lh.get("delivery")
+            if isinstance(d2, dict):
+                cc = str(d2.get("country") or "").strip().lower()
+                if cc in DELIVERY_OPTIONS:
+                    return cc
+            raw = lh.get("deliveryCountry") or lh.get("delivery_country")
+            if raw is not None:
+                code, _, _, _ = _delivery_option_for_site_code(str(raw))
+                if code in DELIVERY_OPTIONS:
+                    return code
+    cc = _cart_price_region_for_user(uid, ud)
+    return cc if cc in DELIVERY_OPTIONS else "by"
+
+
 def _resolve_site_confirm_pricing(
     uid: int,
     ud: dict,
     lines: List[dict],
     meta: Optional[dict],
+    *,
+    delivery_cc: Optional[str] = None,
 ) -> Tuple[int, str, dict]:
     """Итог и валюта для шага оплаты — те же правила, что в превью корзины."""
     meta_m = _merge_site_bonus_into_meta(uid, meta if isinstance(meta, dict) else {})
-    cc = _cart_price_region_for_user(uid, ud)
+    cc = str(delivery_cc or "").strip().lower()
     if cc not in DELIVERY_OPTIONS:
-        cc = "by"
+        cc = _checkout_delivery_cc(uid, ud, meta_m)
     dlabel, damount, dcur = DELIVERY_OPTIONS.get(cc, DELIVERY_OPTIONS["by"])
     drec = {
         "country": cc,
@@ -4646,13 +4680,6 @@ def _resolve_site_confirm_pricing(
         "amount": int(damount),
         "currency": dcur,
     }
-    try:
-        locked = int(meta_m.get("preview_pay_total") or 0)
-    except (TypeError, ValueError):
-        locked = 0
-    locked_cur = str(meta_m.get("preview_pay_currency") or "").strip().upper()
-    if locked > 0 and locked_cur in ("BYN", "RUB"):
-        return int(locked), locked_cur, drec
     fin = _site_cart_checkout_finance(uid, list(lines), cc, ud)
     pay_cur = str(fin["g_cur"])
     goods = int(fin["goods"])
@@ -4798,13 +4825,20 @@ def _refresh_unpaid_order_payment(
     if not isinstance(o, dict):
         return 0, "BYN"
     meta_m = _merge_site_bonus_into_meta(uid, meta if isinstance(meta, dict) else {})
-    if lines:
+    use_lines = list(lines or []) or list(o.get("items") or [])
+    if use_lines:
+        drec_o = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
+        cc_o = str(drec_o.get("country") or "").strip().lower()
         total, pay_cur, drec = _resolve_site_confirm_pricing(
-            uid, ud, list(lines), meta_m
+            uid,
+            ud,
+            use_lines,
+            meta_m,
+            delivery_cc=cc_o if cc_o in DELIVERY_OPTIONS else None,
         )
         o["delivery"] = deepcopy(drec)
-        goods, _ = _cart_totals(list(lines))
-        o["items"] = deepcopy(list(lines))
+        goods, _ = _cart_totals(use_lines)
+        o["items"] = deepcopy(list(use_lines))
         o["total_goods"] = int(goods)
         try:
             b_ap = int(meta_m.get("bonus_applied") or 0)
@@ -9113,7 +9147,7 @@ def _format_site_checkout_order_body(
     fin = _site_cart_checkout_finance(int(uid), lines, cc, user_data)
     meta = _prepare_site_checkout_meta(int(uid), norm)
     grand_show, pay_cur, _ = _resolve_site_confirm_pricing(
-        int(uid), user_data or {}, lines, meta
+        int(uid), user_data or {}, lines, meta, delivery_cc=cc
     )
     d_label = fin["d_label"]
     d_amt = fin["d_amt"]
@@ -9171,10 +9205,18 @@ async def _begin_site_checkout_order(
         return None
     meta = _prepare_site_checkout_meta(int(uid), norm)
     ext_id = str(meta.get("external_id") or "").strip()
+    d_norm = norm.get("delivery") if isinstance(norm.get("delivery"), dict) else {}
+    cc_norm = str(d_norm.get("country") or "").strip().lower()
     existing = _find_unpaid_bot_order_by_external_id(int(uid), ext_id) if ext_id else None
     if existing is not None:
         po = ORDERS.get(int(existing)) or {}
-        total, pay_cur, drec = _resolve_site_confirm_pricing(int(uid), ud, lines, meta)
+        total, pay_cur, drec = _resolve_site_confirm_pricing(
+            int(uid),
+            ud,
+            lines,
+            meta,
+            delivery_cc=cc_norm if cc_norm in DELIVERY_OPTIONS else None,
+        )
         goods_total, _ = _cart_totals(list(lines))
         po["total"] = int(total)
         po["payment_currency"] = str(pay_cur)
@@ -9186,7 +9228,13 @@ async def _begin_site_checkout_order(
         _set_awaiting_payment_order_id(int(uid), ud, int(existing))
         save_state()
         return int(existing), int(total), str(pay_cur)
-    total, pay_cur, drec = _resolve_site_confirm_pricing(int(uid), ud, lines, meta)
+    total, pay_cur, drec = _resolve_site_confirm_pricing(
+        int(uid),
+        ud,
+        lines,
+        meta,
+        delivery_cc=cc_norm if cc_norm in DELIVERY_OPTIONS else None,
+    )
     goods_total, _ = _cart_totals(list(lines))
     dl_bonus_applied = 0
     dl_bonus_points_spent = 0
@@ -12533,7 +12581,7 @@ async def on_payment_method(
             uid,
             ud,
             preview_text=_get_site_pending_preview(uid) or msg_txt,
-            lines=_cart_get_lines_uid(uid, ud),
+            lines=list(o.get("items") or []) or _cart_get_lines_uid(uid, ud),
             meta=_get_site_pending_meta(uid, ud),
         )
         if o.get("paid"):
