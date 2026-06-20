@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-shipping-fix-v50"
+BOT_BUILD_ID = "2026-06-21-shipping-fix-v51"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -1342,6 +1342,7 @@ BTN_CART = "🛒 Корзина"
 BTN_POPULAR = "🔥 Акции"
 BTN_CHAT = "💬 Связь"
 BTN_MY_ORDERS = "📋 Мои заказы"
+BTN_MY_ORDERS_LEGACY = "📜 Мои заказы"
 BTN_DELIVERY = "🚚 Доставка"
 BTN_RANDOM_CARD = "🎁 Случайная карточка"
 BTN_FAVORITES = "💚 Избранное"
@@ -3766,9 +3767,22 @@ REPLY_MENU_TEXTS = frozenset(
     {
         BTN_CHAT,
         BTN_MY_ORDERS,
+        BTN_MY_ORDERS_LEGACY,
         BTN_DELIVERY,
     },
 )
+
+
+def _normalize_reply_menu_text(text: str) -> str:
+    """Старые reply-клавиатуры (📜) → актуальные подписи кнопок."""
+    t = str(text or "").strip()
+    if t == BTN_MY_ORDERS_LEGACY:
+        return BTN_MY_ORDERS
+    return t
+
+
+def _is_reply_menu_text(text: str) -> bool:
+    return _normalize_reply_menu_text(text) in REPLY_MENU_TEXTS
 
 # Старые ссылки вида ?start=web_login — не показывать как «заказ», обрабатывать как обычный /start
 START_IGNORED_DEEP_LINK = frozenset({"web_login"})
@@ -11674,6 +11688,7 @@ async def on_user_order_open(
 async def on_order_status_buttons(
     update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    log = logging.getLogger(__name__)
     if not q or not q.from_user or not q.data or not q.message:
         return
     m = re.match(r"^(accept|sent|cancel|done|delmsg)_(\d+)$", (q.data or "").strip())
@@ -11691,45 +11706,63 @@ async def on_order_status_buttons(
     except ValueError:
         await q.answer()
         return
-    o = _restore_order_for_admin(q, oid)
-    if not o:
-        await _reply_admin_order_stale(q, oid)
-        raise ApplicationHandlerStop
-    if text := ((q.message.text or q.message.caption or "").strip() if q.message else ""):
-        if _message_looks_like_admin_order_card(text) and not list(o.get("items") or []):
-            o = _enrich_order_from_admin_card_text(o, oid, text)
-    if action == "delmsg":
-        await _admin_delete_order_chat_message(context, q, oid)
-        raise ApplicationHandlerStop
-    want = {
-        "accept": "accepted",
-        "sent": "shipped",
-        "done": "done",
-        "cancel": "canceled",
-    }.get(action)
-    if not want:
-        return
-    st_norm = _norm_bot_order_status(str(o.get("status") or "new"))
-    if st_norm == want:
-        try:
+    log.info(
+        "admin order action uid=%s action=%s oid=%s data=%r",
+        q.from_user.id,
+        action,
+        oid,
+        q.data,
+    )
+    try:
+        o = _restore_order_for_admin(q, oid)
+        if not o:
+            await _reply_admin_order_stale(q, oid)
+            raise ApplicationHandlerStop
+        if text := ((q.message.text or q.message.caption or "").strip() if q.message else ""):
+            if _message_looks_like_admin_order_card(text) and not list(o.get("items") or []):
+                o = _enrich_order_from_admin_card_text(o, oid, text)
+        if action == "delmsg":
+            await q.answer()
+            await _admin_delete_order_chat_message(context, q, oid)
+            raise ApplicationHandlerStop
+        want = {
+            "accept": "accepted",
+            "sent": "shipped",
+            "done": "done",
+            "cancel": "canceled",
+        }.get(action)
+        if not want:
+            await q.answer()
+            return
+        st_norm = _norm_bot_order_status(str(o.get("status") or "new"))
+        if st_norm == want:
             await q.answer("Статус уже такой.", show_alert=False)
+            await _refresh_admin_order_message(context, oid)
+            raise ApplicationHandlerStop
+        await q.answer(MSG_ORDER_STATUS_UPDATED, show_alert=False)
+        o["status"] = want
+        try:
+            await asyncio.to_thread(save_state)
+        except Exception:
+            log.exception("admin order status save_state oid=%s", oid)
+        if want in ("done", "canceled"):
+            cuid = int(o.get("user_id") or 0)
+            if cuid:
+                _clear_postpaid_thread_if_matches(cuid, oid)
+        if not str(o.get("external_id") or "").strip() and o.get("paid"):
+            await _ensure_site_order_for_bot_order(oid, o)
+        await _sync_site_order_status(o)
+        notice = _format_customer_order_status_notice(oid, str(o.get("status") or ""))
+        await _notify_order_customer(context, o, notice)
+        await _refresh_admin_order_message(context, oid)
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        log.exception("admin order action failed oid=%s action=%s", oid, action)
+        try:
+            await q.answer("Не удалось обновить заказ.", show_alert=True)
         except Exception:
             pass
-        await _refresh_admin_order_message(context, oid)
-        return
-    o["status"] = want
-    save_state()
-    if want in ("done", "canceled"):
-        cuid = int(o.get("user_id") or 0)
-        if cuid:
-            _clear_postpaid_thread_if_matches(cuid, oid)
-    if not str(o.get("external_id") or "").strip() and o.get("paid"):
-        await _ensure_site_order_for_bot_order(oid, o)
-    await _sync_site_order_status(o)
-    await q.answer(MSG_ORDER_STATUS_UPDATED, show_alert=False)
-    notice = _format_customer_order_status_notice(oid, str(o.get("status") or ""))
-    await _notify_order_customer(context, o, notice)
-    await _refresh_admin_order_message(context, oid)
     raise ApplicationHandlerStop
 
 
@@ -14211,14 +14244,14 @@ async def _try_handle_postpaid_shipping_text(
     msg = update.effective_message
     if not msg or not msg.text or not msg.from_user:
         return False
-    text = msg.text.strip()
+    text = _normalize_reply_menu_text(msg.text)
     if not text:
         return False
     uid = int(msg.from_user.id)
     user_data = context.user_data if isinstance(context.user_data, dict) else {}
     log = logging.getLogger(__name__)
     thread_oid = _resolve_postpaid_thread_oid(uid, user_data)
-    if thread_oid is None and len(text) >= 8 and text not in REPLY_MENU_TEXTS:
+    if thread_oid is None and len(text) >= 8 and not _is_reply_menu_text(text):
         recovered = _find_active_postpaid_order_id(uid)
         if recovered is not None:
             thread_oid = int(recovered)
@@ -14240,7 +14273,7 @@ async def _try_handle_postpaid_shipping_text(
         len(text),
     )
     _bind_postpaid_thread_oid(uid, user_data, int(thread_oid), persist=False)
-    if text in REPLY_MENU_TEXTS:
+    if _is_reply_menu_text(text):
         for key in ("postpaid_thread_oid", "awaiting_shipping_oid"):
             _user_state_pop(uid, key, persist=False)
             user_data.pop(key, None)
@@ -14300,7 +14333,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     if not msg or not msg.text:
         return
-    text = msg.text.strip()
+    text = _normalize_reply_menu_text(msg.text)
     user_data = context.user_data
     log.info("on_text uid=%s text_len=%s", uid, len(text))
 
@@ -14668,6 +14701,7 @@ def main() -> None:
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             on_postpaid_shipping_text,
+            block=False,
         ),
         group=-1,
     )
