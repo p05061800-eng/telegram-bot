@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-shipping-fix-v49"
+BOT_BUILD_ID = "2026-06-21-shipping-fix-v50"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -846,6 +846,14 @@ async def track_user_activity(
     u = update.effective_user
     if not u:
         return
+    msg = update.effective_message
+    if msg and msg.text:
+        logging.getLogger(__name__).info(
+            "incoming_text uid=%s text_len=%s msg_id=%s",
+            int(u.id),
+            len(msg.text),
+            msg.message_id,
+        )
     try:
         uid = int(u.id)
         epoch = context.application.bot_data.get("deploy_epoch")
@@ -14193,74 +14201,111 @@ async def on_view_cart_callback(
             log_vc.exception("vc:0 fallback reply failed")
 
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _try_handle_postpaid_shipping_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    log_prefix: str = "postpaid",
+) -> bool:
+    """Адрес после скрина оплаты. True — обработано, дальше on_text не нужен."""
     msg = update.effective_message
-    if not msg or not msg.text:
-        return
+    if not msg or not msg.text or not msg.from_user:
+        return False
     text = msg.text.strip()
-    user_data = context.user_data
-    uid = msg.from_user.id if msg.from_user else 0
+    if not text:
+        return False
+    uid = int(msg.from_user.id)
+    user_data = context.user_data if isinstance(context.user_data, dict) else {}
     log = logging.getLogger(__name__)
-    log.info("on_text uid=%s text_len=%s", uid, len(text))
-
     thread_oid = _resolve_postpaid_thread_oid(uid, user_data)
-    if thread_oid is None and uid and len(text) >= 8 and text not in REPLY_MENU_TEXTS:
-        recovered = _find_active_postpaid_order_id(int(uid))
+    if thread_oid is None and len(text) >= 8 and text not in REPLY_MENU_TEXTS:
+        recovered = _find_active_postpaid_order_id(uid)
         if recovered is not None:
             thread_oid = int(recovered)
             _bind_postpaid_thread_oid(uid, user_data, thread_oid, persist=False)
             log.info(
-                "postpaid recovered from ORDERS uid=%s oid=%s text_len=%s",
+                "%s recovered from ORDERS uid=%s oid=%s text_len=%s",
+                log_prefix,
                 uid,
                 thread_oid,
                 len(text),
             )
-    if thread_oid is not None:
-        log.info(
-            "on_text shipping uid=%s oid=%s text_len=%s",
-            uid,
-            thread_oid,
-            len(text),
+    if thread_oid is None:
+        return False
+    log.info(
+        "%s shipping uid=%s oid=%s text_len=%s",
+        log_prefix,
+        uid,
+        thread_oid,
+        len(text),
+    )
+    _bind_postpaid_thread_oid(uid, user_data, int(thread_oid), persist=False)
+    if text in REPLY_MENU_TEXTS:
+        for key in ("postpaid_thread_oid", "awaiting_shipping_oid"):
+            _user_state_pop(uid, key, persist=False)
+            user_data.pop(key, None)
+        return False
+    if not text.strip():
+        await msg.reply_text(MSG_EMPTY_INPUT)
+        return True
+    log.info(
+        "%s text uid=%s oid=%s text_len=%s",
+        log_prefix,
+        uid,
+        thread_oid,
+        len(text),
+    )
+    try:
+        ok = await _collect_postpaid_client_message(
+            context,
+            uid=uid,
+            oid=int(thread_oid),
+            body_text=text,
+            msg=msg,
         )
-    if thread_oid is not None and uid:
-        _bind_postpaid_thread_oid(uid, user_data, int(thread_oid), persist=False)
-        if text in REPLY_MENU_TEXTS:
-            for key in ("postpaid_thread_oid", "awaiting_shipping_oid"):
-                _user_state_pop(uid, key, persist=False)
-                user_data.pop(key, None)
-        elif not text.strip():
-            await msg.reply_text(MSG_EMPTY_INPUT)
-            return
-        else:
-            logging.getLogger(__name__).info(
-                "postpaid text uid=%s oid=%s text_len=%s",
-                uid,
-                thread_oid,
-                len(text),
-            )
-            try:
-                ok = await _collect_postpaid_client_message(
-                    context,
-                    uid=uid,
-                    oid=int(thread_oid),
-                    body_text=text,
-                    msg=msg,
-                )
-            except Exception:
-                logging.getLogger(__name__).exception(
-                    "postpaid text uid=%s oid=%s", uid, thread_oid
-                )
-                try:
-                    await msg.reply_text(MSG_POSTPAID_SUBMIT_FAIL, reply_markup=REPLY_KB)
-                except Exception:
-                    pass
-                return
-            if not ok:
-                try:
-                    await msg.reply_text(MSG_SEND_SUPPORT_FAIL, reply_markup=REPLY_KB)
-                except Exception:
-                    pass
-            return
+    except Exception:
+        log.exception("%s text uid=%s oid=%s", log_prefix, uid, thread_oid)
+        try:
+            await msg.reply_text(MSG_POSTPAID_SUBMIT_FAIL, reply_markup=REPLY_KB)
+        except Exception:
+            pass
+        return True
+    if not ok:
+        try:
+            await msg.reply_text(MSG_SEND_SUPPORT_FAIL, reply_markup=REPLY_KB)
+        except Exception:
+            pass
+    return True
+
+
+async def on_postpaid_shipping_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Адрес после оплаты — group -1, до остальных хендлеров."""
+    handled = await _try_handle_postpaid_shipping_text(
+        update, context, log_prefix="shipping_text"
+    )
+    if handled:
+        raise ApplicationHandlerStop
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    uid = msg.from_user.id if msg and msg.from_user else 0
+    log = logging.getLogger(__name__)
+    log.info(
+        "on_text enter uid=%s has_text=%s",
+        uid,
+        bool(msg and msg.text),
+    )
+    if not msg or not msg.text:
+        return
+    text = msg.text.strip()
+    user_data = context.user_data
+    log.info("on_text uid=%s text_len=%s", uid, len(text))
+
+    if await _try_handle_postpaid_shipping_text(update, context, log_prefix="on_text"):
+        return
 
     if uid:
         _remember_user_message(
@@ -14619,6 +14664,13 @@ def main() -> None:
     )
     app.add_error_handler(on_ptb_error)
 
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            on_postpaid_shipping_text,
+        ),
+        group=-1,
+    )
     app.add_handler(
         MessageHandler(_PROOF_MEDIA_FILTER, on_customer_proof_media),
         group=-1,
