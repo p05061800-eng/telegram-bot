@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-05-29-checkout-v33"
+BOT_BUILD_ID = "2026-06-20-proof-instant-v34"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -554,8 +554,15 @@ def save_state() -> None:
         logging.getLogger(__name__).exception("Не удалось сохранить состояние бота")
 
 
-def _refresh_orders_state_from_redis() -> None:
+_REDIS_REFRESH_TS: float = 0.0
+
+
+def _refresh_orders_state_from_redis(*, force: bool = False) -> None:
     """Подтянуть ORDERS и user_states из Redis, не затирая свежее in-memory состояние."""
+    global _REDIS_REFRESH_TS
+    if not force and (time.time() - _REDIS_REFRESH_TS) < 2.0:
+        return
+    _REDIS_REFRESH_TS = time.time()
     if not STATE_REDIS_KEY or STATE_REDIS_SAVE_BLOCKED:
         return
     raw = _state_redis_command(["GET", STATE_REDIS_KEY])
@@ -988,12 +995,31 @@ def _find_latest_unpaid_order_id(uid: int) -> Optional[int]:
     return best_oid
 
 
-def _bind_proof_upload_session(uid: int, ud: dict, oid: int) -> None:
+def _bind_proof_upload_session(
+    uid: int, ud: dict, oid: int, *, persist: bool = True
+) -> None:
     """Сессия «ждём скрин» — переживает рестарт (user_states + Redis)."""
-    _set_awaiting_proof_session(uid, ud, int(oid))
-    _bind_payment_order_session(uid, ud, int(oid))
-    if uid:
-        _user_state_bucket(int(uid))["proof_deadline"] = int(time.time()) + 6 * 3600
+    oid_i = int(oid)
+    if isinstance(ud, dict):
+        ud["awaiting_proof"] = oid_i
+        ud["awaiting_payment_order_id"] = oid_i
+        pm = ud.get("payment_pending_method")
+        if pm and oid_i in ORDERS and isinstance(ORDERS.get(oid_i), dict):
+            o = ORDERS[oid_i]
+            if not o.get("payment_pending_method"):
+                o["payment_pending_method"] = pm
+    b = _user_state_bucket(uid)
+    b["awaiting_proof"] = oid_i
+    b["awaiting_payment_order_id"] = oid_i
+    b["proof_deadline"] = int(time.time()) + 6 * 3600
+    _bind_payment_order_session(uid, ud, oid_i)
+    if persist:
+        try:
+            save_state()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "bind_proof_upload_session save_state uid=%s oid=%s", uid, oid_i
+            )
 
 
 def _resolve_awaiting_payment_order_id(uid: int, user_data: Optional[dict]) -> Optional[int]:
@@ -1323,8 +1349,8 @@ PAY_CARD_BODY = (
     "9112 3810 0954 6243\n\n"
     "Имя на карте:\n"
     "DANIL PARFIONAU\n\n"
-    "После оплаты нажмите:\n"
-    "✅ Я оплатил"
+    "После оплаты пришлите 📸 скрин перевода.\n"
+    "Кнопку «✅ Оплатить» нажимать необязательно."
 )
 PAY_TRANSFER_BODY = (
     "📱 Перевод на номер\n\n"
@@ -1332,14 +1358,14 @@ PAY_TRANSFER_BODY = (
     "+375298124337\n\n"
     "Получатель:\n"
     "DANIL PARFIONAU\n\n"
-    "После оплаты нажмите:\n"
-    "✅ Я оплатил"
+    "После оплаты пришлите 📸 скрин перевода.\n"
+    "Кнопку «✅ Оплатить» нажимать необязательно."
 )
 PAY_CRYPTO_BODY = (
     "₿ Крипто (USDT TRC20)\n\n"
     "TBRKDLTC6QXED4pEVVm1RpZNKeB4ScJChf\n\n"
-    "После оплаты нажмите:\n"
-    "✅ Я оплатил"
+    "После оплаты пришлите 📸 скрин перевода.\n"
+    "Кнопку «✅ Оплатить» нажимать необязательно."
 )
 PAY_PROOF_REQUEST = (
     "📸 Отправьте скрин оплаты\n\n"
@@ -5659,17 +5685,25 @@ def _ensure_awaiting_proof_session(uid: int, ud: Optional[dict] = None) -> Optio
     return None
 
 
-def _set_awaiting_proof_session(uid: int, ud: dict, oid: int) -> None:
+def _set_awaiting_proof_session(
+    uid: int, ud: dict, oid: int, *, persist: bool = True
+) -> None:
     oid_i = int(oid)
     if isinstance(ud, dict):
         ud["awaiting_proof"] = oid_i
         ud["awaiting_payment_order_id"] = oid_i
     b = _user_state_bucket(uid)
+    b["awaiting_proof"] = oid_i
+    b["awaiting_payment_order_id"] = oid_i
     b["proof_deadline"] = int(time.time()) + 7200
-    _user_state_set(uid, "awaiting_proof", oid_i)
-    _user_state_set(uid, "awaiting_payment_order_id", oid_i)
     _bind_payment_order_session(uid, ud, oid_i)
-    save_state()
+    if persist:
+        try:
+            save_state()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "set_awaiting_proof_session save_state uid=%s oid=%s", uid, oid_i
+            )
 
 
 def _is_reply_to_proof_request(msg: Optional[Message]) -> bool:
@@ -12597,28 +12631,83 @@ _PROOF_MEDIA_FILTER = (
 )
 
 
+def _resolve_payment_step_order_id(
+    uid: int, ud: Optional[dict] = None, msg: Optional[Message] = None
+) -> Optional[int]:
+    """Заказ на шаге оплаты: in-memory сессия → последний неоплаченный → Redis."""
+    ud_d = ud if isinstance(ud, dict) else {}
+    if msg is not None:
+        from_reply = _proof_order_id_from_reply_context(uid, ud_d, msg)
+        if from_reply is not None:
+            return int(from_reply)
+    oid = _resolve_proof_order_id_for_photo(uid, ud_d)
+    if oid is not None:
+        return int(oid)
+    for raw in (
+        _user_state_get(uid, "awaiting_proof"),
+        ud_d.get("awaiting_proof"),
+        _user_state_get(uid, "awaiting_payment_order_id"),
+        ud_d.get("awaiting_payment_order_id"),
+    ):
+        if raw is None:
+            continue
+        try:
+            oid_i = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if _proof_order_owned_by_user(uid, oid_i):
+            return oid_i
+    latest = _find_latest_unpaid_order_id(uid)
+    if latest is not None:
+        oid_i = int(latest)
+        o = ORDERS.get(oid_i)
+        if isinstance(o, dict) and int(o.get("user_id") or 0) == int(uid):
+            if (
+                str(o.get("payment_pending_method") or "").strip()
+                or ud_d.get("payment_pending_method")
+                or _user_state_get(uid, "proof_deadline") is not None
+            ):
+                return oid_i
+        return oid_i
+    _refresh_orders_state_from_redis()
+    return _resolve_proof_order_id_aggressive(uid, ud_d, msg)
+
+
 async def on_customer_proof_media(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Единая точка входа для фото/картинок клиента (block=True, без гонок block=False)."""
+    """Единая точка входа для фото/картинок клиента — сначала ответ клиенту, потом Redis."""
     log = logging.getLogger(__name__)
     msg = update.effective_message
     if not msg or not msg.from_user:
         raise ApplicationHandlerStop
     uid = int(msg.from_user.id)
     ud = context.user_data if isinstance(context.user_data, dict) else {}
-    try:
-        file_id = _image_file_id_from_message(msg)
-        log.info(
-            "proof_media uid=%s msg_id=%s photo=%s doc=%s file=%s reply=%s",
-            uid,
-            msg.message_id,
-            bool(msg.photo),
-            bool(msg.document),
-            bool(file_id),
-            bool(msg.reply_to_message),
-        )
+    file_id = _image_file_id_from_message(msg)
+    log.info(
+        "proof_media uid=%s msg_id=%s photo=%s doc=%s file=%s reply=%s",
+        uid,
+        msg.message_id,
+        bool(msg.photo),
+        bool(msg.document),
+        bool(file_id),
+        bool(msg.reply_to_message),
+    )
 
+    if not file_id:
+        if _user_wants_proof_upload(uid, ud, msg):
+            await msg.reply_text(
+                "Не вижу изображение. Пришлите скрин как фото (PNG/JPG), не PDF.",
+                reply_markup=REPLY_KB,
+            )
+        else:
+            await msg.reply_text(
+                "Сначала выберите способ оплаты, затем пришлите скрин оплаты.",
+                reply_markup=REPLY_KB,
+            )
+        raise ApplicationHandlerStop
+
+    try:
         if user_support_state.get(uid):
             ok = await _forward_support_photo_to_admin(context, msg, uid)
             if ok:
@@ -12633,37 +12722,27 @@ async def on_customer_proof_media(
         if pp_oid is not None:
             cap = (msg.caption or "").strip() if msg.caption else ""
             fid = file_id or (msg.photo[-1].file_id if msg.photo else None)
-            if not fid:
-                await msg.reply_text(
-                    "Пришлите фото или картинку (PNG/JPG), не PDF.",
-                    reply_markup=REPLY_KB,
-                )
-            else:
-                ok = await _collect_postpaid_client_message(
-                    context,
-                    uid=uid,
-                    oid=int(pp_oid),
-                    body_text=cap or None,
-                    msg=msg,
-                    photo_file_id=fid,
-                )
-                if not ok:
-                    await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
+            ok = await _collect_postpaid_client_message(
+                context,
+                uid=uid,
+                oid=int(pp_oid),
+                body_text=cap or None,
+                msg=msg,
+                photo_file_id=fid,
+            )
+            if not ok:
+                await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
             raise ApplicationHandlerStop
 
-        _refresh_orders_state_from_redis()
-        proof_oid = _resolve_proof_order_id_aggressive(uid, ud, msg)
-        if proof_oid is None:
-            latest = _find_latest_unpaid_order_id(uid)
-            if latest is not None:
-                proof_oid = int(latest)
+        # Мгновенный ответ — до save_state / Redis (иначе «тишина» 10–30 с).
+        try:
+            await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
+        except Exception:
+            log.exception("proof_media instant ack uid=%s", uid)
 
-        if file_id and proof_oid is not None:
-            _bind_proof_upload_session(uid, ud, int(proof_oid))
-            try:
-                await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
-            except Exception:
-                log.exception("proof_media ack uid=%s", uid)
+        proof_oid = _resolve_payment_step_order_id(uid, ud, msg)
+        if proof_oid is not None:
+            _bind_proof_upload_session(uid, ud, int(proof_oid), persist=False)
             try:
                 await _on_payment_proof_photo_body(update, context)
             except Exception:
@@ -12672,41 +12751,28 @@ async def on_customer_proof_media(
                     await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
                 except Exception:
                     pass
-            raise ApplicationHandlerStop
-
-        if not file_id:
-            if _user_wants_proof_upload(uid, ud, msg):
-                await msg.reply_text(
-                    "Не вижу изображение. Пришлите скрин как фото (PNG/JPG), не PDF.",
-                    reply_markup=REPLY_KB,
-                )
-            else:
-                await msg.reply_text(
-                    "Сначала выберите способ оплаты и нажмите «✅ Оплатить», затем пришлите скрин.",
-                    reply_markup=REPLY_KB,
-                )
-            raise ApplicationHandlerStop
-
-        wants_proof = _user_wants_proof_upload(uid, ud, msg)
-        if not wants_proof:
-            await msg.reply_text(
-                "Сначала нажмите «✅ Оплатить» на сообщении с реквизитами, затем пришлите скрин.",
-                reply_markup=REPLY_KB,
-            )
-            raise ApplicationHandlerStop
-
-        try:
-            await msg.reply_text(MSG_PAY_PROOF_RECEIVED, reply_markup=REPLY_KB)
-        except Exception:
-            log.exception("proof_media ack uid=%s", uid)
-        try:
-            await _on_payment_proof_photo_body(update, context)
-        except Exception:
-            log.exception("proof_media body uid=%s", uid)
             try:
-                await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
+                save_state()
             except Exception:
-                pass
+                log.exception("proof_media final save uid=%s oid=%s", uid, proof_oid)
+            raise ApplicationHandlerStop
+
+        if _user_wants_proof_upload(uid, ud, msg):
+            try:
+                await _on_payment_proof_photo_body(update, context)
+            except Exception:
+                log.exception("proof_media body uid=%s", uid)
+                try:
+                    await msg.reply_text(MSG_PAY_PROOF_TO_ADMIN_FAIL, reply_markup=REPLY_KB)
+                except Exception:
+                    pass
+            raise ApplicationHandlerStop
+
+        await msg.reply_text(
+            "Сначала выберите «💳 Карта» / «📱 Перевод» на шаге оплаты, "
+            "затем пришлите скрин. Кнопку «✅ Оплатить» можно не нажимать.",
+            reply_markup=REPLY_KB,
+        )
     except ApplicationHandlerStop:
         raise
     except Exception:
@@ -12885,8 +12951,7 @@ async def _on_payment_proof_photo_body(
     uid = msg.from_user.id if msg.from_user else 0
     if not uid:
         return
-    _refresh_orders_state_from_redis()
-    oid_raw = _resolve_proof_order_id_aggressive(uid, ud, msg)
+    oid_raw = _resolve_payment_step_order_id(uid, ud, msg)
     if oid_raw is None:
         await msg.reply_text(MSG_EXPECT_PHOTO_PROOF)
         return
@@ -13734,7 +13799,11 @@ def main() -> None:
     app.add_error_handler(on_ptb_error)
 
     app.add_handler(
-        TypeHandler(Update, track_user_activity, block=True),
+        MessageHandler(_PROOF_MEDIA_FILTER, on_customer_proof_media),
+        group=-1,
+    )
+    app.add_handler(
+        TypeHandler(Update, track_user_activity, block=False),
         group=-1,
     )
     app.add_handler(
@@ -13742,10 +13811,6 @@ def main() -> None:
             on_checkout_payment_callback,
             pattern=re.compile(r"^(pay_(card|transfer|crypto)|pay_cancel|paid)(:\d+)?$"),
         ),
-        group=-1,
-    )
-    app.add_handler(
-        MessageHandler(_PROOF_MEDIA_FILTER, on_customer_proof_media),
         group=-1,
     )
     app.add_handler(
