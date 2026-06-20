@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-05-29-client-proof-v32"
+BOT_BUILD_ID = "2026-05-29-checkout-v33"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -10197,30 +10197,49 @@ async def _run_site_confirm_order(
 async def on_checkout_payment_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Ранний роутер pay_* / paid:* (до catch-all unhandled)."""
+    """Единый роутер pay_* / paid:* — один раз на callback (без дублей в других group)."""
     q = update.callback_query
     if not q or not q.data:
         return
     data = (q.data or "").strip()
     log = logging.getLogger(__name__)
-    if _RE_PAY_METHOD_CB.match(data):
-        log.info(
-            "checkout_payment_route method uid=%s data=%r",
+    try:
+        if _RE_PAY_METHOD_CB.match(data):
+            log.info(
+                "checkout_payment_route method uid=%s data=%r",
+                q.from_user.id if q.from_user else 0,
+                data,
+            )
+            await on_payment_method(update, context)
+            raise ApplicationHandlerStop
+        if _RE_PAY_CANCEL_CB.match(data):
+            await on_payment_cancel(update, context)
+            raise ApplicationHandlerStop
+        if _RE_PAID_CB.match(data):
+            log.info(
+                "checkout_payment_route paid uid=%s data=%r",
+                q.from_user.id if q.from_user else 0,
+                data,
+            )
+            await on_payment_paid(update, context)
+            raise ApplicationHandlerStop
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        log.exception(
+            "checkout_payment_route failed uid=%s data=%r",
             q.from_user.id if q.from_user else 0,
             data,
         )
-        await on_payment_method(update, context)
-        raise ApplicationHandlerStop
-    if _RE_PAY_CANCEL_CB.match(data):
-        await on_payment_cancel(update, context)
-        raise ApplicationHandlerStop
-    if _RE_PAID_CB.match(data):
-        log.info(
-            "checkout_payment_route paid uid=%s data=%r",
-            q.from_user.id if q.from_user else 0,
-            data,
-        )
-        await on_payment_paid(update, context)
+        await _callback_ack(q)
+        if q.message:
+            try:
+                await q.message.reply_text(
+                    "Не удалось обработать оплату. Нажмите кнопку ещё раз.",
+                    reply_markup=REPLY_KB,
+                )
+            except Exception:
+                pass
         raise ApplicationHandlerStop
 
 
@@ -12130,13 +12149,16 @@ async def on_payment_method(
     """pay_card | pay_transfer | pay_crypto — реквизиты и кнопка «Я оплатил»."""
     log = logging.getLogger(__name__)
     q = update.callback_query
-    if not q or not q.from_user or not q.data or not q.message:
+    if not q or not q.from_user or not q.message:
+        await _callback_ack(q)
         return
-    m = _RE_PAY_METHOD_CB.match((q.data or "").strip())
-    if not m:
+    if not q.data or not _RE_PAY_METHOD_CB.match((q.data or "").strip()):
         return
     uid = int(q.from_user.id)
     ud = context.user_data if isinstance(context.user_data, dict) else {}
+    m = _RE_PAY_METHOD_CB.match((q.data or "").strip())
+    if not m:
+        return
     await _callback_ack(q)
     msg_txt = (q.message.text or q.message.caption or "") if q.message else ""
     log.info("payment_method uid=%s data=%r msg_oid=%s", uid, q.data, _parse_order_id_from_payment_message(msg_txt))
@@ -12220,14 +12242,37 @@ async def on_payment_paid(
     """paid — подтверждение оплаты клиентом."""
     log = logging.getLogger(__name__)
     q = update.callback_query
-    if not q or not q.from_user or not q.data or not q.message:
+    if not q or not q.from_user or not q.message:
+        await _callback_ack(q)
         return
-    if not _RE_PAID_CB.match((q.data or "").strip()):
+    if not q.data or not _RE_PAID_CB.match((q.data or "").strip()):
         return
     uid = int(q.from_user.id)
     ud = context.user_data if isinstance(context.user_data, dict) else {}
     log.info("payment_paid uid=%s data=%r", uid, q.data)
     await _callback_ack(q)
+    try:
+        await _on_payment_paid_body(update, context, uid=uid, ud=ud, q=q)
+    except Exception:
+        log.exception("on_payment_paid failed uid=%s data=%r", uid, q.data)
+        try:
+            await q.message.reply_text(
+                "Не удалось открыть шаг со скрином. Нажмите «✅ Оплатить» ещё раз.",
+                reply_markup=REPLY_KB,
+            )
+        except Exception:
+            pass
+
+
+async def _on_payment_paid_body(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    uid: int,
+    ud: dict,
+    q: CallbackQuery,
+) -> None:
+    log = logging.getLogger(__name__)
     msg_txt = (q.message.text or q.message.caption or "") if q.message else ""
     oid = _resolve_payment_order_id(
         uid, ud, callback_data=q.data, message_text=msg_txt
@@ -13689,14 +13734,14 @@ def main() -> None:
     app.add_error_handler(on_ptb_error)
 
     app.add_handler(
+        TypeHandler(Update, track_user_activity, block=True),
+        group=-1,
+    )
+    app.add_handler(
         CallbackQueryHandler(
             on_checkout_payment_callback,
             pattern=re.compile(r"^(pay_(card|transfer|crypto)|pay_cancel|paid)(:\d+)?$"),
         ),
-        group=-2,
-    )
-    app.add_handler(
-        TypeHandler(Update, track_user_activity, block=True),
         group=-1,
     )
     app.add_handler(
@@ -13739,26 +13784,6 @@ def main() -> None:
         CallbackQueryHandler(
             on_admin_reject_payment,
             pattern=re.compile(r"^reject_payment_\d+$"),
-        ),
-        group=-1,
-    )
-    app.add_handler(
-        CallbackQueryHandler(
-            on_payment_cancel,
-            pattern=re.compile(r"^pay_cancel(:\d+)?$"),
-        ),
-        group=-1,
-    )
-    app.add_handler(
-        CallbackQueryHandler(
-            on_payment_method,
-            pattern=re.compile(r"^pay_(card|transfer|crypto)(:\d+)?$"),
-        ),
-        group=-1,
-    )
-    app.add_handler(
-        CallbackQueryHandler(
-            on_payment_paid, pattern=re.compile(r"^paid(:\d+)?$")
         ),
         group=-1,
     )
@@ -13848,17 +13873,6 @@ def main() -> None:
     )
     app.add_handler(
         CallbackQueryHandler(
-            on_payment_method,
-            pattern=re.compile(r"^pay_(card|transfer|crypto)(:\d+)?$"),
-        )
-    )
-    app.add_handler(
-        CallbackQueryHandler(
-            on_payment_paid, pattern=re.compile(r"^paid(:\d+)?$")
-        )
-    )
-    app.add_handler(
-        CallbackQueryHandler(
             on_postpaid_submit,
             pattern=re.compile(r"^ppdone:\d+$"),
         )
@@ -13903,7 +13917,6 @@ def main() -> None:
     )
     app.add_handler(CallbackQueryHandler(on_pick_category, pattern=re.compile(r"^c:(\d+|all)$")))
     app.add_handler(CallbackQueryHandler(on_callback_query_unhandled), group=99)
-    app.add_handler(MessageHandler(_PROOF_MEDIA_FILTER, on_user_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     # Краткие сбои Telegram / наложение деплоев: повторить bootstrap (delete_webhook и т.д.).
