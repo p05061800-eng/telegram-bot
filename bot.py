@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-20-auto-shipping-submit-v37"
+BOT_BUILD_ID = "2026-06-20-proof-before-shipping-v38"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -5985,9 +5985,14 @@ def _postpaid_merged_details(o: dict) -> str:
     parts = o.get("delivery_details_parts")
     if isinstance(parts, list) and parts:
         return "\n\n".join(
-            str(x).strip() for x in parts if str(x).strip()
+            str(x).strip()
+            for x in parts
+            if str(x).strip() and str(x).strip() != "[приложено фото]"
         ).strip()
-    return str(o.get("delivery_details") or "").strip()
+    raw = str(o.get("delivery_details") or "").strip()
+    if raw == "[приложено фото]":
+        return ""
+    return raw
 
 
 def _order_has_payment_proof(o: dict) -> bool:
@@ -6052,6 +6057,21 @@ def _kb_postpaid_submit(order_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def _postpaid_shipping_collect_active(uid: int, oid: int) -> bool:
+    """Сбор адреса после скрина — только если чек уже сохранён (или заказ уже у админа)."""
+    o = ORDERS.get(int(oid))
+    if not o or int(o.get("user_id") or 0) != int(uid):
+        return False
+    if o.get("checkout_submitted_to_admin"):
+        return True
+    return _order_has_payment_proof(o)
+
+
+def _delivery_text_looks_valid(text: str) -> bool:
+    t = str(text or "").strip()
+    return len(t) >= 8 and t != "[приложено фото]"
 
 
 async def _reply_postpaid_finalize_to_client(
@@ -6199,11 +6219,17 @@ async def _collect_postpaid_client_message(
             msg=msg,
             photo_file_id=photo_file_id,
         )
+    if not _postpaid_shipping_collect_active(uid, int(oid)):
+        _user_state_pop(uid, "postpaid_thread_oid")
+        return False
     chunk = str(body_text or "").strip()
-    if photo_file_id:
-        extra = "[приложено фото]"
-        chunk = f"{chunk}\n{extra}".strip() if chunk else extra
-    if not chunk:
+    if photo_file_id and not chunk:
+        try:
+            await msg.reply_text(MSG_POSTPAID_NEED_DETAILS)
+        except Exception:
+            pass
+        return True
+    if not _delivery_text_looks_valid(chunk):
         try:
             await msg.reply_text(MSG_POSTPAID_NEED_DETAILS)
         except Exception:
@@ -12318,6 +12344,10 @@ async def on_payment_method(
             _user_state_pop(uid, "awaiting_proof")
         method = m.group(1)
         ud["payment_pending_method"] = method
+        _user_state_pop(uid, "postpaid_thread_oid")
+        if isinstance(o, dict):
+            o.pop("delivery_details_parts", None)
+            o.pop("delivery_details", None)
         _bind_payment_order_session(uid, ud, int(oid))
         if uid:
             _user_state_bucket(int(uid))["proof_deadline"] = int(time.time()) + 6 * 3600
@@ -12798,20 +12828,54 @@ async def on_customer_proof_media(
             raise ApplicationHandlerStop
 
         pp_oid = _user_state_get(uid, "postpaid_thread_oid")
+        proof_oid = _resolve_payment_step_order_id(uid, ud, msg)
+        if proof_oid is not None:
+            o_pr = ORDERS.get(int(proof_oid))
+            if (
+                isinstance(o_pr, dict)
+                and int(o_pr.get("user_id") or 0) == uid
+                and not o_pr.get("checkout_submitted_to_admin")
+                and not _order_has_payment_proof(o_pr)
+            ):
+                pp_oid = None
+            elif pp_oid is not None and int(pp_oid) != int(proof_oid):
+                pp_oid = None
+        if pp_oid is not None and not _postpaid_shipping_collect_active(uid, int(pp_oid)):
+            _user_state_pop(uid, "postpaid_thread_oid")
+            pp_oid = None
         if pp_oid is not None:
-            cap = (msg.caption or "").strip() if msg.caption else ""
-            fid = file_id or (msg.photo[-1].file_id if msg.photo else None)
-            ok = await _collect_postpaid_client_message(
-                context,
-                uid=uid,
-                oid=int(pp_oid),
-                body_text=cap or None,
-                msg=msg,
-                photo_file_id=fid,
-            )
-            if not ok:
-                await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
-            raise ApplicationHandlerStop
+            o_pp = ORDERS.get(int(pp_oid))
+            if o_pp and o_pp.get("checkout_submitted_to_admin"):
+                cap = (msg.caption or "").strip() if msg.caption else ""
+                fid = file_id or (msg.photo[-1].file_id if msg.photo else None)
+                ok = await _collect_postpaid_client_message(
+                    context,
+                    uid=uid,
+                    oid=int(pp_oid),
+                    body_text=cap or None,
+                    msg=msg,
+                    photo_file_id=fid,
+                )
+                if ok:
+                    raise ApplicationHandlerStop
+            else:
+                cap = (msg.caption or "").strip() if msg.caption else ""
+                if not _delivery_text_looks_valid(cap):
+                    try:
+                        await msg.reply_text(MSG_POSTPAID_NEED_DETAILS)
+                    except Exception:
+                        pass
+                    raise ApplicationHandlerStop
+                ok = await _collect_postpaid_client_message(
+                    context,
+                    uid=uid,
+                    oid=int(pp_oid),
+                    body_text=cap,
+                    msg=msg,
+                    photo_file_id=None,
+                )
+                if ok:
+                    raise ApplicationHandlerStop
 
         # Мгновенный ответ — до save_state / Redis (иначе «тишина» 10–30 с).
         try:
@@ -12911,7 +12975,17 @@ async def _on_user_photo_body(
             )
         return
     proof_oid = _resolve_proof_order_id_aggressive(uid, ud, msg) if uid else None
-    if uid and file_id_peek:
+    pp_oid = _user_state_get(uid, "postpaid_thread_oid")
+    shipping_photo = False
+    if uid and pp_oid is not None and proof_oid is not None and int(pp_oid) == int(proof_oid):
+        o_pp = ORDERS.get(int(pp_oid))
+        if (
+            isinstance(o_pp, dict)
+            and _order_has_payment_proof(o_pp)
+            and not o_pp.get("checkout_submitted_to_admin")
+        ):
+            shipping_photo = True
+    if uid and file_id_peek and not shipping_photo:
         if proof_oid is not None:
             await on_payment_proof_photo(update, context)
             return
@@ -12939,19 +13013,51 @@ async def _on_user_photo_body(
             reply_markup=REPLY_KB,
         )
         return
-    pp_oid = _user_state_get(uid, "postpaid_thread_oid")
+    if proof_oid is not None:
+        o_pr = ORDERS.get(int(proof_oid))
+        if (
+            isinstance(o_pr, dict)
+            and int(o_pr.get("user_id") or 0) == uid
+            and not o_pr.get("checkout_submitted_to_admin")
+            and not _order_has_payment_proof(o_pr)
+        ):
+            pp_oid = None
+    if pp_oid is not None and not _postpaid_shipping_collect_active(uid, int(pp_oid)):
+        _user_state_pop(uid, "postpaid_thread_oid")
+        pp_oid = None
     if uid and pp_oid is not None:
+        o_pp = ORDERS.get(int(pp_oid))
+        if o_pp and o_pp.get("checkout_submitted_to_admin"):
+            cap = (msg.caption or "").strip() if msg.caption else ""
+            fid = msg.photo[-1].file_id if msg.photo else None
+            ok = await _collect_postpaid_client_message(
+                context,
+                uid=uid,
+                oid=int(pp_oid),
+                body_text=cap or None,
+                msg=msg,
+                photo_file_id=fid,
+            )
+            if not ok:
+                try:
+                    await msg.reply_text(MSG_SEND_SUPPORT_FAIL)
+                except Exception:
+                    pass
+            return
         cap = (msg.caption or "").strip() if msg.caption else ""
-        fid = msg.photo[-1].file_id if msg.photo else None
-        if not fid:
+        if not _delivery_text_looks_valid(cap):
+            try:
+                await msg.reply_text(MSG_POSTPAID_NEED_DETAILS)
+            except Exception:
+                pass
             return
         ok = await _collect_postpaid_client_message(
             context,
             uid=uid,
             oid=int(pp_oid),
-            body_text=cap or None,
+            body_text=cap,
             msg=msg,
-            photo_file_id=fid,
+            photo_file_id=None,
         )
         if not ok:
             try:
@@ -13061,6 +13167,7 @@ async def _on_payment_proof_photo_body(
             reply_markup=REPLY_KB,
         )
         return
+    _user_state_pop(uid, "postpaid_thread_oid")
     if o.get("checkout_submitted_to_admin") and o.get("payment_proof_submitted"):
         _user_state_set(uid, "postpaid_thread_oid", int(oid))
         await msg.reply_text(MSG_POSTPAID_FORWARDED_OK)
