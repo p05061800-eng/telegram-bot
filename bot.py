@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-shipping-fix-v53"
+BOT_BUILD_ID = "2026-06-21-shipping-fix-v54"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -5610,14 +5610,33 @@ async def _send_deferred_admin_order_panel(
     await _send_admin_order_panel(context, order_id, o, force_new=True)
 
 
-def _kb_order_admin_actions(order_id: int, _status: str) -> Optional[InlineKeyboardMarkup]:
-    """Кнопки заказа для админа: статус можно менять и удалить карточку из чата в любой момент."""
-    rep = InlineKeyboardButton("💬 Ответить", callback_data=f"oam:rep:{order_id}")
-    acc = InlineKeyboardButton("✅ Принять", callback_data=f"accept_{order_id}")
-    shp = InlineKeyboardButton("🚚 Отправлен", callback_data=f"sent_{order_id}")
-    can = InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_{order_id}")
-    done_btn = InlineKeyboardButton("🏁 Завершён", callback_data=f"done_{order_id}")
-    del_btn = InlineKeyboardButton("🗑 Удалить из чата", callback_data=f"delmsg_{order_id}")
+def _kb_order_admin_actions(order_id: int, status: str) -> Optional[InlineKeyboardMarkup]:
+    """Кнопки заказа: текущий статус отмечен «✓» на соответствующей кнопке."""
+    st = _norm_bot_order_status(str(status or "new"))
+    oid = int(order_id)
+    rep = InlineKeyboardButton("💬 Ответить", callback_data=f"oam:rep:{oid}")
+    del_btn = InlineKeyboardButton("🗑 Удалить из чата", callback_data=f"delmsg_{oid}")
+
+    def _btn(label: str, key: str, action: str) -> InlineKeyboardButton:
+        text = f"{label} ✓" if st == key else label
+        return InlineKeyboardButton(text, callback_data=f"{action}_{oid}")
+
+    acc = _btn("✅ Принять", "accepted", "accept")
+    if st == "new":
+        acc = InlineKeyboardButton("🆕 Новый ✓", callback_data=f"accept_{oid}")
+    elif st == "accepted":
+        acc = InlineKeyboardButton("✅ Принят ✓", callback_data=f"accept_{oid}")
+
+    shp = _btn("🚚 Отправлен", "shipped", "sent")
+    done_btn = _btn("🏁 Завершён", "done", "done")
+    can = _btn("❌ Отменить", "canceled", "cancel")
+    if st == "canceled":
+        can = InlineKeyboardButton("❌ Отменён ✓", callback_data=f"cancel_{oid}")
+
+    if st in ("done", "canceled"):
+        mark = done_btn if st == "done" else can
+        return InlineKeyboardMarkup([[mark], [rep], [del_btn]])
+
     return InlineKeyboardMarkup(
         [
             [rep, acc],
@@ -7018,28 +7037,47 @@ async def _notify_order_customer(
 
 
 async def _refresh_admin_order_message(
-    context: ContextTypes.DEFAULT_TYPE, order_id: int
+    context: ContextTypes.DEFAULT_TYPE,
+    order_id: int,
+    *,
+    q: Optional[CallbackQuery] = None,
 ) -> None:
     o = ORDERS.get(order_id)
     if not o:
         return
-    cid = o.get("admin_chat_id")
-    mid = o.get("admin_message_id")
-    if cid is None or mid is None:
-        return
     log = logging.getLogger(__name__)
     text = _format_admin_order_detail_text(order_id, o)
     kb = _kb_order_admin_actions(order_id, str(o.get("status") or "new"))
-    try:
-        await context.bot.edit_message_text(
-            chat_id=int(cid),
-            message_id=int(mid),
-            text=text,
-            reply_markup=kb,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        log.warning("Не удалось обновить сообщение заказа #%s", order_id)
+    targets: List[Tuple[int, int]] = []
+    if q and q.message:
+        targets.append((int(q.message.chat_id), int(q.message.message_id)))
+    cid = o.get("admin_chat_id")
+    mid = o.get("admin_message_id")
+    if cid is not None and mid is not None:
+        pair = (int(cid), int(mid))
+        if pair not in targets:
+            targets.append(pair)
+    if not targets:
+        return
+    for chat_id, message_id in targets:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            o["admin_chat_id"] = chat_id
+            o["admin_message_id"] = message_id
+            return
+        except Exception:
+            log.warning(
+                "Не удалось обновить сообщение заказа #%s chat=%s mid=%s",
+                order_id,
+                chat_id,
+                message_id,
+            )
 
 
 async def _admin_delete_order_chat_message(
@@ -11865,9 +11903,10 @@ async def on_order_status_buttons(
     update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     log = logging.getLogger(__name__)
-    if not q or not q.from_user or not q.data or not q.message:
+    if not q or not q.from_user or not q.data:
         return
-    m = re.match(r"^(accept|sent|cancel|done|delmsg)_(\d+)$", (q.data or "").strip())
+    data = (q.data or "").strip()
+    m = re.match(r"^(accept|sent|cancel|done|delmsg)_(\d+)$", data)
     if not m:
         return
     if not is_admin(q.from_user.id):
@@ -11876,24 +11915,34 @@ async def on_order_status_buttons(
         except Exception:
             pass
         raise ApplicationHandlerStop
+    if not q.message:
+        try:
+            await q.answer("Сообщение заказа недоступно.", show_alert=True)
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
     action, oid_s = m.group(1), m.group(2)
     try:
         oid = int(oid_s)
     except ValueError:
         await q.answer()
-        return
+        raise ApplicationHandlerStop
     log.info(
-        "admin order action uid=%s action=%s oid=%s data=%r",
+        "admin order action uid=%s action=%s oid=%s data=%r chat=%s mid=%s",
         q.from_user.id,
         action,
         oid,
-        q.data,
+        data,
+        q.message.chat_id,
+        q.message.message_id,
     )
     try:
         o = _restore_order_for_admin(q, oid)
         if not o:
             await _reply_admin_order_stale(q, oid)
             raise ApplicationHandlerStop
+        o["admin_chat_id"] = int(q.message.chat_id)
+        o["admin_message_id"] = int(q.message.message_id)
         if text := ((q.message.text or q.message.caption or "").strip() if q.message else ""):
             if _message_looks_like_admin_order_card(text) and not list(o.get("items") or []):
                 o = _enrich_order_from_admin_card_text(o, oid, text)
@@ -11913,7 +11962,7 @@ async def on_order_status_buttons(
         st_norm = _norm_bot_order_status(str(o.get("status") or "new"))
         if st_norm == want:
             await q.answer("Статус уже такой.", show_alert=False)
-            await _refresh_admin_order_message(context, oid)
+            await _refresh_admin_order_message(context, oid, q=q)
             raise ApplicationHandlerStop
         await q.answer(MSG_ORDER_STATUS_UPDATED, show_alert=False)
         o["status"] = want
@@ -11930,7 +11979,11 @@ async def on_order_status_buttons(
         await _sync_site_order_status(o)
         notice = _format_customer_order_status_notice(oid, str(o.get("status") or ""))
         await _notify_order_customer(context, o, notice)
-        await _refresh_admin_order_message(context, oid)
+        await _refresh_admin_order_message(context, oid, q=q)
+        try:
+            await asyncio.to_thread(save_state)
+        except Exception:
+            log.exception("admin order status save after refresh oid=%s", oid)
     except ApplicationHandlerStop:
         raise
     except Exception:
@@ -14957,7 +15010,6 @@ def main() -> None:
         CallbackQueryHandler(
             on_order_status_buttons,
             pattern=re.compile(r"^(accept|sent|cancel|done|delmsg)_\d+$"),
-            block=False,
         ),
         group=-1,
     )
@@ -14965,7 +15017,6 @@ def main() -> None:
         CallbackQueryHandler(
             on_order_admin_action,
             pattern=re.compile(r"^oam:rep:\d+$"),
-            block=False,
         ),
         group=-1,
     )
@@ -14973,7 +15024,6 @@ def main() -> None:
         CallbackQueryHandler(
             on_postpaid_submit,
             pattern=re.compile(r"^ppdone:\d+$"),
-            block=False,
         ),
         group=-1,
     )
@@ -14981,7 +15031,6 @@ def main() -> None:
         CallbackQueryHandler(
             on_admin_confirm_payment,
             pattern=re.compile(r"^confirm_payment_\d+$"),
-            block=False,
         ),
         group=-1,
     )
@@ -14989,7 +15038,6 @@ def main() -> None:
         CallbackQueryHandler(
             on_admin_reject_payment,
             pattern=re.compile(r"^reject_payment_\d+$"),
-            block=False,
         ),
         group=-1,
     )
