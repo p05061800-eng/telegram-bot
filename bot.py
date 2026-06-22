@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-shipping-fix-v57"
+BOT_BUILD_ID = "2026-06-22-purge-orders-v58"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -444,6 +444,34 @@ def _build_state_payload() -> dict:
         "pending_site_order_by_user": PENDING_SITE_ORDER_BY_USER,
         "shared_deep_link_orders": SHARED_DEEP_LINK_ORDERS,
     }
+
+
+def _purge_all_orders_state() -> int:
+    """Удалить все заказы и черновики оформления; счётчик заказов → 1."""
+    global ORDER_COUNTER
+    removed = len(ORDERS)
+    ORDERS.clear()
+    USER_ORDERS.clear()
+    ORDER_COUNTER = 1
+    SHARED_DEEP_LINK_ORDERS.clear()
+    PENDING_SITE_ORDER_BY_USER.clear()
+    SITE_LOGIN_PENDING_ORDER.clear()
+    _SITE_CHECKOUT_PUSHED.clear()
+    _SITE_CHECKOUT_PUSHED_FP.clear()
+    for uid in list(user_states.keys()):
+        bucket = user_states.get(uid)
+        if not isinstance(bucket, dict):
+            continue
+        for key in (
+            "awaiting_proof",
+            "postpaid_thread_oid",
+            "awaiting_payment_order_id",
+            "crypto_check",
+        ):
+            bucket.pop(key, None)
+        if not bucket:
+            user_states.pop(uid, None)
+    return removed
 
 
 def _apply_state_payload(data: dict) -> None:
@@ -11722,6 +11750,27 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def reset_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сбросить все заказы в памяти/Redis (только админ)."""
+    msg = update.effective_message
+    u = update.effective_user
+    if not msg or not u:
+        return
+    if not is_admin(u.id):
+        await msg.reply_text(ADMIN_ACCESS_DENIED)
+        return
+    removed = _purge_all_orders_state()
+    try:
+        await asyncio.to_thread(save_state)
+    except Exception:
+        logging.getLogger(__name__).exception("reset_orders save_state")
+    await msg.reply_text(
+        f"✅ Все заказы удалены ({removed} шт.).\n"
+        "Новые заказы начнутся с #1.\n\n"
+        "Старые карточки в чате можно удалить вручную — в базе их уже нет."
+    )
+
+
 async def admin_say_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправить текст клиенту по user_id (только админ)."""
     msg = update.effective_message
@@ -14882,6 +14931,36 @@ async def login_http_api_watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> Non
 async def post_init(application: Application) -> None:
     log = logging.getLogger(__name__)
     load_state()
+    purge_on_start = str(os.getenv("BOT_PURGE_ORDERS_ON_START") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if purge_on_start or BOT_BUILD_ID == "2026-06-22-purge-orders-v58":
+        removed = _purge_all_orders_state()
+        try:
+            await asyncio.to_thread(save_state)
+        except Exception:
+            log.exception("purge orders on start save_state")
+        log.warning("orders purged on start removed=%s build=%s", removed, BOT_BUILD_ID)
+        try:
+            purge_note = (
+                f"🗑 Все заказы сброшены ({removed} шт.). "
+                f"Новые заказы с #1 · {BOT_BUILD_ID}"
+            )
+            notified: set = set()
+            for tgt in _admin_order_notify_targets():
+                key = int(tgt) if isinstance(tgt, int) else str(tgt).strip().lower()
+                if key in notified:
+                    continue
+                notified.add(key)
+                try:
+                    await application.bot.send_message(chat_id=tgt, text=purge_note)
+                except Exception:
+                    log.exception("purge notify target=%s", tgt)
+        except Exception:
+            log.exception("purge notify admin")
     _rebuild_site_login_pending_from_carts()
     application.bot_data["deploy_epoch"] = time.time_ns()
     n_sl = len(SITE_LOGIN_PENDING_ORDER)
@@ -15067,6 +15146,7 @@ def main() -> None:
     app.add_handler(CommandHandler("promo", send_promo))
     app.add_handler(CommandHandler("swipe", send_tinder_mode))
     app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("reset_orders", reset_orders_cmd))
     app.add_handler(CommandHandler("say", admin_say_cmd))
     # confirm_order / cancel_order — явный pattern (нельзя передавать UpdateFilter как pattern).
     app.add_handler(
