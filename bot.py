@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-22-admin-single-card-v62"
+BOT_BUILD_ID = "2026-06-22-admin-reply-fix-v63"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -3862,9 +3862,12 @@ class _SupportClientTextFilter(filters.MessageFilter):
     def filter(self, message) -> bool:
         if not message or not getattr(message, "text", None) or not message.from_user:
             return False
+        uid = int(message.from_user.id)
+        if is_admin(uid):
+            return False
         if not _is_support_forwardable_client_text(message.text):
             return False
-        return bool(user_support_state.get(int(message.from_user.id)))
+        return bool(user_support_state.get(uid))
 
 
 SUPPORT_CLIENT_TEXT_FILTER = _SupportClientTextFilter()
@@ -12047,6 +12050,7 @@ async def on_order_admin_action(
         await _reply_admin_order_stale(q, oid, already_acked=True)
         raise ApplicationHandlerStop
     context.user_data.pop("reply_support_user_id", None)
+    user_support_state.pop(int(q.from_user.id), None)
     context.user_data["reply_to"] = oid
     cust = int(o.get("user_id") or 0)
     if cust:
@@ -12076,6 +12080,7 @@ async def on_support_reply_activate(
         await _callback_ack(q)
         raise ApplicationHandlerStop
     await _callback_ack(q)
+    user_support_state.pop(int(q.from_user.id), None)
     context.user_data.pop("reply_to", None)
     context.user_data["reply_support_user_id"] = client_uid
     await _send_customer_plain(context.bot, client_uid, ADMIN_TYPING_NOTICE)
@@ -13895,7 +13900,7 @@ async def on_customer_proof_media(
         raise ApplicationHandlerStop
 
     try:
-        if user_support_state.get(uid):
+        if user_support_state.get(uid) and not is_admin(uid):
             ok = await _forward_client_support_message(
                 context,
                 msg,
@@ -14145,7 +14150,7 @@ async def _on_user_photo_body(
             except Exception:
                 pass
         return
-    if uid and user_support_state.get(uid):
+    if uid and user_support_state.get(uid) and not is_admin(uid):
         ok = await _forward_support_photo_to_admin(context, msg, uid)
         if ok:
             user_support_state.pop(uid, None)
@@ -14631,6 +14636,91 @@ async def on_view_cart_callback(
             log_vc.exception("vc:0 fallback reply failed")
 
 
+_ADMIN_REPLY_MENU_KEYS = frozenset(
+    (
+        BTN_CATALOG,
+        BTN_CART,
+        BTN_CHAT,
+        BTN_DELIVERY,
+        BTN_MY_ORDERS,
+        BTN_POPULAR,
+        BTN_FAVORITES,
+        BTN_RANDOM_CARD,
+    )
+)
+
+
+async def _try_handle_admin_reply_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """Ответ админа клиенту (поддержка или заказ). True — обработано."""
+    msg = update.effective_message
+    if not msg or not msg.text or not msg.from_user:
+        return False
+    uid = int(msg.from_user.id)
+    if not is_admin(uid):
+        return False
+    user_data = context.user_data if isinstance(context.user_data, dict) else {}
+    sup_uid = user_data.get("reply_support_user_id")
+    rep_oid = user_data.get("reply_to")
+    if sup_uid is None and rep_oid is None:
+        return False
+    text = str(msg.text or "").strip()
+    if text in _ADMIN_REPLY_MENU_KEYS:
+        user_data.pop("reply_to", None)
+        user_data.pop("reply_support_user_id", None)
+        return True
+    if not text:
+        await msg.reply_text(MSG_TYPE_REPLY_TEXT)
+        return True
+    if sup_uid is not None:
+        target = int(sup_uid)
+        body = "💬 Поддержка:\n\n" + text
+        if len(body) > 4096:
+            body = body[:4090] + "…"
+        ok = await _send_customer_plain(context.bot, target, body)
+        if not ok:
+            await msg.reply_text(MSG_FORWARD_FAIL)
+            return True
+        user_data.pop("reply_support_user_id", None)
+        await msg.reply_text(MSG_ADMIN_SAY_OK)
+        return True
+    try:
+        oid_int = int(rep_oid)
+    except (TypeError, ValueError):
+        user_data.pop("reply_to", None)
+        await msg.reply_text(MSG_ADMIN_REPLY_SESSION_RESET)
+        return True
+    o = ORDERS.get(oid_int)
+    if not o:
+        user_data.pop("reply_to", None)
+        await msg.reply_text(MSG_ADMIN_REPLY_SESSION_RESET)
+        return True
+    target = int(o.get("user_id") or 0)
+    if not target:
+        user_data.pop("reply_to", None)
+        await msg.reply_text(MSG_ADMIN_REPLY_SESSION_RESET)
+        return True
+    body = "💬 Ответ от администратора:\n\n" + text
+    if len(body) > 4096:
+        body = body[:4090] + "…"
+    ok = await _send_customer_plain(context.bot, target, body)
+    if not ok:
+        await msg.reply_text(MSG_FORWARD_FAIL)
+        return True
+    user_data.pop("reply_to", None)
+    await msg.reply_text(MSG_ADMIN_SAY_OK)
+    return True
+
+
+async def on_admin_reply_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Ответ админа клиенту — group -1, до перехвата «Связь»."""
+    if await _try_handle_admin_reply_text(update, context):
+        raise ApplicationHandlerStop
+
+
 async def on_support_client_text(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -14639,6 +14729,8 @@ async def on_support_client_text(
     if not msg or not msg.from_user:
         return
     uid = int(msg.from_user.id)
+    if is_admin(uid):
+        return
     if not user_support_state.get(uid):
         return
     text = str(msg.text or "").strip()
@@ -14862,67 +14954,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if co is not None and not co.get("paid"):
             _clear_crypto_auto_watch(co, uid)
 
-    menu_keys = (
-        BTN_CATALOG,
-        BTN_CART,
-        BTN_CHAT,
-        BTN_DELIVERY,
-        BTN_MY_ORDERS,
-        BTN_POPULAR,
-        BTN_FAVORITES,
-        BTN_RANDOM_CARD,
-    )
     sup_uid = user_data.get("reply_support_user_id")
     rep_oid = user_data.get("reply_to")
     if is_admin(uid) and (sup_uid is not None or rep_oid is not None):
-        if text in menu_keys:
-            user_data.pop("reply_to", None)
-            user_data.pop("reply_support_user_id", None)
-        elif not text:
-            await msg.reply_text(MSG_TYPE_REPLY_TEXT)
-            return
-        elif sup_uid is not None:
-            target = int(sup_uid)
-            body = "💬 Поддержка:\n\n" + msg.text
-            if len(body) > 4096:
-                body = body[:4090] + "…"
-            ok = await _send_customer_plain(context.bot, target, body)
-            if not ok:
-                await msg.reply_text(MSG_FORWARD_FAIL)
-                return
-            user_data.pop("reply_support_user_id", None)
-            await msg.reply_text(MSG_ADMIN_SAY_OK)
-            return
-        else:
-            oid_raw = user_data.get("reply_to")
-            try:
-                oid_int = int(oid_raw)
-            except (TypeError, ValueError):
-                user_data.pop("reply_to", None)
-                await msg.reply_text(MSG_ADMIN_REPLY_SESSION_RESET)
-                return
-            o = ORDERS.get(oid_int)
-            if not o:
-                user_data.pop("reply_to", None)
-                await msg.reply_text(MSG_ADMIN_REPLY_SESSION_RESET)
-                return
-            target = int(o.get("user_id") or 0)
-            if not target:
-                user_data.pop("reply_to", None)
-                await msg.reply_text(MSG_ADMIN_REPLY_SESSION_RESET)
-                return
-            body = "💬 Ответ от администратора:\n\n" + msg.text
-            if len(body) > 4096:
-                body = body[:4090] + "…"
-            ok = await _send_customer_plain(context.bot, target, body)
-            if not ok:
-                await msg.reply_text(MSG_FORWARD_FAIL)
-                return
-            user_data.pop("reply_to", None)
-            await msg.reply_text(MSG_ADMIN_SAY_OK)
+        if await _try_handle_admin_reply_text(update, context):
             return
 
-    if uid and user_support_state.get(uid):
+    if uid and user_support_state.get(uid) and not is_admin(uid):
         if _is_reply_menu_text(text):
             user_support_state.pop(uid, None)
         elif not _is_support_forwardable_client_text(text):
@@ -15165,6 +15203,14 @@ def main() -> None:
 
     app.add_handler(
         MessageHandler(MAIN_REPLY_MENU_FILTER, on_reply_menu_buttons),
+        group=-1,
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            on_admin_reply_text,
+            block=False,
+        ),
         group=-1,
     )
     app.add_handler(
