@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-shipping-fix-v55"
+BOT_BUILD_ID = "2026-06-21-shipping-fix-v56"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -3377,6 +3377,8 @@ async def on_ptb_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
     log.error("Необработанная ошибка в обработчике: %s", err, exc_info=err)
     if not isinstance(update, Update):
         return
+    if update.callback_query:
+        await _callback_ack(update.callback_query)
     try:
         if update.callback_query and update.callback_query.message:
             await update.callback_query.message.reply_text(
@@ -5298,11 +5300,14 @@ def _restore_order_for_admin(q: CallbackQuery, oid: int) -> Optional[dict]:
     return o
 
 
-async def _reply_admin_order_stale(q: CallbackQuery, oid: int) -> None:
-    try:
-        await q.answer("Заказ не найден", show_alert=True)
-    except Exception:
-        pass
+async def _reply_admin_order_stale(
+    q: CallbackQuery, oid: int, *, already_acked: bool = False
+) -> None:
+    if not already_acked:
+        try:
+            await q.answer("Заказ не найден", show_alert=True)
+        except Exception:
+            pass
     if q.message:
         await q.message.reply_text(MSG_ADMIN_ORDER_STALE.format(oid=int(oid)))
 
@@ -7036,6 +7041,38 @@ async def _notify_order_customer(
     return await _send_customer_plain(context.bot, uid, text)
 
 
+async def _try_edit_admin_order_card(
+    bot,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    kb: Optional[InlineKeyboardMarkup],
+) -> bool:
+    """Текстовая карточка или подпись к фото чека — edit_message_text / edit_message_caption."""
+    log = logging.getLogger(__name__)
+    common = {"chat_id": int(chat_id), "message_id": int(message_id), "reply_markup": kb}
+    try:
+        await bot.edit_message_text(
+            text=text,
+            disable_web_page_preview=True,
+            **common,
+        )
+        return True
+    except Exception:
+        pass
+    cap = text if len(text) <= 1024 else text[:1020] + "…"
+    try:
+        await bot.edit_message_caption(caption=cap, **common)
+        return True
+    except Exception:
+        log.warning(
+            "Не удалось обновить карточку заказа chat=%s mid=%s",
+            chat_id,
+            message_id,
+        )
+        return False
+
+
 async def _refresh_admin_order_message(
     context: ContextTypes.DEFAULT_TYPE,
     order_id: int,
@@ -7045,7 +7082,6 @@ async def _refresh_admin_order_message(
     o = ORDERS.get(order_id)
     if not o:
         return
-    log = logging.getLogger(__name__)
     text = _format_admin_order_detail_text(order_id, o)
     kb = _kb_order_admin_actions(order_id, str(o.get("status") or "new"))
     targets: List[Tuple[int, int]] = []
@@ -7060,24 +7096,10 @@ async def _refresh_admin_order_message(
     if not targets:
         return
     for chat_id, message_id in targets:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                reply_markup=kb,
-                disable_web_page_preview=True,
-            )
+        if await _try_edit_admin_order_card(context.bot, chat_id, message_id, text, kb):
             o["admin_chat_id"] = chat_id
             o["admin_message_id"] = message_id
             return
-        except Exception:
-            log.warning(
-                "Не удалось обновить сообщение заказа #%s chat=%s mid=%s",
-                order_id,
-                chat_id,
-                message_id,
-            )
 
 
 async def _admin_delete_order_chat_message(
@@ -11228,6 +11250,27 @@ async def on_callback_query_unhandled(
     data = (q.data or "").strip()
     uid = int(q.from_user.id) if q.from_user else 0
     log = logging.getLogger(__name__)
+    if re.match(r"^(accept|sent|cancel|done|delmsg)_\d+$", data):
+        await on_order_status_buttons(update, context)
+        return
+    if re.match(r"^confirm_payment_\d+$", data):
+        await on_admin_confirm_payment(update, context)
+        return
+    if re.match(r"^reject_payment_\d+$", data):
+        await on_admin_reject_payment(update, context)
+        return
+    if re.match(r"^oam:rep:\d+$", data):
+        await on_order_admin_action(update, context)
+        return
+    if re.match(r"^open_order_\d+$", data):
+        await on_admin_open_order(update, context)
+        return
+    if re.match(r"^adm:", data):
+        await on_admin_panel_action(update, context)
+        return
+    if re.match(r"^adm_user_(new|all|shipped)_\d+$", data):
+        await on_admin_user_messages(update, context)
+        return
     if _RE_PAY_METHOD_CB.match(data):
         await on_payment_method(update, context)
         return
@@ -11260,18 +11303,6 @@ async def on_callback_query_unhandled(
         data,
         q.message.message_id if q.message else None,
     )
-    if re.match(r"^(accept|sent|cancel|done|delmsg)_\d+$", data):
-        await on_order_status_buttons(update, context)
-        return
-    if re.match(r"^confirm_payment_\d+$", data):
-        await on_admin_confirm_payment(update, context)
-        return
-    if re.match(r"^reject_payment_\d+$", data):
-        await on_admin_reject_payment(update, context)
-        return
-    if re.match(r"^oam:rep:\d+$", data):
-        await on_order_admin_action(update, context)
-        return
     msg_text = (q.message.text or q.message.caption or "") if q.message else ""
     if _message_looks_like_admin_order_card(msg_text):
         await _callback_ack(q)
@@ -11711,6 +11742,7 @@ async def on_admin_panel_action(
     if not m:
         return
     if not is_admin(q.from_user.id):
+        await _callback_ack(q, ADMIN_ACCESS_DENIED, show_alert=True)
         return
     action = m.group(1)
     await q.answer()
@@ -11755,12 +11787,13 @@ async def on_admin_user_messages(
     if not m:
         return
     if not is_admin(q.from_user.id):
+        await _callback_ack(q, ADMIN_ACCESS_DENIED, show_alert=True)
         return
     try:
         section = m.group(1)
         uid = int(m.group(2))
     except ValueError:
-        await q.answer()
+        await _callback_ack(q)
         return
     await q.answer()
     await q.message.reply_text(
@@ -11779,17 +11812,18 @@ async def on_admin_open_order(
     if not m:
         return
     if not is_admin(q.from_user.id):
-        return
+        await _callback_ack(q, ADMIN_ACCESS_DENIED, show_alert=True)
+        raise ApplicationHandlerStop
     try:
         oid = int(m.group(1))
     except ValueError:
-        await q.answer()
-        return
-    o = _restore_order_for_admin(q, oid)
-    if not o:
-        await _reply_admin_order_stale(q, oid)
+        await _callback_ack(q)
         raise ApplicationHandlerStop
-    await q.answer()
+    await _callback_ack(q)
+    o = await asyncio.to_thread(_restore_order_for_admin, q, oid)
+    if not o:
+        await _reply_admin_order_stale(q, oid, already_acked=True)
+        raise ApplicationHandlerStop
     st = str(o.get("status") or "new")
     await q.message.reply_text(
         _format_admin_order_detail_text(oid, o),
@@ -11808,19 +11842,20 @@ async def on_order_admin_action(
     if not m:
         return
     if not is_admin(q.from_user.id):
-        return
+        await _callback_ack(q, ADMIN_ACCESS_DENIED, show_alert=True)
+        raise ApplicationHandlerStop
     try:
         oid = int(m.group(1))
     except ValueError:
-        await q.answer()
-        return
-    o = _restore_order_for_admin(q, oid)
+        await _callback_ack(q)
+        raise ApplicationHandlerStop
+    await _callback_ack(q)
+    o = await asyncio.to_thread(_restore_order_for_admin, q, oid)
     if not o:
-        await _reply_admin_order_stale(q, oid)
+        await _reply_admin_order_stale(q, oid, already_acked=True)
         raise ApplicationHandlerStop
     context.user_data.pop("reply_support_user_id", None)
     context.user_data["reply_to"] = oid
-    await q.answer()
     cust = int(o.get("user_id") or 0)
     if cust:
         await _send_customer_plain(context.bot, cust, ADMIN_TYPING_NOTICE)
@@ -11908,25 +11943,21 @@ async def on_order_status_buttons(
     data = (q.data or "").strip()
     m = re.match(r"^(accept|sent|cancel|done|delmsg)_(\d+)$", data)
     if not m:
-        return
+        await _callback_ack(q)
+        raise ApplicationHandlerStop
     if not is_admin(q.from_user.id):
-        try:
-            await q.answer("Эта кнопка только для администратора.", show_alert=True)
-        except Exception:
-            pass
+        await _callback_ack(q, "Эта кнопка только для администратора.", show_alert=True)
         raise ApplicationHandlerStop
     if not q.message:
-        try:
-            await q.answer("Сообщение заказа недоступно.", show_alert=True)
-        except Exception:
-            pass
+        await _callback_ack(q, "Сообщение заказа недоступно.", show_alert=True)
         raise ApplicationHandlerStop
     action, oid_s = m.group(1), m.group(2)
     try:
         oid = int(oid_s)
     except ValueError:
-        await q.answer()
+        await _callback_ack(q)
         raise ApplicationHandlerStop
+    await _callback_ack(q)
     log.info(
         "admin order action uid=%s action=%s oid=%s data=%r chat=%s mid=%s",
         q.from_user.id,
@@ -11937,9 +11968,9 @@ async def on_order_status_buttons(
         q.message.message_id,
     )
     try:
-        o = _restore_order_for_admin(q, oid)
+        o = await asyncio.to_thread(_restore_order_for_admin, q, oid)
         if not o:
-            await _reply_admin_order_stale(q, oid)
+            await _reply_admin_order_stale(q, oid, already_acked=True)
             raise ApplicationHandlerStop
         o["admin_chat_id"] = int(q.message.chat_id)
         o["admin_message_id"] = int(q.message.message_id)
@@ -11947,7 +11978,6 @@ async def on_order_status_buttons(
             if _message_looks_like_admin_order_card(text) and not list(o.get("items") or []):
                 o = _enrich_order_from_admin_card_text(o, oid, text)
         if action == "delmsg":
-            await q.answer()
             await _admin_delete_order_chat_message(context, q, oid)
             raise ApplicationHandlerStop
         want = {
@@ -11957,14 +11987,11 @@ async def on_order_status_buttons(
             "cancel": "canceled",
         }.get(action)
         if not want:
-            await q.answer()
             raise ApplicationHandlerStop
         st_norm = _norm_bot_order_status(str(o.get("status") or "new"))
         if st_norm == want:
-            await q.answer("Статус уже такой.", show_alert=False)
             await _refresh_admin_order_message(context, oid, q=q)
             raise ApplicationHandlerStop
-        await q.answer(MSG_ORDER_STATUS_UPDATED, show_alert=False)
         o["status"] = want
         try:
             await asyncio.to_thread(save_state)
@@ -11988,10 +12015,11 @@ async def on_order_status_buttons(
         raise
     except Exception:
         log.exception("admin order action failed oid=%s action=%s", oid, action)
-        try:
-            await q.answer("Не удалось обновить заказ.", show_alert=True)
-        except Exception:
-            pass
+        if q.message:
+            try:
+                await q.message.reply_text("Не удалось обновить заказ. Попробуйте ещё раз.")
+            except Exception:
+                pass
     raise ApplicationHandlerStop
 
 
@@ -14132,31 +14160,23 @@ async def on_admin_confirm_payment(
     if not m:
         return
     if not is_admin(q.from_user.id):
-        try:
-            await q.answer()
-        except Exception:
-            pass
+        await _callback_ack(q, ADMIN_ACCESS_DENIED, show_alert=True)
         raise ApplicationHandlerStop
     try:
         oid = int(m.group(1))
     except ValueError:
-        await q.answer()
+        await _callback_ack(q)
         raise ApplicationHandlerStop
-    o = _restore_order_for_admin(q, oid)
+    await _callback_ack(q)
+    o = await asyncio.to_thread(_restore_order_for_admin, q, oid)
     if not o:
-        await _reply_admin_order_stale(q, oid)
+        await _reply_admin_order_stale(q, oid, already_acked=True)
         raise ApplicationHandlerStop
     if o.get("paid"):
-        try:
-            await q.answer()
-        except Exception:
-            pass
         raise ApplicationHandlerStop
     if not o.get("payment_proof_submitted"):
-        try:
-            await q.answer()
-        except Exception:
-            pass
+        if q.message:
+            await q.message.reply_text("Сначала нужен скрин оплаты от клиента.")
         raise ApplicationHandlerStop
     o["paid"] = True
     o["paid_at"] = time.time()
@@ -14167,10 +14187,6 @@ async def on_admin_confirm_payment(
     cud.pop("awaiting_payment_order_id", None)
     o.pop("crypto_auto_active", None)
     o.pop("crypto_auto_deadline", None)
-    try:
-        await q.answer()
-    except Exception:
-        pass
     try:
         prev = (q.message.caption or "").strip()
         await q.message.edit_caption(
@@ -14290,31 +14306,23 @@ async def on_admin_reject_payment(
     if not m:
         return
     if not is_admin(q.from_user.id):
-        try:
-            await q.answer()
-        except Exception:
-            pass
+        await _callback_ack(q, ADMIN_ACCESS_DENIED, show_alert=True)
         raise ApplicationHandlerStop
     try:
         oid = int(m.group(1))
     except ValueError:
-        await q.answer()
+        await _callback_ack(q)
         raise ApplicationHandlerStop
-    o = _restore_order_for_admin(q, oid)
+    await _callback_ack(q)
+    o = await asyncio.to_thread(_restore_order_for_admin, q, oid)
     if not o:
-        await _reply_admin_order_stale(q, oid)
+        await _reply_admin_order_stale(q, oid, already_acked=True)
         raise ApplicationHandlerStop
     if o.get("paid"):
-        try:
-            await q.answer()
-        except Exception:
-            pass
         raise ApplicationHandlerStop
     if not o.get("payment_proof_submitted"):
-        try:
-            await q.answer()
-        except Exception:
-            pass
+        if q.message:
+            await q.message.reply_text("Скрин оплаты ещё не был отправлен.")
         raise ApplicationHandlerStop
     cust = int(o.get("user_id") or 0)
     cud = _user_data_for(context.application, cust) if cust else {}
@@ -14332,10 +14340,6 @@ async def on_admin_reject_payment(
         await _send_customer_plain(
             context.bot, cust, PAY_ADMIN_REJECTED_CLIENT
         )
-    try:
-        await q.answer()
-    except Exception:
-        pass
     try:
         prev = (q.message.caption or "").strip()
         await q.message.edit_caption(
@@ -15010,6 +15014,7 @@ def main() -> None:
         CallbackQueryHandler(
             on_order_status_buttons,
             pattern=re.compile(r"^(accept|sent|cancel|done|delmsg)_\d+$"),
+            block=False,
         ),
         group=-1,
     )
@@ -15017,6 +15022,7 @@ def main() -> None:
         CallbackQueryHandler(
             on_order_admin_action,
             pattern=re.compile(r"^oam:rep:\d+$"),
+            block=False,
         ),
         group=-1,
     )
@@ -15031,6 +15037,7 @@ def main() -> None:
         CallbackQueryHandler(
             on_admin_confirm_payment,
             pattern=re.compile(r"^confirm_payment_\d+$"),
+            block=False,
         ),
         group=-1,
     )
@@ -15038,6 +15045,7 @@ def main() -> None:
         CallbackQueryHandler(
             on_admin_reject_payment,
             pattern=re.compile(r"^reject_payment_\d+$"),
+            block=False,
         ),
         group=-1,
     )
