@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-22-support-start-fix-v59"
+BOT_BUILD_ID = "2026-06-22-support-deeplink-v60"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
