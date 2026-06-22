@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-shipping-fix-v54"
+BOT_BUILD_ID = "2026-06-21-shipping-fix-v55"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -5611,31 +5611,31 @@ async def _send_deferred_admin_order_panel(
 
 
 def _kb_order_admin_actions(order_id: int, status: str) -> Optional[InlineKeyboardMarkup]:
-    """Кнопки заказа: текущий статус отмечен «✓» на соответствующей кнопке."""
+    """Кнопки заказа: «✅ Принять» всегда видна; текущий статус отмечен «✓»."""
     st = _norm_bot_order_status(str(status or "new"))
     oid = int(order_id)
     rep = InlineKeyboardButton("💬 Ответить", callback_data=f"oam:rep:{oid}")
     del_btn = InlineKeyboardButton("🗑 Удалить из чата", callback_data=f"delmsg_{oid}")
 
-    def _btn(label: str, key: str, action: str) -> InlineKeyboardButton:
-        text = f"{label} ✓" if st == key else label
-        return InlineKeyboardButton(text, callback_data=f"{action}_{oid}")
-
-    acc = _btn("✅ Принять", "accepted", "accept")
-    if st == "new":
-        acc = InlineKeyboardButton("🆕 Новый ✓", callback_data=f"accept_{oid}")
-    elif st == "accepted":
+    if st in ("accepted", "shipped", "done"):
         acc = InlineKeyboardButton("✅ Принят ✓", callback_data=f"accept_{oid}")
+    else:
+        acc = InlineKeyboardButton("✅ Принять", callback_data=f"accept_{oid}")
 
-    shp = _btn("🚚 Отправлен", "shipped", "sent")
-    done_btn = _btn("🏁 Завершён", "done", "done")
-    can = _btn("❌ Отменить", "canceled", "cancel")
+    if st == "shipped" or st == "done":
+        shp = InlineKeyboardButton("🚚 Отправлен ✓", callback_data=f"sent_{oid}")
+    else:
+        shp = InlineKeyboardButton("🚚 Отправлен", callback_data=f"sent_{oid}")
+
+    if st == "done":
+        done_btn = InlineKeyboardButton("🏁 Завершён ✓", callback_data=f"done_{oid}")
+    else:
+        done_btn = InlineKeyboardButton("🏁 Завершён", callback_data=f"done_{oid}")
+
     if st == "canceled":
         can = InlineKeyboardButton("❌ Отменён ✓", callback_data=f"cancel_{oid}")
-
-    if st in ("done", "canceled"):
-        mark = done_btn if st == "done" else can
-        return InlineKeyboardMarkup([[mark], [rep], [del_btn]])
+    else:
+        can = InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_{oid}")
 
     return InlineKeyboardMarkup(
         [
@@ -10456,6 +10456,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     reply_markup=REPLY_KB,
                 )
             return
+        if is_support_link:
+            await _maybe_thank_first_telegram_auth(msg, uid)
+            await _activate_user_support_chat(msg, context, uid, reply_markup=REPLY_KB)
+            return
         oid = _parse_order_id_from_start_args(list(args))
         if not oid:
             oid = (PENDING_SITE_ORDER_BY_USER.get(uid) or "").strip() or None
@@ -10505,10 +10509,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 _telegram_login_code_message(code),
                 reply_markup=REPLY_KB,
             )
-            return
-        if fl == "support" or jl == "support":
-            await _maybe_thank_first_telegram_auth(msg, uid)
-            await _activate_user_support_chat(msg, context, uid, reply_markup=REPLY_KB)
             return
         if jl in START_IGNORED_DEEP_LINK or fl in START_IGNORED_DEEP_LINK:
             if await _maybe_prompt_site_cart_confirmation(
