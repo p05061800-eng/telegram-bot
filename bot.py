@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-22-login-no-auto-order-v64"
+BOT_BUILD_ID = "2026-06-22-postpaid-address-fix-v66"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -615,6 +615,10 @@ def _refresh_orders_state_from_redis(*, force: bool = False) -> None:
             ORDERS[oid] = rec
             continue
         for key, val in rec.items():
+            if key in ("proof_file_id", "payment_proof_submitted") and local.get(
+                "proof_file_id"
+            ) and local.get("payment_proof_submitted"):
+                continue
             if key not in local or local.get(key) in (None, "", 0, False, []):
                 local[key] = val
     loaded_user_orders = _int_key_dict(data.get("user_orders"))
@@ -7006,6 +7010,10 @@ async def _finalize_order_submission_to_admin(
 ) -> Tuple[bool, str]:
     """Скрин + адрес + карточка заказа админу; синк на сайт; очистка корзины."""
     log = logging.getLogger(__name__)
+    try:
+        save_state()
+    except Exception:
+        log.exception("finalize pre-refresh save uid=%s oid=%s", uid, oid)
     _refresh_orders_state_from_redis(force=True)
     o = _ensure_order_in_orders(int(oid), int(uid)) or ORDERS.get(int(oid))
     if not o or int(o.get("user_id") or 0) != int(uid):
@@ -8284,16 +8292,32 @@ def _product_category_number(products: List[dict], target: dict) -> int:
     return max(1, n)
 
 
-def _product_catalog_number(products: List[dict], target: dict) -> int:
+def _parse_category_order_value(raw: object) -> Optional[int]:
+    if raw is None:
+        return None
+    try:
+        n = int(raw)
+        return n if n >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _product_catalog_number(
+    products: List[dict],
+    target: dict,
+    *,
+    line: Optional[dict] = None,
+) -> int:
     """Номер в каталоге: `categoryOrder` с сайта, иначе позиция в списке категории."""
-    co = target.get("category_order")
+    if line is not None:
+        co_line = _parse_category_order_value(
+            line.get("category_order") if line.get("category_order") is not None else line.get("categoryOrder")
+        )
+        if co_line is not None:
+            return co_line
+    co = _parse_category_order_value(target.get("category_order"))
     if co is not None:
-        try:
-            n = int(co)
-            if n >= 0:
-                return n
-        except (TypeError, ValueError):
-            pass
+        return co
     return _product_category_number(products, target)
 
 
@@ -8323,8 +8347,8 @@ def _order_line_display_name(
     if not p:
         return name
     cat = str(p.get("category", "Без категории") or "Без категории")
-    no = _product_catalog_number(products or [], p)
-    return f"{name} ({cat} №{no})"
+    no = _product_catalog_number(products or [], p, line=line)
+    return f"{cat} №{no} — {name}"
 
 
 def _product_category_label(products: List[dict], target: dict) -> str:
@@ -14256,7 +14280,7 @@ async def _on_payment_proof_photo_body(
             uid,
             ud if isinstance(ud, dict) else None,
             int(oid),
-            persist=False,
+            persist=True,
         )
         shipped = True
         log.info(
@@ -14276,23 +14300,20 @@ async def _on_payment_proof_photo_body(
             pass
         return
 
-    async def _persist_proof_state() -> None:
-        try:
-            _remember_user_message(
-                uid,
-                uname,
-                "photo",
-                f"📸 Чек оплаты заказ #{oid}",
-                persist=False,
-            )
-        except Exception:
-            log.exception("remember payment proof uid=%s oid=%s", uid, oid)
-        try:
-            await asyncio.to_thread(save_state)
-        except Exception:
-            log.exception("payment_proof_photo save_state uid=%s oid=%s", uid, oid)
-
-    asyncio.create_task(_persist_proof_state())
+    try:
+        _remember_user_message(
+            uid,
+            uname,
+            "photo",
+            f"📸 Чек оплаты заказ #{oid}",
+            persist=False,
+        )
+    except Exception:
+        log.exception("remember payment proof uid=%s oid=%s", uid, oid)
+    try:
+        await asyncio.to_thread(save_state)
+    except Exception:
+        log.exception("payment_proof_photo save_state uid=%s oid=%s", uid, oid)
 
 
 async def on_admin_confirm_payment(
@@ -14699,10 +14720,20 @@ async def on_support_client_text(
         return
     if not user_support_state.get(uid):
         return
+    if _find_active_postpaid_order_id(uid) is not None:
+        return
     text = str(msg.text or "").strip()
     if not _is_support_forwardable_client_text(text):
         return
-    ok = await _forward_client_support_message(context, msg, uid)
+    try:
+        ok = await _forward_client_support_message(context, msg, uid)
+    except Exception:
+        logging.getLogger(__name__).exception("support forward uid=%s", uid)
+        try:
+            await msg.reply_text(MSG_SEND_SUPPORT_FAIL, reply_markup=REPLY_KB)
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
     if not ok:
         try:
             await msg.reply_text(MSG_SEND_SUPPORT_FAIL, reply_markup=REPLY_KB)
@@ -14789,22 +14820,21 @@ async def _try_handle_postpaid_shipping_text(
     if not msg or not msg.text or not msg.from_user:
         return False
     uid = int(msg.from_user.id)
-    if user_support_state.get(uid):
+    active_postpaid = _find_active_postpaid_order_id(uid)
+    if user_support_state.get(uid) and active_postpaid is None:
         return False
     if _match_reply_menu_text(msg.text) is not None:
         return False
     text = str(msg.text or "").strip()
     if not text:
         return False
-    uid = int(msg.from_user.id)
     user_data = context.user_data if isinstance(context.user_data, dict) else {}
     log = logging.getLogger(__name__)
     thread_oid = _resolve_postpaid_thread_oid(uid, user_data)
     if thread_oid is None and len(text) >= 8 and not _is_reply_menu_text(text):
-        recovered = _find_active_postpaid_order_id(uid)
-        if recovered is not None:
-            thread_oid = int(recovered)
-            _bind_postpaid_thread_oid(uid, user_data, thread_oid, persist=False)
+        if active_postpaid is not None:
+            thread_oid = int(active_postpaid)
+            _bind_postpaid_thread_oid(uid, user_data, thread_oid, persist=True)
             log.info(
                 "%s recovered from ORDERS uid=%s oid=%s text_len=%s",
                 log_prefix,
@@ -14813,6 +14843,15 @@ async def _try_handle_postpaid_shipping_text(
                 len(text),
             )
     if thread_oid is None:
+        if (
+            _user_state_get(uid, "postpaid_thread_oid") is not None
+            or _user_state_get(uid, "awaiting_shipping_oid") is not None
+        ):
+            try:
+                await msg.reply_text(MSG_POSTPAID_RESEND_PROOF, reply_markup=REPLY_KB)
+            except Exception:
+                pass
+            return True
         return False
     log.info(
         "%s shipping uid=%s oid=%s text_len=%s",
@@ -14821,7 +14860,7 @@ async def _try_handle_postpaid_shipping_text(
         thread_oid,
         len(text),
     )
-    _bind_postpaid_thread_oid(uid, user_data, int(thread_oid), persist=False)
+    _bind_postpaid_thread_oid(uid, user_data, int(thread_oid), persist=True)
     if _is_reply_menu_text(text):
         for key in ("postpaid_thread_oid", "awaiting_shipping_oid"):
             _user_state_pop(uid, key, persist=False)
@@ -14927,6 +14966,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     if uid and user_support_state.get(uid) and not is_admin(uid):
+        if _find_active_postpaid_order_id(uid) is not None:
+            if await _try_handle_postpaid_shipping_text(update, context, log_prefix="on_text_sup"):
+                return
         if _is_reply_menu_text(text):
             user_support_state.pop(uid, None)
         elif not _is_support_forwardable_client_text(text):
@@ -15180,15 +15222,15 @@ def main() -> None:
         group=-1,
     )
     app.add_handler(
-        MessageHandler(SUPPORT_CLIENT_TEXT_FILTER, on_support_client_text),
-        group=-1,
-    )
-    app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             on_postpaid_shipping_text,
             block=False,
         ),
+        group=-1,
+    )
+    app.add_handler(
+        MessageHandler(SUPPORT_CLIENT_TEXT_FILTER, on_support_client_text),
         group=-1,
     )
     app.add_handler(
