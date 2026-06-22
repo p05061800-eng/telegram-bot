@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-22-support-deeplink-v60"
+BOT_BUILD_ID = "2026-06-22-site-order-catalog-no-v61"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -4139,6 +4139,13 @@ async def load_products() -> List[dict]:
         is_sale = _card_is_sale_payload(item, price_byn or price_rub, legacy)
         sku_raw = item.get("sku") or item.get("SKU") or ""
         slug_raw = item.get("slug") or item.get("handle") or item.get("permalink") or ""
+        co_raw = item.get("categoryOrder")
+        category_order = None
+        if co_raw is not None:
+            try:
+                category_order = int(co_raw)
+            except (TypeError, ValueError):
+                category_order = None
         cards.append(
             {
                 "id": item.get("id"),
@@ -4147,6 +4154,7 @@ async def load_products() -> List[dict]:
                 "price_rub": price_rub,
                 "price": price_byn,
                 "category": item.get("category", "Без категории"),
+                "category_order": category_order,
                 "rarity": (str(rar).strip() or "—"),
                 "image": image,
                 "isSale": is_sale,
@@ -8217,6 +8225,49 @@ def _product_category_number(products: List[dict], target: dict) -> int:
     return max(1, n)
 
 
+def _product_catalog_number(products: List[dict], target: dict) -> int:
+    """Номер в каталоге: `categoryOrder` с сайта, иначе позиция в списке категории."""
+    co = target.get("category_order")
+    if co is not None:
+        try:
+            n = int(co)
+            if n >= 0:
+                return n
+        except (TypeError, ValueError):
+            pass
+    return _product_category_number(products, target)
+
+
+def _resolve_product_for_order_line(
+    line: dict, products: Optional[List[dict]]
+) -> Optional[dict]:
+    if not products or not isinstance(line, dict):
+        return None
+    ref = str(line.get("ref") or line.get("id") or "").strip()
+    name = str(line.get("name") or "").strip()
+    p = _product_from_callback(ref, products) if ref else None
+    if not p and name:
+        p = _find_product_by_catalog_name(products, name)
+    if not p and ref:
+        p = _find_product_by_catalog_name(products, ref)
+    return p
+
+
+def _order_line_display_name(
+    line: dict, products: Optional[List[dict]] = None
+) -> str:
+    name_raw = str(line.get("name") or "—")
+    name = name_raw[:200]
+    if len(name_raw) > 200:
+        name = name.rstrip() + "…"
+    p = _resolve_product_for_order_line(line, products)
+    if not p:
+        return name
+    cat = str(p.get("category", "Без категории") or "Без категории")
+    no = _product_catalog_number(products or [], p)
+    return f"{name} ({cat} №{no})"
+
+
 def _product_category_label(products: List[dict], target: dict) -> str:
     cat = str(target.get("category", "Без категории") or "Без категории")
     no = _product_category_number(products, target)
@@ -9801,10 +9852,7 @@ def _format_site_checkout_order_body(
     for x in lines:
         if not isinstance(x, dict):
             continue
-        name_raw = str(x.get("name") or "—")
-        name = name_raw[:200]
-        if len(name_raw) > 200:
-            name = name.rstrip() + "…"
+        name = _order_line_display_name(x, products)
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
         lc = str(x.get("line_currency") or "").strip().upper()
