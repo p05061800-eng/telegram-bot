@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-22-admin-reply-fix-v63"
+BOT_BUILD_ID = "2026-06-22-login-no-auto-order-v64"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -10630,24 +10630,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     reply_markup=REPLY_KB,
                 )
                 return
-            un = (msg.from_user.username or "").strip().lstrip("@") or None
-            if await _try_present_pending_site_order(
-                msg, context, uid, username=un
-            ):
-                return
             await msg.reply_text(
                 "✅ Вход подтверждён.\n\n"
                 "Нажмите кнопку ниже — откроется личный кабинет на сайте (вход уже выполнен).\n\n"
                 "Или вернитесь на вкладку с сайтом — вход завершится автоматически.",
                 reply_markup=_account_open_markup(wait_id, uid),
             )
-            if PENDING_SITE_ORDER_BY_USER.get(int(uid)):
-                await msg.reply_text(
-                    "На сайте есть незавершённый заказ, но бот не смог его подтянуть.\n\n"
-                    "Вернитесь в корзину на illucards.by и снова нажмите "
-                    "«Оформить заказ через телеграм бот».",
-                    reply_markup=REPLY_KB,
-                )
             return
         if is_support_link:
             await _maybe_thank_first_telegram_auth(msg, uid)
@@ -10737,28 +10725,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(START_WELCOME_MENU_TEXT, reply_markup=REPLY_KB)
         return
     if await _create_order_from_synced_site_cart(msg, context, uid):
-        return
-    un_plain = (msg.from_user.username or "").strip().lstrip("@") or None
-    if await _try_present_pending_site_order(
-        msg, context, uid, username=un_plain
-    ):
-        return
-    pending_oid = await _resolve_pending_site_order_id(int(uid))
-    if pending_oid:
-        buyer_seq = None
-        for raw in await _fetch_site_orders_for_user(int(uid)):
-            oid = str(raw.get("id") or raw.get("order_id") or "").strip()
-            if oid == pending_oid:
-                buyer_seq = _extract_buyer_seq_from_sources(raw)
-                break
-        tok = _site_order_start_token(pending_oid, buyer_seq)
-        await msg.reply_text(
-            "На сайте есть незавершённый заказ, но бот не смог его загрузить.\n\n"
-            f"Отправьте команду:\n/start {tok}\n\n"
-            "Если не помогло — снова нажмите «Оформить заказ через телеграм бот» на сайте.",
-            reply_markup=REPLY_KB,
-        )
-        await _send_start_intro_with_site_button(msg, uid, context.user_data)
         return
     logging.getLogger(__name__).warning(
         "start without order payload and no synced cart: uid=%s args=%s cart=%s pending=%s",
