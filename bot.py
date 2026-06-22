@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-22-purge-orders-v58"
+BOT_BUILD_ID = "2026-06-22-support-start-fix-v59"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -3830,6 +3830,18 @@ def _is_reply_menu_text(text: str) -> bool:
     return _match_reply_menu_text(text) is not None
 
 
+def _is_support_forwardable_client_text(text: str) -> bool:
+    """Текст клиента для пересылки в поддержку (не команда и не кнопка меню)."""
+    t = str(text or "").strip()
+    if not t:
+        return False
+    if t.startswith("/"):
+        return False
+    if _match_reply_menu_text(t) is not None:
+        return False
+    return True
+
+
 class _MainReplyMenuFilter(filters.MessageFilter):
     __slots__ = ()
 
@@ -3850,7 +3862,7 @@ class _SupportClientTextFilter(filters.MessageFilter):
     def filter(self, message) -> bool:
         if not message or not getattr(message, "text", None) or not message.from_user:
             return False
-        if _match_reply_menu_text(message.text) is not None:
+        if not _is_support_forwardable_client_text(message.text):
             return False
         return bool(user_support_state.get(int(message.from_user.id)))
 
@@ -4062,13 +4074,15 @@ async def _activate_user_support_chat(
     _clear_checkout_delivery(context.user_data)
     context.user_data.pop("pending_order", None)
     _clear_shipping_session_keys(uid, context.user_data)
+    already_open = bool(user_support_state.get(uid))
     user_support_state[uid] = True
     await msg.reply_text(SUPPORT_INTRO_TEXT, reply_markup=reply_markup)
-    await _notify_admin_support_opened(
-        context,
-        uid,
-        getattr(msg.from_user, "username", None) if msg.from_user else None,
-    )
+    if not already_open:
+        await _notify_admin_support_opened(
+            context,
+            uid,
+            getattr(msg.from_user, "username", None) if msg.from_user else None,
+        )
 
 
 def _format_caption(p: dict) -> str:
@@ -14540,6 +14554,9 @@ async def on_support_client_text(
     uid = int(msg.from_user.id)
     if not user_support_state.get(uid):
         return
+    text = str(msg.text or "").strip()
+    if not _is_support_forwardable_client_text(text):
+        return
     ok = await _forward_client_support_message(context, msg, uid)
     if not ok:
         try:
@@ -14821,8 +14838,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if uid and user_support_state.get(uid):
         if _is_reply_menu_text(text):
             user_support_state.pop(uid, None)
-        elif not text.strip():
-            await msg.reply_text(MSG_EMPTY_INPUT)
+        elif not _is_support_forwardable_client_text(text):
+            if not text.strip():
+                await msg.reply_text(MSG_EMPTY_INPUT)
             return
         else:
             ok = await _forward_client_support_message(context, msg, uid)
