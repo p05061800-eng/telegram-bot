@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-21-shipping-fix-v56"
+BOT_BUILD_ID = "2026-06-21-shipping-fix-v57"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -3915,12 +3915,47 @@ def _support_reply_kb(uid: int) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    "💬",
+                    "💬 Ответить клиенту",
                     callback_data=f"sup:rep:{uid}",
                 )
             ],
         ],
     )
+
+
+async def _broadcast_admin_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    text: Optional[str] = None,
+    photo_file_id: Optional[str] = None,
+    caption: Optional[str] = None,
+    reply_markup=None,
+    log_tag: str = "admin",
+) -> int:
+    """Уведомление во все чаты админа (ORDER_NOTIFY + ADMIN_ID + ADMIN_CHAT)."""
+    log = logging.getLogger(__name__)
+    targets = _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else [])
+    sent = 0
+    for tgt in targets:
+        try:
+            if photo_file_id:
+                await context.bot.send_photo(
+                    tgt,
+                    photo_file_id,
+                    caption=str(caption or "")[:1024],
+                    reply_markup=reply_markup,
+                )
+            else:
+                await context.bot.send_message(
+                    tgt,
+                    str(text or "")[:4096],
+                    disable_web_page_preview=True,
+                    reply_markup=reply_markup,
+                )
+            sent += 1
+        except Exception:
+            log.exception("%s → target=%s", log_tag, tgt)
+    return sent
 
 
 async def _notify_admin_support_opened(
@@ -3929,25 +3964,22 @@ async def _notify_admin_support_opened(
     username: Optional[str] = None,
 ) -> None:
     """Клиент нажал «Связь» — короткое уведомление админу."""
-    log = logging.getLogger(__name__)
     uname = str(username or "").strip().lstrip("@")
     body = f"💬 Клиент нажал «Связь»\n\n👤 id {int(uid)}"
     if uname:
         body += f" @{uname}"
     body += "\n\nЖдём сообщение от клиента в этом чате."
     kb = _support_reply_kb(int(uid))
-    targets = _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else [])
-    for tgt in targets:
-        try:
-            await context.bot.send_message(
-                tgt,
-                body,
-                disable_web_page_preview=True,
-                reply_markup=kb,
-            )
-            return
-        except Exception:
-            log.exception("support opened notify target=%s uid=%s", tgt, uid)
+    sent = await _broadcast_admin_message(
+        context,
+        text=body,
+        reply_markup=kb,
+        log_tag="support_opened",
+    )
+    if not sent:
+        logging.getLogger(__name__).error(
+            "support opened notify failed for all targets uid=%s", uid
+        )
 
 
 async def _forward_client_support_message(
@@ -3958,46 +3990,36 @@ async def _forward_client_support_message(
     body_text: Optional[str] = None,
     photo_file_id: Optional[str] = None,
 ) -> bool:
-    """Текст/фото клиента из режима «Связь» → ORDER_NOTIFY_TARGET."""
-    log = logging.getLogger(__name__)
+    """Текст/фото клиента из режима «Связь» → все чаты админа."""
     chunk = str(body_text if body_text is not None else (msg.text or "")).strip()
     uname = (msg.from_user.username or "").strip() if msg.from_user else ""
     head = f"💬 Сообщение от клиента\n\n👤 id {int(uid)}"
     if uname:
         head += f" @{uname}"
     kb = _support_reply_kb(int(uid))
-    targets = _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else [])
 
-    async def _send_to(tgt) -> bool:
-        if photo_file_id:
-            cap = head
-            if chunk:
-                cap = f"{head}\n\n{chunk}"
-            await context.bot.send_photo(
-                tgt,
-                photo_file_id,
-                caption=cap[:1024],
-                reply_markup=kb,
-            )
-        else:
-            body = head
-            if chunk:
-                body = f"{head}\n\n{chunk}"
-            await context.bot.send_message(
-                tgt,
-                body[:4096],
-                disable_web_page_preview=True,
-                reply_markup=kb,
-            )
-        return True
-
-    for tgt in targets:
-        try:
-            await _send_to(tgt)
-            return True
-        except Exception:
-            log.exception("клиент → поддержка: target=%s uid=%s", tgt, uid)
-    return False
+    if photo_file_id:
+        cap = head
+        if chunk:
+            cap = f"{head}\n\n{chunk}"
+        sent = await _broadcast_admin_message(
+            context,
+            photo_file_id=photo_file_id,
+            caption=cap,
+            reply_markup=kb,
+            log_tag="support_client_photo",
+        )
+    else:
+        body = head
+        if chunk:
+            body = f"{head}\n\n{chunk}"
+        sent = await _broadcast_admin_message(
+            context,
+            text=body,
+            reply_markup=kb,
+            log_tag="support_client_text",
+        )
+    return sent > 0
 
 
 async def _activate_user_support_chat(
@@ -11262,6 +11284,9 @@ async def on_callback_query_unhandled(
     if re.match(r"^oam:rep:\d+$", data):
         await on_order_admin_action(update, context)
         return
+    if re.match(r"^sup:rep:\d+$", data):
+        await on_support_reply_activate(update, context)
+        return
     if re.match(r"^open_order_\d+$", data):
         await on_admin_open_order(update, context)
         return
@@ -11873,20 +11898,22 @@ async def on_support_reply_activate(
     if not m:
         return
     if not is_admin(q.from_user.id):
-        return
+        await _callback_ack(q, ADMIN_ACCESS_DENIED, show_alert=True)
+        raise ApplicationHandlerStop
     try:
         client_uid = int(m.group(1))
     except ValueError:
-        await q.answer()
-        return
+        await _callback_ack(q)
+        raise ApplicationHandlerStop
     if not client_uid:
-        await q.answer()
-        return
+        await _callback_ack(q)
+        raise ApplicationHandlerStop
+    await _callback_ack(q)
     context.user_data.pop("reply_to", None)
     context.user_data["reply_support_user_id"] = client_uid
-    await q.answer()
     await _send_customer_plain(context.bot, client_uid, ADMIN_TYPING_NOTICE)
     await q.message.reply_text(MSG_REPLY_MODE_ACTIVE)
+    raise ApplicationHandlerStop
 
 
 async def on_user_order_open(
@@ -13603,41 +13630,18 @@ async def _send_or_edit_admin_payment_proof(
 async def _forward_support_photo_to_admin(
     context: ContextTypes.DEFAULT_TYPE, msg: Message, uid: int
 ) -> bool:
-    """Фото из режима «Связь» → админ (как текст), с кнопкой ответа."""
-    log = logging.getLogger(__name__)
+    """Фото из режима «Связь» → все чаты админа, с кнопкой ответа."""
+    if not msg.photo:
+        return False
     file_id = msg.photo[-1].file_id
     uc = (msg.caption or "").strip()
-    uname = (msg.from_user.username or "").strip() if msg.from_user else ""
-    head = "📸 Фото от клиента"
-    tail = f"\n\n👤 id {uid}"
-    if uname:
-        tail += f" @{uname}"
-    mid = f"\n\n{uc}" if uc else ""
-    cap = (head + mid + tail)[:1024]
-    sup_kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("💬", callback_data=f"sup:rep:{uid}")]]
+    return await _forward_client_support_message(
+        context,
+        msg,
+        uid,
+        body_text=uc or None,
+        photo_file_id=file_id,
     )
-    try:
-        await context.bot.send_photo(
-            chat_id=ORDER_NOTIFY_TARGET,
-            photo=file_id,
-            caption=cap,
-            reply_markup=sup_kb,
-        )
-        return True
-    except Exception:
-        log.exception("клиент → поддержка (фото): target=%s", ORDER_NOTIFY_TARGET)
-        try:
-            await context.bot.send_photo(
-                chat_id=ADMIN_ID,
-                photo=file_id,
-                caption=cap,
-                reply_markup=sup_kb,
-            )
-            return True
-        except Exception:
-            log.exception("клиент → поддержка (фото) fallback admin_id=%s", ADMIN_ID)
-            return False
 
 
 _PROOF_MEDIA_FILTER = (
@@ -15022,6 +15026,14 @@ def main() -> None:
         CallbackQueryHandler(
             on_order_admin_action,
             pattern=re.compile(r"^oam:rep:\d+$"),
+            block=False,
+        ),
+        group=-1,
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_support_reply_activate,
+            pattern=re.compile(r"^sup:rep:\d+$"),
             block=False,
         ),
         group=-1,
