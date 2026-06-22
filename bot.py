@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-22-postpaid-address-fix-v67"
+BOT_BUILD_ID = "2026-06-22-postpaid-address-fix-v68"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -3855,6 +3855,56 @@ def _is_support_forwardable_client_text(text: str) -> bool:
     return True
 
 
+def _user_awaiting_postpaid_address(uid: int) -> bool:
+    """Клиент на шаге «адрес после скрина» — без обращения к Redis."""
+    try:
+        uid_i = int(uid)
+    except (TypeError, ValueError):
+        return False
+    for key in (
+        "awaiting_postpaid_shipping",
+        "postpaid_thread_oid",
+        "awaiting_shipping_oid",
+    ):
+        if _user_state_get(uid_i, key) is not None:
+            return True
+    for raw_oid, rec in ORDERS.items():
+        if not isinstance(rec, dict):
+            continue
+        if int(rec.get("user_id") or 0) != uid_i:
+            continue
+        if rec.get("paid") or rec.get("checkout_submitted_to_admin"):
+            continue
+        if _order_has_payment_proof(rec):
+            return True
+    for rec in USER_ORDERS.get(uid_i) or []:
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("proof_file_id") or "").strip() and rec.get("payment_proof_submitted"):
+            return True
+    return False
+
+
+class _PostpaidShippingTextFilter(filters.MessageFilter):
+    __slots__ = ()
+
+    def filter(self, message) -> bool:
+        if not message or not getattr(message, "text", None) or not message.from_user:
+            return False
+        uid = int(message.from_user.id)
+        if is_admin(uid):
+            return False
+        if _match_reply_menu_text(message.text) is not None:
+            return False
+        text = str(message.text or "").strip()
+        if len(text) < 8:
+            return False
+        return _user_awaiting_postpaid_address(uid)
+
+
+POSTPAID_SHIPPING_TEXT_FILTER = _PostpaidShippingTextFilter()
+
+
 class _MainReplyMenuFilter(filters.MessageFilter):
     __slots__ = ()
 
@@ -3879,6 +3929,8 @@ class _SupportClientTextFilter(filters.MessageFilter):
         if is_admin(uid):
             return False
         if not _is_support_forwardable_client_text(message.text):
+            return False
+        if _user_awaiting_postpaid_address(uid):
             return False
         return bool(user_support_state.get(uid))
 
@@ -6662,6 +6714,13 @@ def _hydrate_postpaid_state_for_uid(uid: int) -> None:
             _recover_payment_proof_on_order(uid_i, oid_i)
 
 
+async def _hydrate_postpaid_state_for_uid_async(uid: int) -> None:
+    try:
+        await asyncio.to_thread(_hydrate_postpaid_state_for_uid, int(uid))
+    except Exception:
+        logging.getLogger(__name__).exception("hydrate postpaid uid=%s", uid)
+
+
 def _find_active_postpaid_order_id(uid: int) -> Optional[int]:
     """Заказ со скрином, ждёт адрес (postpaid_thread мог потеряться после рестарта)."""
     _hydrate_postpaid_state_for_uid(int(uid))
@@ -6910,6 +6969,7 @@ async def _collect_postpaid_client_message(
     body_text: Optional[str],
     msg: Message,
     photo_file_id: Optional[str] = None,
+    processing_msg: Optional[Message] = None,
 ) -> bool:
     """Собрать адрес/ФИО/телефон до отправки полного заказа админу."""
     log = logging.getLogger(__name__)
@@ -6969,11 +7029,13 @@ async def _collect_postpaid_client_message(
         oid,
         len(details),
     )
-    processing_msg = None
-    try:
-        processing_msg = await msg.reply_text(MSG_POSTPAID_PROCESSING, reply_markup=REPLY_KB)
-    except Exception:
-        log.exception("postpaid collect processing ack uid=%s oid=%s", uid, oid)
+    if processing_msg is None:
+        try:
+            processing_msg = await msg.reply_text(
+                MSG_POSTPAID_PROCESSING, reply_markup=REPLY_KB
+            )
+        except Exception:
+            log.exception("postpaid collect processing ack uid=%s oid=%s", uid, oid)
     try:
         await asyncio.to_thread(save_state)
     except Exception:
@@ -13627,6 +13689,7 @@ async def _on_payment_paid_body(
     if o.get("payment_proof_submitted") and not o.get("checkout_submitted_to_admin"):
         await q.message.reply_text(_postpaid_shipping_prompt_for_order(o))
         _bind_postpaid_thread_oid(uid, ud, int(oid), persist=False)
+        _user_state_bucket(uid)["awaiting_postpaid_shipping"] = int(oid)
         asyncio.create_task(asyncio.to_thread(save_state))
         return
     if (
@@ -14794,7 +14857,13 @@ async def on_support_client_text(
     if not _is_support_forwardable_client_text(text):
         return
     try:
-        ok = await _forward_client_support_message(context, msg, uid)
+        ok = await asyncio.wait_for(
+            _forward_client_support_message(context, msg, uid),
+            timeout=25.0,
+        )
+    except asyncio.TimeoutError:
+        logging.getLogger(__name__).error("support forward timeout uid=%s", uid)
+        ok = False
     except Exception:
         logging.getLogger(__name__).exception("support forward uid=%s", uid)
         try:
@@ -14888,9 +14957,10 @@ async def _try_handle_postpaid_shipping_text(
     if not msg or not msg.text or not msg.from_user:
         return False
     uid = int(msg.from_user.id)
-    _hydrate_postpaid_state_for_uid(uid)
+    await _hydrate_postpaid_state_for_uid_async(uid)
     active_postpaid = _find_active_postpaid_order_id(uid)
-    if user_support_state.get(uid) and active_postpaid is None:
+    awaiting_pp = _user_awaiting_postpaid_address(uid)
+    if user_support_state.get(uid) and active_postpaid is None and not awaiting_pp:
         return False
     if _match_reply_menu_text(msg.text) is not None:
         return False
@@ -14954,6 +15024,14 @@ async def _try_handle_postpaid_shipping_text(
         thread_oid,
         len(text),
     )
+    processing_msg = None
+    if awaiting_pp or active_postpaid is not None:
+        try:
+            processing_msg = await msg.reply_text(
+                MSG_POSTPAID_PROCESSING, reply_markup=REPLY_KB
+            )
+        except Exception:
+            log.exception("%s early ack uid=%s oid=%s", log_prefix, uid, thread_oid)
     try:
         ok = await _collect_postpaid_client_message(
             context,
@@ -14961,6 +15039,7 @@ async def _try_handle_postpaid_shipping_text(
             oid=int(thread_oid),
             body_text=text,
             msg=msg,
+            processing_msg=processing_msg,
         )
     except Exception:
         log.exception("%s text uid=%s oid=%s", log_prefix, uid, thread_oid)
@@ -14975,6 +15054,13 @@ async def _try_handle_postpaid_shipping_text(
         except Exception:
             pass
     return True
+
+
+async def on_postpaid_shipping_text_priority(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Адрес после скрина — наивысший приоритет (group -2)."""
+    await on_postpaid_shipping_text(update, context)
 
 
 async def on_postpaid_shipping_text(
@@ -15026,6 +15112,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _try_handle_postpaid_shipping_text(update, context, log_prefix="on_text"):
         return
 
+    if uid and len(text) >= 8 and not _is_reply_menu_text(text):
+        await _hydrate_postpaid_state_for_uid_async(uid)
+        if _user_awaiting_postpaid_address(uid):
+            if await _try_handle_postpaid_shipping_text(
+                update, context, log_prefix="on_text_retry"
+            ):
+                return
+
     if uid:
         _remember_user_message(
             uid,
@@ -15036,6 +15130,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     if _user_state_get(uid, "awaiting_proof") is not None:
+        if _user_awaiting_postpaid_address(uid):
+            if await _try_handle_postpaid_shipping_text(
+                update, context, log_prefix="on_text_proof_skip"
+            ):
+                return
         if text in REPLY_MENU_TEXTS:
             _user_state_pop(uid, "awaiting_proof")
         else:
@@ -15302,6 +15401,13 @@ def main() -> None:
     )
     app.add_error_handler(on_ptb_error)
 
+    app.add_handler(
+        MessageHandler(
+            POSTPAID_SHIPPING_TEXT_FILTER,
+            on_postpaid_shipping_text_priority,
+        ),
+        group=-2,
+    )
     app.add_handler(
         MessageHandler(MAIN_REPLY_MENU_FILTER, on_reply_menu_buttons),
         group=-1,
