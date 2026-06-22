@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-22-site-order-catalog-no-v61"
+BOT_BUILD_ID = "2026-06-22-admin-single-card-v62"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -5723,6 +5723,62 @@ def _kb_order_admin_actions(order_id: int, status: str) -> Optional[InlineKeyboa
     )
 
 
+def _kb_admin_order_combined(order_id: int, uid: int, status: str, o: dict) -> InlineKeyboardMarkup:
+    """Одна клавиатура: статус заказа + проверка оплаты + папка клиента."""
+    base = _kb_order_admin_actions(order_id, status)
+    rows: List[List[InlineKeyboardButton]] = (
+        [list(r) for r in base.inline_keyboard] if base else []
+    )
+    if not o.get("paid") and o.get("payment_proof_submitted"):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "✅ Оплата получена",
+                    callback_data=f"confirm_payment_{int(order_id)}",
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "❌ Скрин не подходит",
+                    callback_data=f"reject_payment_{int(order_id)}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "📁 Папка клиента",
+                callback_data=f"adm_user_all_{int(uid)}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _admin_order_card_caption(order_id: int, o: dict) -> str:
+    """Текст карточки: для чека — подпись к фото, иначе текстовая карточка."""
+    uid = int(o.get("user_id") or 0)
+    if o.get("payment_proof_submitted") or o.get("proof_file_id"):
+        cap = _format_payment_proof_caption(int(order_id), o, uid)
+        if o.get("paid"):
+            if MSG_PAYMENT_CAPTION_CONFIRMED.strip() not in cap:
+                cap = (cap + MSG_PAYMENT_CAPTION_CONFIRMED)[:1024]
+        return cap
+    return _format_admin_order_detail_text(order_id, o)
+
+
+def _admin_order_card_keyboard(order_id: int, o: dict) -> InlineKeyboardMarkup:
+    uid = int(o.get("user_id") or 0)
+    return _kb_admin_order_combined(
+        int(order_id),
+        uid,
+        str(o.get("status") or "new"),
+        o,
+    )
+
+
 async def _notify_admin_new_order(
     context: ContextTypes.DEFAULT_TYPE,
     user,
@@ -6992,17 +7048,11 @@ async def _finalize_order_submission_to_admin(
         log.exception("finalize admin proof uid=%s oid=%s", uid, oid)
     if not ok:
         return False, "admin_fail"
+    proof_cid = o.get("payment_proof_admin_chat_id")
     proof_mid = o.get("payment_proof_admin_message_id")
-    try:
-        await _send_admin_order_panel(
-            context,
-            int(oid),
-            o,
-            force_new=True,
-            reply_to_message_id=int(proof_mid) if proof_mid is not None else None,
-        )
-    except Exception:
-        log.exception("finalize admin panel uid=%s oid=%s", uid, oid)
+    if proof_cid is not None and proof_mid is not None:
+        o["admin_chat_id"] = int(proof_cid)
+        o["admin_message_id"] = int(proof_mid)
     o["checkout_submitted_to_admin"] = True
     if o.get("clear_cart_on_paid"):
         _clear_user_cart_after_payment_proof(int(uid), int(oid), o)
@@ -7154,23 +7204,29 @@ async def _refresh_admin_order_message(
     o = ORDERS.get(order_id)
     if not o:
         return
-    text = _format_admin_order_detail_text(order_id, o)
-    kb = _kb_order_admin_actions(order_id, str(o.get("status") or "new"))
+    text = _admin_order_card_caption(order_id, o)
+    kb = _admin_order_card_keyboard(order_id, o)
     targets: List[Tuple[int, int]] = []
     if q and q.message:
         targets.append((int(q.message.chat_id), int(q.message.message_id)))
-    cid = o.get("admin_chat_id")
-    mid = o.get("admin_message_id")
-    if cid is not None and mid is not None:
-        pair = (int(cid), int(mid))
-        if pair not in targets:
-            targets.append(pair)
+    for cid_key, mid_key in (
+        ("admin_chat_id", "admin_message_id"),
+        ("payment_proof_admin_chat_id", "payment_proof_admin_message_id"),
+    ):
+        cid = o.get(cid_key)
+        mid = o.get(mid_key)
+        if cid is not None and mid is not None:
+            pair = (int(cid), int(mid))
+            if pair not in targets:
+                targets.append(pair)
     if not targets:
         return
     for chat_id, message_id in targets:
         if await _try_edit_admin_order_card(context.bot, chat_id, message_id, text, kb):
             o["admin_chat_id"] = chat_id
             o["admin_message_id"] = message_id
+            o["payment_proof_admin_chat_id"] = chat_id
+            o["payment_proof_admin_message_id"] = message_id
             return
 
 
@@ -13593,7 +13649,7 @@ async def _send_or_edit_admin_payment_proof(
     if len(caption) > 1024:
         caption = caption[:1021] + "…"
     cust_uid = int(o.get("user_id") or 0)
-    kb = _kb_payment_admin_review(order_id, cust_uid)
+    kb = _admin_order_card_keyboard(order_id, o)
     targets = _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else [])
     if not targets:
         log.error("payment proof: admin targets empty order_id=%s", order_id)
@@ -13729,6 +13785,8 @@ async def _send_or_edit_admin_payment_proof(
 
     o["payment_proof_admin_chat_id"] = chat_id
     o["payment_proof_admin_message_id"] = message_id
+    o["admin_chat_id"] = chat_id
+    o["admin_message_id"] = message_id
     log.info(
         "payment proof delivered chat=%s msg=%s order_id=%s",
         chat_id,
@@ -14303,30 +14361,11 @@ async def on_admin_confirm_payment(
     o.pop("crypto_auto_active", None)
     o.pop("crypto_auto_deadline", None)
     try:
-        prev = (q.message.caption or "").strip()
-        await q.message.edit_caption(
-            caption=prev + MSG_PAYMENT_CAPTION_CONFIRMED,
-            reply_markup=None,
-        )
+        await _refresh_admin_order_message(context, oid, q=q)
     except Exception:
-        pass
-    # Карточка заказа админу — если ещё не отправляли на шаге «Отправить заказ».
-    if not o.get("admin_message_id"):
-        try:
-            panel_text = _format_admin_order_detail_text(oid, o)
-            panel_kb = _kb_order_admin_actions(oid, str(o.get("status") or "new"))
-            panel = await q.message.reply_text(
-                panel_text,
-                reply_markup=panel_kb,
-                disable_web_page_preview=True,
-            )
-            o["admin_chat_id"] = int(panel.chat_id)
-            o["admin_message_id"] = int(panel.message_id)
-        except Exception:
-            logging.getLogger(__name__).exception(
-                "confirm_payment admin panel reply order_id=%s", oid
-            )
-            await _send_admin_order_panel(context, oid, o, force_new=True)
+        logging.getLogger(__name__).exception(
+            "confirm_payment refresh order_id=%s", oid
+        )
     if cust:
         await _send_payment_receipt(context.bot, cust, oid, o)
     save_state()
