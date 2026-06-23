@@ -21,7 +21,7 @@ import urllib.request
 from copy import deepcopy
 from datetime import datetime
 from threading import Thread
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-23-clear-admin-orders-v70"
+BOT_BUILD_ID = "2026-06-23-admin-orders-delete-v71"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -473,6 +473,63 @@ def _purge_all_orders_state() -> int:
             bucket.pop(key, None)
         if not bucket:
             user_states.pop(uid, None)
+    return removed
+
+
+def _order_matches_admin_section(o: dict, section: str) -> bool:
+    st = _norm_bot_order_status(str(o.get("status") or "new"))
+    sec = str(section or "all").strip()
+    if sec == "new" and st in ("accepted", "shipped", "done", "canceled"):
+        return False
+    if sec == "shipped" and st != "shipped":
+        return False
+    return True
+
+
+def _purge_orders_subset(
+    *,
+    user_id: Optional[int] = None,
+    section: Optional[str] = None,
+    order_ids: Optional[Iterable[int]] = None,
+) -> List[int]:
+    """Удалить заказы из ORDERS/USER_ORDERS; вернуть список удалённых id."""
+    want_ids: Optional[set] = None
+    if order_ids is not None:
+        want_ids = {int(x) for x in order_ids}
+    removed: List[int] = []
+    uids_affected: set = set()
+    for oid, o in list(ORDERS.items()):
+        if not isinstance(o, dict):
+            continue
+        oid_i = int(oid)
+        if want_ids is not None:
+            if oid_i not in want_ids:
+                continue
+        else:
+            uid_o = int(o.get("user_id") or 0)
+            if user_id is not None and uid_o != int(user_id):
+                continue
+            if section is not None and not _order_matches_admin_section(o, str(section)):
+                continue
+        uid_o = int(o.get("user_id") or 0)
+        if uid_o:
+            uids_affected.add(uid_o)
+            _clear_postpaid_thread_if_matches(uid_o, oid_i)
+        ORDERS.pop(oid_i, None)
+        removed.append(oid_i)
+    if removed:
+        removed_s = {str(x) for x in removed}
+        for uid in uids_affected:
+            lst = USER_ORDERS.get(int(uid)) or []
+            kept = [
+                r
+                for r in lst
+                if isinstance(r, dict) and str(r.get("id") or "").strip() not in removed_s
+            ]
+            if kept:
+                USER_ORDERS[int(uid)] = kept
+            else:
+                USER_ORDERS.pop(int(uid), None)
     return removed
 
 
@@ -11558,6 +11615,9 @@ async def on_callback_query_unhandled(
     if re.match(r"^adm:", data):
         await on_admin_panel_action(update, context)
         return
+    if re.match(r"^adm:clear_user_(new|all|shipped)_\d+$", data):
+        await on_admin_clear_user_orders(update, context)
+        return
     if re.match(r"^adm_user_(new|all|shipped)_\d+$", data):
         await on_admin_user_messages(update, context)
         return
@@ -11842,6 +11902,14 @@ def _admin_customer_rows_for_section(section: str = "all") -> List[Tuple[int, st
     return rows
 
 
+def _admin_section_callback(section: str) -> str:
+    return {
+        "new": "adm:orders_new",
+        "all": "adm:orders_all",
+        "shipped": "adm:orders_shipped",
+    }.get(str(section or "all").strip(), "adm:orders_all")
+
+
 def _kb_admin_orders_list(section: str = "all") -> Optional[InlineKeyboardMarkup]:
     customers = _admin_customer_rows_for_section(section)
     if not customers:
@@ -11853,6 +11921,15 @@ def _kb_admin_orders_list(section: str = "all") -> Optional[InlineKeyboardMarkup
         if len(label) > 60:
             label = label[:57] + "…"
         rows.append([InlineKeyboardButton(label, callback_data=f"adm_user_{sec}_{uid}")])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🗑 Очистить этот раздел",
+                callback_data=f"adm:clear_sec_{sec}",
+            )
+        ]
+    )
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="adm:panel")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -11949,6 +12026,18 @@ def _kb_admin_customer_detail(uid: int, section: str = "all") -> InlineKeyboardM
     rows: List[List[InlineKeyboardButton]] = []
     for oid, _o in _admin_user_orders_for_section(uid, section)[:20]:
         rows.append([InlineKeyboardButton(f"📦 Открыть заказ #{oid}", callback_data=f"open_order_{oid}")])
+    sec = str(section or "all").strip() or "all"
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🗑 Удалить заказы клиента",
+                callback_data=f"adm:clear_user_{sec}_{int(uid)}",
+            )
+        ]
+    )
+    rows.append(
+        [InlineKeyboardButton("◀️ К списку", callback_data=_admin_section_callback(sec))]
+    )
     rows.append([InlineKeyboardButton("💬 Ответить клиенту", callback_data=f"sup:rep:{int(uid)}")])
     return InlineKeyboardMarkup(rows)
 
@@ -11989,17 +12078,24 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _clear_admin_order_chat_messages(
     context: ContextTypes.DEFAULT_TYPE,
+    *,
+    order_ids: Optional[Iterable[int]] = None,
 ) -> Tuple[int, int]:
-    """Удалить карточки заказов из чатов админа; сами заказы в базе не трогаем."""
+    """Удалить карточки заказов из чатов админа."""
     log = logging.getLogger(__name__)
     admin_chats = {
         int(t)
         for t in _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else [])
         if isinstance(t, int) and int(t) > 0
     }
+    want_ids: Optional[set] = None
+    if order_ids is not None:
+        want_ids = {int(x) for x in order_ids}
     to_delete: set = set()
     for oid, o in list(ORDERS.items()):
         if not isinstance(o, dict):
+            continue
+        if want_ids is not None and int(oid) not in want_ids:
             continue
         for cid_key, mid_key in (
             ("admin_chat_id", "admin_message_id"),
@@ -12051,6 +12147,39 @@ async def _clear_admin_order_chat_messages(
         except Exception:
             log.exception("clear_admin_orders save_state")
     return deleted, failed
+
+
+async def _admin_purge_orders(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: Optional[int] = None,
+    section: Optional[str] = None,
+    order_ids: Optional[Iterable[int]] = None,
+) -> Tuple[int, int, int]:
+    """Удалить заказы у админа: сообщения в чате + записи ORDERS."""
+    ids_list: List[int]
+    if order_ids is not None:
+        ids_list = [int(x) for x in order_ids]
+    else:
+        ids_list = [
+            int(oid)
+            for oid, o in list(ORDERS.items())
+            if isinstance(o, dict)
+            and (user_id is None or int(o.get("user_id") or 0) == int(user_id))
+            and (section is None or _order_matches_admin_section(o, str(section)))
+        ]
+    deleted_msgs, failed_msgs = 0, 0
+    if ids_list:
+        deleted_msgs, failed_msgs = await _clear_admin_order_chat_messages(
+            context, order_ids=ids_list
+        )
+    removed = len(_purge_orders_subset(order_ids=ids_list)) if ids_list else 0
+    if removed:
+        try:
+            await asyncio.to_thread(save_state)
+        except Exception:
+            logging.getLogger(__name__).exception("admin_purge_orders save_state")
+    return removed, deleted_msgs, failed_msgs
 
 
 async def clear_admin_orders_cmd(
@@ -12147,11 +12276,43 @@ async def on_admin_panel_action(
     q = update.callback_query
     if not q or not q.from_user or not q.data or not q.message:
         return
-    m = re.match(r"^adm:(orders_new|orders_all|orders_shipped|stats)$", (q.data or "").strip())
-    if not m:
-        return
+    data = (q.data or "").strip()
     if not is_admin(q.from_user.id):
         await _callback_ack(q, ADMIN_ACCESS_DENIED, show_alert=True)
+        return
+
+    if data == "adm:panel":
+        await q.answer()
+        await q.message.reply_text(
+            "👑 Админ-панель\n\nВыберите раздел 👇",
+            reply_markup=_kb_admin_panel(),
+        )
+        return
+
+    m_clear = re.match(r"^adm:clear_sec_(new|all|shipped)$", data)
+    if m_clear:
+        section = m_clear.group(1)
+        title = {
+            "new": "🆕 Новые заказы",
+            "all": "📦 Заказы",
+            "shipped": "🚚 Отправленные",
+        }.get(section, "📦 Заказы")
+        removed, deleted, failed = await _admin_purge_orders(context, section=section)
+        await q.answer(f"Удалено: {removed}")
+        extra = f" Сообщений в чате: {deleted}." if deleted else ""
+        if failed:
+            extra += f" Не удалось сообщений: {failed}."
+        await q.message.reply_text(
+            f"✅ {title}\n\nУдалено заказов: {removed}.{extra}\n\n"
+            "Корзины клиентов не тронуты.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data="adm:panel")]]
+            ),
+        )
+        return
+
+    m = re.match(r"^adm:(orders_new|orders_all|orders_shipped|stats)$", data)
+    if not m:
         return
     action = m.group(1)
     await q.answer()
@@ -12167,10 +12328,14 @@ async def on_admin_panel_action(
             "shipped": "🚚 Отправленные",
         }.get(section, "📦 Заказы")
         admin_orders = _admin_orders_for_section(section)
+        back_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("◀️ Назад", callback_data="adm:panel")]]
+        )
         if not admin_orders:
             await q.message.reply_text(
                 f"{title}\n\nПока нет заказов\n\n"
-                "Как только клиент оформит покупку — заказ появится здесь ✨"
+                "Как только клиент оформит покупку — заказ появится здесь ✨",
+                reply_markup=back_kb,
             )
         else:
             body_lines: List[str] = [title, "", "Выберите клиента 👇", ""]
@@ -12184,7 +12349,12 @@ async def on_admin_panel_action(
                 reply_markup=_kb_admin_orders_list(section),
             )
     else:
-        await q.message.reply_text(_format_admin_stats())
+        await q.message.reply_text(
+            _format_admin_stats(),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Назад", callback_data="adm:panel")]]
+            ),
+        )
 
 
 async def on_admin_user_messages(
@@ -12209,6 +12379,43 @@ async def on_admin_user_messages(
         _format_admin_customer_detail(uid, section),
         reply_markup=_kb_admin_customer_detail(uid, section),
         disable_web_page_preview=True,
+    )
+
+
+async def on_admin_clear_user_orders(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    m = re.match(r"^adm:clear_user_(new|all|shipped)_(\d+)$", (q.data or "").strip())
+    if not m:
+        return
+    if not is_admin(q.from_user.id):
+        await _callback_ack(q, ADMIN_ACCESS_DENIED, show_alert=True)
+        return
+    section = m.group(1)
+    try:
+        uid = int(m.group(2))
+    except ValueError:
+        await _callback_ack(q)
+        return
+    name = _user_display_name(uid)
+    removed, deleted, failed = await _admin_purge_orders(
+        context, user_id=uid, section=section
+    )
+    await q.answer(f"Удалено: {removed}")
+    extra = f" Сообщений в чате: {deleted}." if deleted else ""
+    if failed:
+        extra += f" Не удалось сообщений: {failed}."
+    await q.message.reply_text(
+        f"✅ Заказы клиента {name} удалены: {removed} шт.{extra}",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("◀️ К списку", callback_data=_admin_section_callback(section))],
+                [InlineKeyboardButton("◀️ В админ-панель", callback_data="adm:panel")],
+            ]
+        ),
     )
 
 
@@ -15596,7 +15803,15 @@ def main() -> None:
     app.add_handler(
         CallbackQueryHandler(
             on_admin_panel_action,
-            pattern=re.compile(r"^adm:(orders_new|orders_all|orders_shipped|stats)$"),
+            pattern=re.compile(
+                r"^adm:(panel|orders_new|orders_all|orders_shipped|stats|clear_sec_new|clear_sec_all|clear_sec_shipped)$"
+            ),
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            on_admin_clear_user_orders,
+            pattern=re.compile(r"^adm:clear_user_(new|all|shipped)_\d+$"),
         )
     )
     app.add_handler(
