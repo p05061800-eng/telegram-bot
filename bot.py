@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-22-postpaid-address-fix-v69"
+BOT_BUILD_ID = "2026-06-23-clear-admin-orders-v70"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -465,6 +465,8 @@ def _purge_all_orders_state() -> int:
         for key in (
             "awaiting_proof",
             "postpaid_thread_oid",
+            "awaiting_shipping_oid",
+            "awaiting_postpaid_shipping",
             "awaiting_payment_order_id",
             "crypto_check",
         ):
@@ -12054,7 +12056,7 @@ async def _clear_admin_order_chat_messages(
 async def clear_admin_orders_cmd(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Удалить карточки заказов из чата админа (заказы клиентов в базе остаются)."""
+    """Очистить заказы у админа: сообщения в чате + списки /admin (корзины клиентов не трогаем)."""
     msg = update.effective_message
     u = update.effective_user
     if not msg or not u:
@@ -12063,11 +12065,17 @@ async def clear_admin_orders_cmd(
         await msg.reply_text(ADMIN_ACCESS_DENIED)
         return
     deleted, failed = await _clear_admin_order_chat_messages(context)
+    removed = _purge_all_orders_state()
+    try:
+        await asyncio.to_thread(save_state)
+    except Exception:
+        logging.getLogger(__name__).exception("clear_admin_orders save_state")
     await msg.reply_text(
-        f"🗑 Удалено сообщений с заказами: {deleted}."
-        + (f" Не удалось: {failed}." if failed else "")
-        + "\n\nЗаказы клиентов в базе не тронуты. "
-        "Сообщения без привязки к заказу удалите вручную в чате."
+        f"✅ У админа очищено.\n"
+        f"• Сообщений в чате удалено: {deleted}"
+        + (f" (не удалось: {failed})" if failed else "")
+        + f"\n• Заказов убрано из панели /admin: {removed}\n\n"
+        "Корзины и профили клиентов не тронуты. Новые заказы — с #1."
     )
 
 
@@ -12080,6 +12088,11 @@ async def reset_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not is_admin(u.id):
         await msg.reply_text(ADMIN_ACCESS_DENIED)
         return
+    deleted, failed = 0, 0
+    try:
+        deleted, failed = await _clear_admin_order_chat_messages(context)
+    except Exception:
+        logging.getLogger(__name__).exception("reset_orders clear chat messages")
     removed = _purge_all_orders_state()
     try:
         await asyncio.to_thread(save_state)
@@ -12087,8 +12100,9 @@ async def reset_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         logging.getLogger(__name__).exception("reset_orders save_state")
     await msg.reply_text(
         f"✅ Все заказы удалены ({removed} шт.).\n"
-        "Новые заказы начнутся с #1.\n\n"
-        "Старые карточки в чате можно удалить вручную — в базе их уже нет."
+        f"Сообщений в чате админа удалено: {deleted}"
+        + (f" (не удалось: {failed})" if failed else "")
+        + ".\nНовые заказы начнутся с #1."
     )
 
 
