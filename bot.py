@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-23-admin-orders-delete-v71"
+BOT_BUILD_ID = "2026-06-23-order-persist-on-create-v72"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -10187,6 +10187,7 @@ async def _begin_site_checkout_order(
         po["checkout_fingerprint"] = str(checkout_fp)
         ORDERS[int(existing)] = po
         _set_awaiting_payment_order_id(int(uid), ud, int(existing))
+        await _finalize_new_bot_order_persistence(int(uid), int(existing))
         save_state()
         return int(existing), int(total), str(pay_cur)
     total, pay_cur, drec = _resolve_site_confirm_pricing(
@@ -10263,6 +10264,7 @@ async def _begin_site_checkout_order(
     ud.pop("payment_pending_method", None)
     ud.pop("pending_order", None)
     _clear_site_pending_order(int(uid), ud)
+    await _finalize_new_bot_order_persistence(int(uid), int(oid))
     save_state()
     return int(oid), int(total), str(pay_cur)
 
@@ -10545,6 +10547,43 @@ def _site_order_items_from_bot_order(order: dict) -> List[dict]:
     return out
 
 
+async def _persist_order_to_site_lk(order_id: int, order: dict) -> Optional[str]:
+    """Сразу записать заказ в ЛК на сайте (status=new), не дожидаясь подтверждения админом."""
+    ext = str(order.get("external_id") or "").strip()
+    if ext:
+        try:
+            await _sync_site_order_status({**order, "external_id": ext, "status": "new"})
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "site order touch failed external_id=%s bot=%s", ext, order_id
+            )
+        return ext
+    created = await _ensure_site_order_for_bot_order(order_id, order)
+    if created:
+        order["external_id"] = created
+        try:
+            await _sync_site_order_status({**order, "external_id": created, "status": "new"})
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "site order sync after import failed external_id=%s", created
+            )
+    return created or ext or None
+
+
+async def _finalize_new_bot_order_persistence(uid: int, oid: int) -> None:
+    """USER_ORDERS + зеркало на сайте сразу после создания заказа в боте."""
+    o = ORDERS.get(int(oid))
+    if not o or int(o.get("user_id") or 0) != int(uid):
+        return
+    _sync_order_record_to_user_orders(int(uid), int(oid), o)
+    try:
+        await _persist_order_to_site_lk(int(oid), o)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "finalize bot order persistence uid=%s oid=%s", uid, oid
+        )
+
+
 async def _ensure_site_order_for_bot_order(order_id: int, order: dict) -> Optional[str]:
     """Для заказов, оформленных в Telegram: создать зеркало заказа на сайте."""
     existing = str(order.get("external_id") or "").strip()
@@ -10561,7 +10600,9 @@ async def _ensure_site_order_for_bot_order(order_id: int, order: dict) -> Option
     headers = {"Content-Type": "application/json"}
     if ORDER_STATUS_UPDATE_SECRET:
         headers["Authorization"] = f"Bearer {ORDER_STATUS_UPDATE_SECRET}"
+    stable_site_id = f"tg-{int(order_id)}"
     payload = {
+        "order_id": stable_site_id,
         "bot_order_id": int(order_id),
         "user_id": uid,
         "username": str(order.get("username") or "").strip(),
@@ -10727,6 +10768,7 @@ async def _create_order_from_synced_site_cart(
     ORDERS[int(oid)]["clear_cart_on_paid"] = True
     ORDERS[int(oid)]["total_goods"] = int(goods_total)
     save_state()
+    await _finalize_new_bot_order_persistence(uid, int(oid))
     context.user_data.pop("pending_order", None)
     SITE_LOGIN_PENDING_ORDER.pop(uid, None)
     _set_awaiting_payment_order_id(uid, context.user_data, int(oid))
@@ -11509,6 +11551,7 @@ async def _run_site_confirm_order(
     ORDERS[int(oid)]["payment_currency"] = str(pay_cur)
     ORDERS[int(oid)]["payment_total_locked"] = True
     save_state()
+    await _finalize_new_bot_order_persistence(uid_cb, int(oid))
     _set_awaiting_payment_order_id(uid_cb, ud, int(oid))
     ud.pop("payment_pending_method", None)
     ud.pop("pending_order", None)
@@ -11804,6 +11847,7 @@ async def on_deep_link_structured_submit(
     if order_rec.get("external_id"):
         ORDERS[int(oid)]["external_id"] = str(order_rec["external_id"])
     save_state()
+    await _finalize_new_bot_order_persistence(u.id if u else 0, int(oid))
     _set_awaiting_payment_order_id(u.id if u else 0, ud, int(oid))
     ud.pop("payment_pending_method", None)
     await q.answer()
@@ -13754,6 +13798,7 @@ async def on_send_order_to_admin(
     if int(spend) > 0:
         ORDERS[int(oid)]["bonus_applied"] = int(spend)
     save_state()
+    await _finalize_new_bot_order_persistence(uid, int(oid))
     _set_awaiting_payment_order_id(uid, ud, int(oid))
     await q.answer()
     tot = int(order_rec["total"])
