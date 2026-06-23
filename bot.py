@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-06-23-order-persist-on-create-v72"
+BOT_BUILD_ID = "2026-05-29-admin-id-v74"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -1444,6 +1444,7 @@ BTN_CHAT = "💬 Связь"
 BTN_MY_ORDERS = "📋 Мои заказы"
 BTN_MY_ORDERS_LEGACY = "📜 Мои заказы"
 BTN_DELIVERY = "🚚 Доставка"
+BTN_ABOUT_SELLER = "ℹ️ О продавце"
 BTN_RANDOM_CARD = "🎁 Случайная карточка"
 BTN_FAVORITES = "💚 Избранное"
 
@@ -3859,7 +3860,7 @@ def _rarity_label_ru(s: str) -> str:
 REPLY_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(BTN_CHAT), KeyboardButton(BTN_MY_ORDERS)],
-        [KeyboardButton(BTN_DELIVERY)],
+        [KeyboardButton(BTN_DELIVERY), KeyboardButton(BTN_ABOUT_SELLER)],
     ],
     resize_keyboard=True,
 )
@@ -3871,6 +3872,7 @@ REPLY_MENU_TEXTS = frozenset(
         BTN_MY_ORDERS,
         BTN_MY_ORDERS_LEGACY,
         BTN_DELIVERY,
+        BTN_ABOUT_SELLER,
     },
 )
 
@@ -3895,6 +3897,10 @@ def _match_reply_menu_text(text: str) -> Optional[str]:
         return BTN_MY_ORDERS
     if "достав" in low:
         return BTN_DELIVERY
+    if "продав" in low or "о продав" in low:
+        return BTN_ABOUT_SELLER
+    if low in ("контакты", "контакт"):
+        return BTN_ABOUT_SELLER
     return None
 
 
@@ -4025,6 +4031,31 @@ def _illucards_site_open_markup(telegram_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "Открыть сайт",
                     url=f"https://illucards.by/?user_id={int(telegram_id)}",
+                ),
+            ],
+        ],
+    )
+
+
+def _illucards_contacts_url() -> str:
+    return f"{_illucards_site_base_url()}/contacts"
+
+
+def _about_seller_text() -> str:
+    return (
+        "ℹ️ О продавце\n\n"
+        "IlluCards — коллекционные карточки с доставкой по Беларуси, России и другим странам.\n\n"
+        "Реквизиты, владелец и способы связи — на странице «Контакты» на сайте 👇"
+    )
+
+
+def _kb_about_seller() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📇 Контакты на сайте",
+                    url=_illucards_contacts_url(),
                 ),
             ],
         ],
@@ -15107,6 +15138,7 @@ _ADMIN_REPLY_MENU_KEYS = frozenset(
         BTN_CART,
         BTN_CHAT,
         BTN_DELIVERY,
+        BTN_ABOUT_SELLER,
         BTN_MY_ORDERS,
         BTN_POPULAR,
         BTN_FAVORITES,
@@ -15276,6 +15308,12 @@ async def _handle_main_reply_menu(
         return
     if text == BTN_DELIVERY:
         await msg.reply_text(_delivery_info_text(), reply_markup=REPLY_KB)
+        return
+    if text == BTN_ABOUT_SELLER:
+        await msg.reply_text(
+            _about_seller_text(),
+            reply_markup=_kb_about_seller(),
+        )
         return
 
 
@@ -15509,6 +15547,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         BTN_CATALOG,
         BTN_MY_ORDERS,
         BTN_DELIVERY,
+        BTN_ABOUT_SELLER,
         BTN_POPULAR,
         BTN_FAVORITES,
         BTN_RANDOM_CARD,

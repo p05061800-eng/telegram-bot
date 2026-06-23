@@ -28,11 +28,11 @@ services:
       - key: POST_LOGIN_REDIRECT
         value: "https://www.illucards.by/account"
       - key: TELEGRAM_ORDER_NOTIFY_ID
-        value: "5879163640"
+        value: "711309799"
       - key: TELEGRAM_ADMIN_CHAT_ID
-        value: "5879163640"
+        value: "711309799"
       - key: TELEGRAM_ADMIN_ID
-        value: "5879163640"
+        value: "711309799"
       # Опционально: публичный JSON баннеров главной (иначе POST /api/sync/promotions или scrape <head> главной).
       # - key: HOME_PROMOTIONS_JSON_URL
       #   sync: false
