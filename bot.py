@@ -141,7 +141,7 @@ def _read_primary_admin_id() -> int:
 
 
 ADMIN_ID = _read_primary_admin_id()
-BOT_BUILD_ID = "2026-05-29-admin-id-v74"
+BOT_BUILD_ID = "2026-05-29-admin-order-card-numbers-v75"
 
 
 # Куда бот пишет о новых заказах: по умолчанию ADMIN_ID; переопределение — TELEGRAM_ORDER_NOTIFY_ID.
@@ -2174,16 +2174,33 @@ def _normalize_sync_cart_items(
             qty = 1
         qty = max(1, min(qty, 999))
         lc = _goods_currency_for_delivery_country(cc)
-        out.append(
-            {
-                "ref": ref,
-                "name": name[:200],
-                "price": max(0, price),
-                "qty": qty,
-                "from_site": True,
-                "line_currency": lc,
-            }
+        cat = str(x.get("category") or "").strip()
+        co_raw = (
+            x.get("categoryOrder")
+            if x.get("categoryOrder") is not None
+            else x.get("category_order")
         )
+        category_order = None
+        if co_raw is not None:
+            try:
+                category_order = int(co_raw)
+                if category_order < 0:
+                    category_order = None
+            except (TypeError, ValueError):
+                category_order = None
+        line_entry: dict = {
+            "ref": ref,
+            "name": name[:200],
+            "price": max(0, price),
+            "qty": qty,
+            "from_site": True,
+            "line_currency": lc,
+        }
+        if cat:
+            line_entry["category"] = cat
+        if category_order is not None:
+            line_entry["category_order"] = category_order
+        out.append(line_entry)
     return out
 
 
@@ -2358,6 +2375,11 @@ def _reconcile_cart_lines_to_catalog(products: List[dict], lines: List[dict]) ->
         if p:
             line["ref"] = _product_ref_for_callback(p, _global_product_index(products, p))
             line["name"] = str(p.get("name") or name or "—")[:200]
+            line["category"] = str(p.get("category") or "Без категории")
+            co = _parse_category_order_value(p.get("category_order"))
+            line["category_order"] = (
+                co if co is not None else _product_category_number(products, p)
+            )
 
 
 def _normalize_sync_delivery(raw: object) -> dict:
@@ -5664,14 +5686,15 @@ def _format_delivery_block(d: Optional[dict]) -> str:
     return f"🚚 {lab} — {amt} {cur}"
 
 
-def _format_order_items_for_admin(lines: List[dict], currency: str = "BYN") -> str:
+def _format_order_items_for_admin(
+    lines: List[dict],
+    currency: str = "BYN",
+    products: Optional[List[dict]] = None,
+) -> str:
     cur = str(currency or "BYN").strip().upper() or "BYN"
     rows: List[str] = []
     for x in lines:
-        name_raw = str(x.get("name") or "—")
-        name = name_raw[:200]
-        if len(name_raw) > 200:
-            name = name.rstrip() + "…"
+        name = _order_line_display_name(x, products)
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
         sub = p * q
@@ -5679,14 +5702,18 @@ def _format_order_items_for_admin(lines: List[dict], currency: str = "BYN") -> s
     return "\n".join(rows) if rows else "—"
 
 
-def _format_admin_order_detail_text(order_id: int, o: dict) -> str:
+def _format_admin_order_detail_text(
+    order_id: int, o: dict, products: Optional[List[dict]] = None
+) -> str:
     """Карточка заказа для админа (уведомление, open_order, правка сообщения)."""
     uid = int(o.get("user_id") or 0)
     un = o.get("username")
     un_s = str(un).strip().lstrip("@") if un else ""
     d = o.get("delivery") if isinstance(o.get("delivery"), dict) else None
     line_cur = _order_line_currency_from_delivery(d)
-    items_block = _format_order_items_for_admin(list(o.get("items") or []), line_cur)
+    items_block = _format_order_items_for_admin(
+        list(o.get("items") or []), line_cur, products
+    )
     tot, pay_cur = _order_payment_display(o)
     if int(tot) <= 0:
         tot = _order_resolved_grand_total(o)
@@ -5742,9 +5769,14 @@ def _format_admin_order_detail_text(order_id: int, o: dict) -> str:
     return body
 
 
-def _format_payment_proof_caption(order_id: int, o: dict, uid: int) -> str:
+def _format_payment_proof_caption(
+    order_id: int,
+    o: dict,
+    uid: int,
+    products: Optional[List[dict]] = None,
+) -> str:
     """Подпись к фото чека для админа (лимит Telegram caption 1024)."""
-    body = _format_admin_order_detail_text(order_id, o)
+    body = _format_admin_order_detail_text(order_id, o, products)
     pm = str(o.get("payment_pending_method") or "").strip().lower()
     pm_ru = {"card": "💳 Карта", "transfer": "📱 Перевод", "crypto": "₿ Крипта"}.get(
         pm, "—"
@@ -5808,7 +5840,8 @@ async def _send_admin_order_panel(
                 pass
     o.pop("admin_chat_id", None)
     o.pop("admin_message_id", None)
-    text = _format_admin_order_detail_text(order_id, o)
+    products = await _get_products(context)
+    text = _format_admin_order_detail_text(order_id, o, products)
     kb = _kb_order_admin_actions(order_id, str(o.get("status") or "new"))
     m = None
     targets = _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else [])
@@ -5914,16 +5947,18 @@ def _kb_admin_order_combined(order_id: int, uid: int, status: str, o: dict) -> I
     return InlineKeyboardMarkup(rows)
 
 
-def _admin_order_card_caption(order_id: int, o: dict) -> str:
+def _admin_order_card_caption(
+    order_id: int, o: dict, products: Optional[List[dict]] = None
+) -> str:
     """Текст карточки: для чека — подпись к фото, иначе текстовая карточка."""
     uid = int(o.get("user_id") or 0)
     if o.get("payment_proof_submitted") or o.get("proof_file_id"):
-        cap = _format_payment_proof_caption(int(order_id), o, uid)
+        cap = _format_payment_proof_caption(int(order_id), o, uid, products)
         if o.get("paid"):
             if MSG_PAYMENT_CAPTION_CONFIRMED.strip() not in cap:
                 cap = (cap + MSG_PAYMENT_CAPTION_CONFIRMED)[:1024]
         return cap
-    return _format_admin_order_detail_text(order_id, o)
+    return _format_admin_order_detail_text(order_id, o, products)
 
 
 def _admin_order_card_keyboard(order_id: int, o: dict) -> InlineKeyboardMarkup:
@@ -7254,7 +7289,8 @@ async def _finalize_order_submission_to_admin(
     except Exception:
         log.exception("finalize admin folder uid=%s oid=%s", uid, oid)
     try:
-        cap = _format_payment_proof_caption(int(oid), o, int(uid))
+        products = await _get_products(context)
+        cap = _format_payment_proof_caption(int(oid), o, int(uid), products)
     except Exception:
         log.exception("finalize proof caption uid=%s oid=%s", uid, oid)
         cap = f"📸 Чек оплаты · Заказ #{oid}\n👤 id: {uid}"
@@ -7428,7 +7464,8 @@ async def _refresh_admin_order_message(
     o = ORDERS.get(order_id)
     if not o:
         return
-    text = _admin_order_card_caption(order_id, o)
+    products = await _get_products(context)
+    text = _admin_order_card_caption(order_id, o, products)
     kb = _admin_order_card_keyboard(order_id, o)
     targets: List[Tuple[int, int]] = []
     if q and q.message:
@@ -8556,12 +8593,22 @@ def _order_line_display_name(
     name = name_raw[:200]
     if len(name_raw) > 200:
         name = name.rstrip() + "…"
-    p = _resolve_product_for_order_line(line, products)
-    if not p:
-        return name
-    cat = str(p.get("category", "Без категории") or "Без категории")
-    no = _product_catalog_number(products or [], p, line=line)
-    return f"{cat} №{no} — {name}"
+    p = _resolve_product_for_order_line(line, products) if products else None
+    cat = ""
+    no: Optional[int] = None
+    if p:
+        cat = str(p.get("category", "Без категории") or "Без категории")
+        no = _product_catalog_number(products or [], p, line=line)
+    else:
+        cat = str(line.get("category") or "").strip()
+        no = _parse_category_order_value(
+            line.get("category_order")
+            if line.get("category_order") is not None
+            else line.get("categoryOrder")
+        )
+    if cat and no is not None:
+        return f"{cat} №{no} — {name}"
+    return name
 
 
 def _product_category_label(products: List[dict], target: dict) -> str:
@@ -12516,8 +12563,9 @@ async def on_admin_open_order(
         await _reply_admin_order_stale(q, oid, already_acked=True)
         raise ApplicationHandlerStop
     st = str(o.get("status") or "new")
+    products = await _get_products(context)
     await q.message.reply_text(
-        _format_admin_order_detail_text(oid, o),
+        _format_admin_order_detail_text(oid, o, products),
         reply_markup=_kb_order_admin_actions(oid, st),
     )
     raise ApplicationHandlerStop
