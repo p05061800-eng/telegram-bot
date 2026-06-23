@@ -11985,6 +11985,92 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def _clear_admin_order_chat_messages(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> Tuple[int, int]:
+    """Удалить карточки заказов из чатов админа; сами заказы в базе не трогаем."""
+    log = logging.getLogger(__name__)
+    admin_chats = {
+        int(t)
+        for t in _admin_order_notify_targets() or ([int(ADMIN_ID)] if ADMIN_ID else [])
+        if isinstance(t, int) and int(t) > 0
+    }
+    to_delete: set = set()
+    for oid, o in list(ORDERS.items()):
+        if not isinstance(o, dict):
+            continue
+        for cid_key, mid_key in (
+            ("admin_chat_id", "admin_message_id"),
+            ("payment_proof_admin_chat_id", "payment_proof_admin_message_id"),
+        ):
+            try:
+                cid = int(o.get(cid_key) or 0)
+                mid = int(o.get(mid_key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if cid > 0 and mid > 0 and (not admin_chats or cid in admin_chats):
+                to_delete.add((cid, mid))
+    deleted = 0
+    failed = 0
+    for chat_id, message_id in sorted(to_delete):
+        try:
+            await context.bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
+            deleted += 1
+        except Exception:
+            failed += 1
+            log.info(
+                "clear_admin_orders delete failed chat=%s mid=%s",
+                chat_id,
+                message_id,
+            )
+    cleared_orders = 0
+    for oid, o in list(ORDERS.items()):
+        if not isinstance(o, dict):
+            continue
+        touched = False
+        for cid_key, mid_key in (
+            ("admin_chat_id", "admin_message_id"),
+            ("payment_proof_admin_chat_id", "payment_proof_admin_message_id"),
+        ):
+            try:
+                cid = int(o.get(cid_key) or 0)
+                mid = int(o.get(mid_key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if cid > 0 and mid > 0 and (cid, mid) in to_delete:
+                o.pop(cid_key, None)
+                o.pop(mid_key, None)
+                touched = True
+        if touched:
+            cleared_orders += 1
+    if cleared_orders:
+        try:
+            await asyncio.to_thread(save_state)
+        except Exception:
+            log.exception("clear_admin_orders save_state")
+    return deleted, failed
+
+
+async def clear_admin_orders_cmd(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Удалить карточки заказов из чата админа (заказы клиентов в базе остаются)."""
+    msg = update.effective_message
+    u = update.effective_user
+    if not msg or not u:
+        return
+    if not is_admin(u.id):
+        await msg.reply_text(ADMIN_ACCESS_DENIED)
+        return
+    deleted, failed = await _clear_admin_order_chat_messages(context)
+    await msg.reply_text(
+        f"🗑 Удалено сообщений с заказами: {deleted}."
+        + (f" Не удалось: {failed}." if failed else "")
+        + "\n\nЗаказы клиентов в базе не тронуты. "
+        "Сообщения без привязки к заказу удалите вручную в чате."
+    )
+
+
 async def reset_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Сбросить все заказы в памяти/Redis (только админ)."""
     msg = update.effective_message
@@ -15480,6 +15566,7 @@ def main() -> None:
     app.add_handler(CommandHandler("swipe", send_tinder_mode))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("reset_orders", reset_orders_cmd))
+    app.add_handler(CommandHandler("clear_admin_orders", clear_admin_orders_cmd))
     app.add_handler(CommandHandler("say", admin_say_cmd))
     # confirm_order / cancel_order — явный pattern (нельзя передавать UpdateFilter как pattern).
     app.add_handler(
