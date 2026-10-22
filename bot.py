@@ -25,6 +25,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
+import custom_card_flow
+
 import aiohttp
 import redis
 from flask import Flask, jsonify, request
@@ -269,6 +271,8 @@ USER_ORDERS: dict = {}
 # текст/фото уходит админу reply к карточке заказа (admin_message_id), пока заказ не done/canceled.
 ORDERS: dict = {}
 ORDER_COUNTER = 1
+CUSTOM_CARD_ORDERS: dict = {}
+CC_COUNTER = 1
 # /start order_<id> — черновики заказов по ссылке (до оформления). Пополняется API/сайтом или register_shared_deep_link_order.
 SHARED_DEEP_LINK_ORDERS: dict = {}
 # Режим «написать админу»: user_id -> True, пока ждём следующее текстовое сообщение
@@ -443,6 +447,8 @@ def _build_state_payload() -> dict:
         "username_to_user_id": USERNAME_TO_USER_ID,
         "pending_site_order_by_user": PENDING_SITE_ORDER_BY_USER,
         "shared_deep_link_orders": SHARED_DEEP_LINK_ORDERS,
+        "custom_card_orders": CUSTOM_CARD_ORDERS,
+        "cc_counter": int(CC_COUNTER),
     }
 
 
@@ -534,7 +540,7 @@ def _purge_orders_subset(
 
 
 def _apply_state_payload(data: dict) -> None:
-    global ORDER_COUNTER
+    global ORDER_COUNTER, CC_COUNTER
     loaded_orders = _int_key_dict(data.get("orders"))
     if loaded_orders or not ORDERS:
         ORDERS.clear()
@@ -602,6 +608,22 @@ def _apply_state_payload(data: dict) -> None:
         restored_counter = 1
     max_oid = max([0] + [int(x) for x in ORDERS.keys()])
     ORDER_COUNTER = max(restored_counter, max_oid + 1)
+    loaded_cc = data.get("custom_card_orders")
+    if isinstance(loaded_cc, dict):
+        CUSTOM_CARD_ORDERS.clear()
+        for raw_oid, raw_payload in loaded_cc.items():
+            try:
+                oid_i = int(raw_oid)
+            except (TypeError, ValueError):
+                continue
+            if oid_i > 0 and isinstance(raw_payload, dict):
+                CUSTOM_CARD_ORDERS[oid_i] = raw_payload
+    try:
+        cc_n = int(data.get("cc_counter") or 1)
+    except (TypeError, ValueError):
+        cc_n = 1
+    max_cc = max([0] + [int(x) for x in CUSTOM_CARD_ORDERS.keys()])
+    CC_COUNTER = max(cc_n, max_cc + 1)
 
 
 def save_state() -> None:
@@ -4187,6 +4209,7 @@ async def _notify_admin_support_opened(
     body = f"💬 Клиент нажал «Связь»\n\n👤 id {int(uid)}"
     if uname:
         body += f" @{uname}"
+    body += custom_card_flow.support_order_suffix(int(uid))
     body += "\n\nЖдём сообщение от клиента в этом чате."
     kb = _support_reply_kb(int(uid))
     sent = await _broadcast_admin_message(
@@ -4215,6 +4238,7 @@ async def _forward_client_support_message(
     head = f"💬 Сообщение от клиента\n\n👤 id {int(uid)}"
     if uname:
         head += f" @{uname}"
+    head += custom_card_flow.support_order_suffix(int(uid))
     kb = _support_reply_kb(int(uid))
 
     if photo_file_id:
@@ -10936,7 +10960,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     is_order_link = bool(args) and bool(_parse_order_id_from_start_args(list(args)))
     is_support_link = bool(args) and (fl == "support" or jl == "support")
-    if not is_web_login and not is_order_link and not is_support_link:
+    is_custom_card_link = bool(args) and custom_card_flow.is_custom_card_start(fl, jl)
+    if (
+        not is_web_login
+        and not is_order_link
+        and not is_support_link
+        and not is_custom_card_link
+    ):
         await _reply_site_transition_notice(msg, uid)
     if args:
         if is_web_login:
@@ -10967,6 +10997,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if is_support_link:
             await _maybe_thank_first_telegram_auth(msg, uid)
             await _activate_user_support_chat(msg, context, uid, reply_markup=REPLY_KB)
+            return
+        if is_custom_card_link:
+            await _maybe_thank_first_telegram_auth(msg, uid)
+            await custom_card_flow.begin_custom_card_flow(msg, context, uid)
             return
         oid = _parse_order_id_from_start_args(list(args))
         if not oid:
@@ -14432,6 +14466,13 @@ async def on_customer_proof_media(
         bool(msg.reply_to_message),
     )
 
+    if file_id:
+        cc_photo = await custom_card_flow.try_handle_custom_card_photo(
+            update, context, uid, file_id
+        )
+        if cc_photo:
+            raise ApplicationHandlerStop
+
     if not file_id:
         if _user_wants_proof_upload(uid, ud, msg):
             await msg.reply_text(
@@ -15912,6 +15953,7 @@ def main() -> None:
         ),
         group=-1,
     )
+    custom_card_flow.register_custom_card_handlers(app)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid_cmd))
     app.add_handler(CommandHandler("catalog", catalog_cmd))
