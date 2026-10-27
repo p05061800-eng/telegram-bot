@@ -5265,7 +5265,7 @@ def _payment_intro_text(
     *,
     loyalty_earn_estimate: Optional[int] = None,
 ) -> str:
-    """После оформления: сумма и выбор способа оплаты."""
+    """Сумма и подпись к кнопкам способа оплаты. Само предупреждение — выше."""
     cur = str(currency or "BYN").strip().upper() or "BYN"
     payment_requisites.ensure_loaded()
     methods = "📱 Перевод по номеру телефона\n💳 Оплата картой"
@@ -5281,16 +5281,81 @@ def _payment_intro_text(
     return body
 
 
+def _with_payment_warning(body: str) -> str:
+    """Текст предупреждения всегда выше выбора способа оплаты."""
+    payment_requisites.ensure_loaded()
+    warning = payment_requisites.render_warning(
+        crypto_on=payment_requisites.crypto_enabled()
+    )
+    rest = str(body or "").strip()
+    if rest:
+        return f"{warning}\n\n{rest}"
+    return warning
+
+
+def _payment_choice_text(
+    total: int,
+    currency: str = "BYN",
+    *,
+    loyalty_earn_estimate: Optional[int] = None,
+    prefix: str = "",
+) -> str:
+    """Предупреждение о переводе стоит до кнопок выбора способа."""
+    intro = _payment_intro_text(
+        int(total), currency, loyalty_earn_estimate=loyalty_earn_estimate
+    )
+    head = str(prefix or "").strip()
+    if head:
+        intro = f"{head}\n\n{intro}"
+    return _with_payment_warning(intro)
+
+
 def _payment_step_message_text(
     total: int,
     currency: str = "BYN",
     *,
     loyalty_earn_estimate: Optional[int] = None,
 ) -> str:
-    return (
-        f"{ORDER_AUTO_ACK}\n\n"
-        f"{_payment_intro_text(int(total), currency, loyalty_earn_estimate=loyalty_earn_estimate)}"
+    return _payment_choice_text(
+        int(total),
+        currency,
+        loyalty_earn_estimate=loyalty_earn_estimate,
+        prefix=ORDER_AUTO_ACK,
     )
+
+
+def _mark_payment_warning_shown(order_id: Optional[int]) -> None:
+    """Предупреждение уже в сообщении с кнопками — не показывать его повторно."""
+    if order_id is None:
+        return
+    try:
+        oid = int(order_id)
+    except (TypeError, ValueError):
+        return
+    o = ORDERS.get(oid)
+    if not isinstance(o, dict) or o.get("payment_warning_shown"):
+        return
+    o["payment_warning_shown"] = True
+    try:
+        save_state()
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "payment warning flag save oid=%s", oid
+        )
+
+
+async def _reply_payment_choice(
+    msg: Message,
+    text: str,
+    order_id: Optional[int] = None,
+) -> None:
+    _mark_payment_warning_shown(order_id)
+    markup = _kb_payment_methods(order_id)
+    try:
+        await msg.reply_text(text, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        plain = re.sub(r"<[^>]+>", "", text)
+        await msg.reply_text(plain, reply_markup=markup)
 
 
 async def _reply_payment_step(
@@ -5301,11 +5366,12 @@ async def _reply_payment_step(
     loyalty_earn_estimate: Optional[int] = None,
     order_id: Optional[int] = None,
 ) -> None:
-    await msg.reply_text(
+    await _reply_payment_choice(
+        msg,
         _payment_step_message_text(
             int(total), currency, loyalty_earn_estimate=loyalty_earn_estimate
         ),
-        reply_markup=_kb_payment_methods(order_id),
+        order_id,
     )
 
 
@@ -5705,11 +5771,13 @@ async def _resend_active_payment_step(
     )
     tot, pay_cur = _order_payment_display(o)
     lo_est = o.get("loyalty_earn_estimate")
-    body = (
-        f"💳 Оплата по заказу #{int(oid)}\n\n"
-        f"{_payment_intro_text(int(tot), pay_cur, loyalty_earn_estimate=lo_est)}"
+    body = _payment_choice_text(
+        int(tot),
+        pay_cur,
+        loyalty_earn_estimate=lo_est,
+        prefix=f"💳 Оплата по заказу #{int(oid)}",
     )
-    await q.message.reply_text(body, reply_markup=_kb_payment_methods(int(oid)))
+    await _reply_payment_choice(q.message, body, int(oid))
     _set_awaiting_payment_order_id(uid, ud, int(oid))
 
 
@@ -10269,12 +10337,13 @@ def _format_site_checkout_order_body(
 
 def _site_checkout_payment_message(uid: int, username: Optional[str] = None) -> str:
     un = _site_checkout_username_label(int(uid), username)
-    return (
+    choice = (
         "Выберите способ оплаты:\n\n"
         "💳 Карта -> 💵 Перевод -> ₿ Крипта\n"
         "💳 Оплата -> 📸 Скрин -> 🔎 Проверка -> ✅ Готово\n\n"
         f"Заказ {un}"
     )
+    return _with_payment_warning(choice)
 
 
 async def _begin_site_checkout_order(
@@ -10467,11 +10536,21 @@ async def _present_site_order_checkout_flow(
             )
         await _send(START_SITE_TRANSITION_TEXT, reply_markup=REPLY_KB)
         await _send(body, disable_web_page_preview=True)
-        await _send(
-            _site_checkout_payment_message(int(uid), username),
-            reply_markup=_kb_payment_methods(bot_oid),
-            disable_web_page_preview=True,
-        )
+        pay_text = _site_checkout_payment_message(int(uid), username)
+        _mark_payment_warning_shown(bot_oid)
+        try:
+            await _send(
+                pay_text,
+                reply_markup=_kb_payment_methods(bot_oid),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await _send(
+                re.sub(r"<[^>]+>", "", pay_text),
+                reply_markup=_kb_payment_methods(bot_oid),
+                disable_web_page_preview=True,
+            )
         if ext_id:
             _mark_site_checkout_pushed(int(uid), ext_id, fingerprint=checkout_fp)
         users_touch(int(uid), "payment")
@@ -14037,9 +14116,12 @@ async def on_checkout_nav_back(
         except Exception:
             pass
         lo_est_pm = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
-        await q.message.reply_text(
-            _payment_intro_text(tot, pay_cur, loyalty_earn_estimate=lo_est_pm),
-            reply_markup=_kb_payment_methods(int(oid)),
+        await _reply_payment_choice(
+            q.message,
+            _payment_choice_text(
+                tot, pay_cur, loyalty_earn_estimate=lo_est_pm
+            ),
+            int(oid),
         )
         return
 
