@@ -14,8 +14,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY requirements.txt .
 RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py .
-COPY main.py .
+COPY bot.py main.py custom_card_flow.py payment_requisites.py ./
 COPY web ./web
 
 CMD ["python3", "main.py"]

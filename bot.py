@@ -25,6 +25,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
+import custom_card_flow
+import payment_requisites
+
 import aiohttp
 import redis
 from flask import Flask, jsonify, request
@@ -269,6 +272,8 @@ USER_ORDERS: dict = {}
 # текст/фото уходит админу reply к карточке заказа (admin_message_id), пока заказ не done/canceled.
 ORDERS: dict = {}
 ORDER_COUNTER = 1
+CUSTOM_CARD_ORDERS: dict = {}
+CC_COUNTER = 1
 # /start order_<id> — черновики заказов по ссылке (до оформления). Пополняется API/сайтом или register_shared_deep_link_order.
 SHARED_DEEP_LINK_ORDERS: dict = {}
 # Режим «написать админу»: user_id -> True, пока ждём следующее текстовое сообщение
@@ -443,6 +448,9 @@ def _build_state_payload() -> dict:
         "username_to_user_id": USERNAME_TO_USER_ID,
         "pending_site_order_by_user": PENDING_SITE_ORDER_BY_USER,
         "shared_deep_link_orders": SHARED_DEEP_LINK_ORDERS,
+        "custom_card_orders": CUSTOM_CARD_ORDERS,
+        "cc_counter": int(CC_COUNTER),
+        **payment_requisites.export_state(),
     }
 
 
@@ -534,7 +542,7 @@ def _purge_orders_subset(
 
 
 def _apply_state_payload(data: dict) -> None:
-    global ORDER_COUNTER
+    global ORDER_COUNTER, CC_COUNTER
     loaded_orders = _int_key_dict(data.get("orders"))
     if loaded_orders or not ORDERS:
         ORDERS.clear()
@@ -602,6 +610,23 @@ def _apply_state_payload(data: dict) -> None:
         restored_counter = 1
     max_oid = max([0] + [int(x) for x in ORDERS.keys()])
     ORDER_COUNTER = max(restored_counter, max_oid + 1)
+    loaded_cc = data.get("custom_card_orders")
+    if isinstance(loaded_cc, dict):
+        CUSTOM_CARD_ORDERS.clear()
+        for raw_oid, raw_payload in loaded_cc.items():
+            try:
+                oid_i = int(raw_oid)
+            except (TypeError, ValueError):
+                continue
+            if oid_i > 0 and isinstance(raw_payload, dict):
+                CUSTOM_CARD_ORDERS[oid_i] = raw_payload
+    try:
+        cc_n = int(data.get("cc_counter") or 1)
+    except (TypeError, ValueError):
+        cc_n = 1
+    max_cc = max([0] + [int(x) for x in CUSTOM_CARD_ORDERS.keys()])
+    CC_COUNTER = max(cc_n, max_cc + 1)
+    payment_requisites.import_state(data)
 
 
 def save_state() -> None:
@@ -4177,6 +4202,14 @@ async def _broadcast_admin_message(
     return sent
 
 
+def _payment_support_suffix(uid: int) -> str:
+    """Номер заказа, если клиент открыл поддержку с экрана оплаты."""
+    oid = _user_state_get(int(uid), "pay_support_oid")
+    if not oid:
+        return ""
+    return f"\n📦 Заказ #{int(oid)}"
+
+
 async def _notify_admin_support_opened(
     context: ContextTypes.DEFAULT_TYPE,
     uid: int,
@@ -4187,6 +4220,8 @@ async def _notify_admin_support_opened(
     body = f"💬 Клиент нажал «Связь»\n\n👤 id {int(uid)}"
     if uname:
         body += f" @{uname}"
+    body += custom_card_flow.support_order_suffix(int(uid))
+    body += _payment_support_suffix(int(uid))
     body += "\n\nЖдём сообщение от клиента в этом чате."
     kb = _support_reply_kb(int(uid))
     sent = await _broadcast_admin_message(
@@ -4215,6 +4250,8 @@ async def _forward_client_support_message(
     head = f"💬 Сообщение от клиента\n\n👤 id {int(uid)}"
     if uname:
         head += f" @{uname}"
+    head += custom_card_flow.support_order_suffix(int(uid))
+    head += _payment_support_suffix(int(uid))
     kb = _support_reply_kb(int(uid))
 
     if photo_file_id:
@@ -5228,12 +5265,16 @@ def _payment_intro_text(
     *,
     loyalty_earn_estimate: Optional[int] = None,
 ) -> str:
-    """После оформления: сумма и выбор способа оплаты (кнопки — карта / перевод / крипта)."""
+    """После оформления: сумма и выбор способа оплаты."""
     cur = str(currency or "BYN").strip().upper() or "BYN"
+    payment_requisites.ensure_loaded()
+    methods = "📱 Перевод по номеру телефона\n💳 Оплата картой"
+    if payment_requisites.crypto_enabled():
+        methods += "\n₿ Оплата криптовалютой"
     body = (
         f"💰 Итого: {int(total)} {cur}\n\n"
         "Выберите способ оплаты:\n\n"
-        "💳 Карта · 📱 Перевод · ₿ Крипта\n\n"
+        f"{methods}\n\n"
         f"{PAY_FLOW_STEPS}\n\n"
         "👇 Нажмите кнопку ниже"
     )
@@ -5778,7 +5819,8 @@ def _format_payment_proof_caption(
     """Подпись к фото чека для админа (лимит Telegram caption 1024)."""
     body = _format_admin_order_detail_text(order_id, o, products)
     pm = str(o.get("payment_pending_method") or "").strip().lower()
-    pm_ru = {"card": "💳 Карта", "transfer": "📱 Перевод", "crypto": "₿ Крипта"}.get(
+    label = str(o.get("payment_req_label") or "").strip()
+    pm_ru = label or {"card": "💳 Карта", "transfer": "📱 Перевод", "crypto": "₿ Крипта"}.get(
         pm, "—"
     )
     un = str(o.get("username") or "").strip().lstrip("@")
@@ -6033,6 +6075,7 @@ async def _notify_admin_new_order(
 _RE_PAY_METHOD_CB = re.compile(r"^pay_(card|transfer|crypto)(?::(?P<oid>\d+))?$")
 _RE_PAY_CANCEL_CB = re.compile(r"^pay_cancel(?::(?P<oid>\d+))?$")
 _RE_PAID_CB = re.compile(r"^paid(?::(?P<oid>\d+))?$")
+_RE_PAY_NAV_CB = re.compile(r"^p(?P<kind>[wnps]):(?P<oid>\d+)$")
 
 
 def _pay_cb(base: str, order_id: Optional[int] = None) -> str:
@@ -6046,7 +6089,7 @@ def _pay_cb(base: str, order_id: Optional[int] = None) -> str:
 
 def _oid_from_pay_callback(data: str) -> Optional[int]:
     d = (data or "").strip()
-    for pat in (_RE_PAY_METHOD_CB, _RE_PAY_CANCEL_CB, _RE_PAID_CB):
+    for pat in (_RE_PAY_METHOD_CB, _RE_PAY_CANCEL_CB, _RE_PAID_CB, _RE_PAY_NAV_CB):
         m = pat.match(d)
         if not m:
             continue
@@ -6444,28 +6487,39 @@ def _resolve_payment_order_id(
 
 
 def _kb_payment_methods(order_id: Optional[int] = None) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+    payment_requisites.ensure_loaded()
+    rows: List[List[InlineKeyboardButton]] = [
         [
+            InlineKeyboardButton(
+                "📱 Перевод по номеру телефона",
+                callback_data=_pay_cb("pay_transfer", order_id),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💳 Оплата картой",
+                callback_data=_pay_cb("pay_card", order_id),
+            )
+        ],
+    ]
+    if payment_requisites.crypto_enabled():
+        rows.append(
             [
                 InlineKeyboardButton(
-                    "💳 Карта", callback_data=_pay_cb("pay_card", order_id)
-                ),
-                InlineKeyboardButton(
-                    "📱 Перевод", callback_data=_pay_cb("pay_transfer", order_id)
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "₿ Крипта", callback_data=_pay_cb("pay_crypto", order_id)
+                    "₿ Оплата криптовалютой",
+                    callback_data=_pay_cb("pay_crypto", order_id),
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    "❌ Отменить оплату", callback_data=_pay_cb("pay_cancel", order_id)
-                )
-            ],
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "❌ Отменить оплату",
+                callback_data=_pay_cb("pay_cancel", order_id),
+            )
         ]
     )
+    return InlineKeyboardMarkup(rows)
 
 
 def _payment_total_label(o: dict) -> str:
@@ -10936,7 +10990,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     is_order_link = bool(args) and bool(_parse_order_id_from_start_args(list(args)))
     is_support_link = bool(args) and (fl == "support" or jl == "support")
-    if not is_web_login and not is_order_link and not is_support_link:
+    is_custom_card_link = bool(args) and custom_card_flow.is_custom_card_start(fl, jl)
+    if (
+        not is_web_login
+        and not is_order_link
+        and not is_support_link
+        and not is_custom_card_link
+    ):
         await _reply_site_transition_notice(msg, uid)
     if args:
         if is_web_login:
@@ -10967,6 +11027,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if is_support_link:
             await _maybe_thank_first_telegram_auth(msg, uid)
             await _activate_user_support_chat(msg, context, uid, reply_markup=REPLY_KB)
+            return
+        if is_custom_card_link:
+            await _maybe_thank_first_telegram_auth(msg, uid)
+            await custom_card_flow.begin_custom_card_flow(msg, context, uid)
             return
         oid = _parse_order_id_from_start_args(list(args))
         if not oid:
@@ -11155,6 +11219,9 @@ def _message_looks_like_payment_step(text: str) -> bool:
         return False
     markers = (
         "Выберите способ оплаты",
+        "Перевод по номеру телефона",
+        "Оплата картой",
+        "Оплата криптовалютой",
         PAY_FLOW_STEPS,
         "👇 Нажмите кнопку ниже",
         "💳 Карта · 📱 Перевод",
@@ -11172,12 +11239,16 @@ def _message_looks_like_payment_requisites(text: str) -> bool:
         return False
     markers = (
         "💳 Оплата картой",
+        "ОПЛАТА КАРТОЙ",
+        "ОПЛАТА ПО НОМЕРУ ТЕЛЕФОНА",
+        "ВАЖНО! ПЕРЕВОД МОЖЕТ НЕ ПРОЙТИ",
         "📱 Перевод на номер",
         "₿ Крипто",
         "📸 Отправьте скрин оплаты",
         "После оплаты нажмите",
         "9112 3810 0954 6243",
         "DANIL PARFIONAU",
+        "DANIIL PARFIONAU",
     )
     return any(m in t for m in markers)
 
@@ -11187,6 +11258,10 @@ _BOT_CHECKOUT_CALLBACK_EXACT = frozenset(
 )
 _BOT_CHECKOUT_CALLBACK_PREFIXES = (
     "pay_",
+    "pw:",
+    "pn:",
+    "pp:",
+    "ps:",
     "chk:",
     "bo:",
     "co:",
@@ -11666,6 +11741,9 @@ async def on_checkout_payment_callback(
     data = (q.data or "").strip()
     log = logging.getLogger(__name__)
     try:
+        if _RE_PAY_NAV_CB.match(data):
+            await on_payment_nav(update, context)
+            raise ApplicationHandlerStop
         if _RE_PAY_METHOD_CB.match(data):
             log.info(
                 "checkout_payment_route method uid=%s data=%r",
@@ -11742,6 +11820,9 @@ async def on_callback_query_unhandled(
     if re.match(r"^adm_user_(new|all|shipped)_\d+$", data):
         await on_admin_user_messages(update, context)
         return
+    if _RE_PAY_NAV_CB.match(data):
+        await on_payment_nav(update, context)
+        return
     if _RE_PAY_METHOD_CB.match(data):
         await on_payment_method(update, context)
         return
@@ -11757,6 +11838,9 @@ async def on_callback_query_unhandled(
             uid,
             data,
         )
+        if _RE_PAY_NAV_CB.match(data):
+            await on_payment_nav(update, context)
+            return
         if _RE_PAY_METHOD_CB.match(data):
             await on_payment_method(update, context)
             return
@@ -11978,6 +12062,7 @@ def _kb_admin_panel() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🚚 Отправленные", callback_data="adm:orders_shipped"),
                 InlineKeyboardButton("📈 Статистика", callback_data="adm:stats"),
             ],
+            [InlineKeyboardButton("💳 Реквизиты", callback_data="adm:reqs")],
         ],
     )
 
@@ -12393,6 +12478,351 @@ async def admin_say_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await msg.reply_text(MSG_ADMIN_SAY_OK)
 
 
+_REQ_EDIT_FIELDS = {
+    "n": ("title", "Новое название способа оплаты."),
+    "b": ("bank", "Название банка."),
+    "c": ("country", "Страна."),
+    "v": ("value", "Номер телефона или карты."),
+    "r": ("recipient", "Имя получателя."),
+    "i": ("instruction", "Дополнительная инструкция. Отправьте «-», чтобы очистить."),
+    "s": ("sort", "Порядковый номер — целое число."),
+}
+_RE_REQ_ID = r"[a-z][a-z0-9_]{0,15}"
+
+
+def _kb_admin_req_list() -> InlineKeyboardMarkup:
+    payment_requisites.ensure_loaded()
+    rows: List[List[InlineKeyboardButton]] = []
+    for req in payment_requisites.sorted_requisites():
+        mark = "✅" if req.get("active", True) else "⛔"
+        label = f"{mark} {req.get('title') or req.get('id')}"
+        if len(label) > 60:
+            label = label[:57] + "…"
+        rows.append(
+            [InlineKeyboardButton(label, callback_data=f"ar:v:{req['id']}")]
+        )
+    rows.append([InlineKeyboardButton("➕ Добавить реквизит", callback_data="ar:n")])
+    crypto_label = (
+        "₿ Выключить криптовалюту"
+        if payment_requisites.crypto_enabled()
+        else "₿ Включить криптовалюту"
+    )
+    rows.append([InlineKeyboardButton(crypto_label, callback_data="ar:cg")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="adm:panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _admin_requisites_text() -> str:
+    payment_requisites.ensure_loaded()
+    lines = [
+        "💳 Реквизиты оплаты",
+        "",
+        "Порядок сверху вниз — тот, в котором их видит покупатель.",
+        "В списке номер скрыт. Полный номер открывается в карточке реквизита.",
+        "",
+    ]
+    reqs = payment_requisites.sorted_requisites()
+    if not reqs:
+        lines.append("Банковских реквизитов нет. Добавьте телефон или карту.")
+    for i, req in enumerate(reqs, 1):
+        flag = "вкл" if req.get("active", True) else "выкл"
+        kind = "телефон" if req.get("kind") == "phone" else "карта"
+        masked = payment_requisites.mask_value(
+            str(req.get("kind") or ""), str(req.get("value") or "")
+        )
+        lines.append(
+            f"{i}. {req.get('title')} — {req.get('bank')} — {kind} — {masked} — {flag}"
+        )
+    crypto = "включена" if payment_requisites.crypto_enabled() else "выключена"
+    lines.extend(
+        [
+            "",
+            f"₿ Криптовалюта: {crypto}.",
+            "Адрес кошелька и сеть в этом разделе не меняются.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _admin_req_detail_text(req: dict) -> str:
+    kind = "телефон" if req.get("kind") == "phone" else "банковская карта"
+    return (
+        f"{req.get('title')}\n\n"
+        f"Тип: {kind}\n"
+        f"Банк: {req.get('bank')}\n"
+        f"Страна: {req.get('country')}\n"
+        f"Номер: {req.get('value')}\n"
+        f"Получатель: {req.get('recipient')}\n"
+        f"Инструкция: {req.get('instruction') or '—'}\n"
+        f"Порядок: {req.get('sort')}\n"
+        f"Активен: {'да' if req.get('active', True) else 'нет'}"
+    )
+
+
+def _kb_admin_req_detail(req: dict) -> InlineKeyboardMarkup:
+    rid = str(req.get("id") or "")
+    active = "Выключить" if req.get("active", True) else "Включить"
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(active, callback_data=f"ar:t:{rid}")],
+            [
+                InlineKeyboardButton("Название", callback_data=f"ar:e:{rid}:n"),
+                InlineKeyboardButton("Банк", callback_data=f"ar:e:{rid}:b"),
+            ],
+            [
+                InlineKeyboardButton("Страна", callback_data=f"ar:e:{rid}:c"),
+                InlineKeyboardButton("Номер", callback_data=f"ar:e:{rid}:v"),
+            ],
+            [
+                InlineKeyboardButton("Получатель", callback_data=f"ar:e:{rid}:r"),
+                InlineKeyboardButton("Инструкция", callback_data=f"ar:e:{rid}:i"),
+            ],
+            [
+                InlineKeyboardButton("Выше", callback_data=f"ar:u:{rid}"),
+                InlineKeyboardButton("Ниже", callback_data=f"ar:d:{rid}"),
+            ],
+            [InlineKeyboardButton("Порядок числом", callback_data=f"ar:e:{rid}:s")],
+            [
+                InlineKeyboardButton("Тип: телефон", callback_data=f"ar:k:{rid}:p"),
+                InlineKeyboardButton("Тип: карта", callback_data=f"ar:k:{rid}:c"),
+            ],
+            [InlineKeyboardButton("Удалить", callback_data=f"ar:x:{rid}")],
+            [InlineKeyboardButton("◀️ К списку", callback_data="adm:reqs")],
+        ]
+    )
+
+
+async def _send_admin_requisites(msg: Message) -> None:
+    await msg.reply_text(_admin_requisites_text(), reply_markup=_kb_admin_req_list())
+
+
+async def _send_admin_req_detail(msg: Message, req_id: str) -> None:
+    req = payment_requisites.find_requisite(req_id)
+    if not req:
+        await msg.reply_text("Реквизит не найден.", reply_markup=_kb_admin_req_list())
+        return
+    await msg.reply_text(_admin_req_detail_text(req), reply_markup=_kb_admin_req_detail(req))
+
+
+async def on_admin_requisites(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    q = update.callback_query
+    if not q or not q.from_user or not q.data or not q.message:
+        return
+    if not is_admin(q.from_user.id):
+        await _callback_ack(q, ADMIN_ACCESS_DENIED, show_alert=True)
+        return
+    data = (q.data or "").strip()
+    await q.answer()
+    payment_requisites.ensure_loaded()
+    ud = context.user_data if isinstance(context.user_data, dict) else {}
+    if data == "ar:n":
+        ud["pay_req_wizard"] = {"step": "title", "draft": {}}
+        ud.pop("pay_req_edit", None)
+        await q.message.reply_text("Название способа оплаты. Например: Карта нового банка.")
+        return
+    if data == "ar:cg":
+        enabled = payment_requisites.toggle_crypto()
+        save_state()
+        await q.message.reply_text(
+            "Криптовалюта снова доступна покупателям. Адрес кошелька не изменён."
+            if enabled
+            else "Криптовалюта скрыта из меню оплаты. Адрес кошелька не изменён.",
+            reply_markup=_kb_admin_req_list(),
+        )
+        return
+    if data.startswith("ar:nk:"):
+        wizard = ud.get("pay_req_wizard")
+        if not isinstance(wizard, dict):
+            await q.message.reply_text("Добавление не начато. Нажмите «Добавить реквизит».")
+            return
+        draft = wizard.setdefault("draft", {})
+        draft["kind"] = "phone" if data.endswith(":p") else "card"
+        wizard["step"] = "bank"
+        await q.message.reply_text("Название банка.")
+        return
+    m = re.match(rf"^ar:v:({_RE_REQ_ID})$", data)
+    if m:
+        ud.pop("pay_req_edit", None)
+        await _send_admin_req_detail(q.message, m.group(1))
+        return
+    m = re.match(rf"^ar:t:({_RE_REQ_ID})$", data)
+    if m:
+        req = payment_requisites.toggle_requisite(m.group(1))
+        if not req:
+            await q.message.reply_text("Реквизит не найден.")
+            return
+        save_state()
+        logging.getLogger(__name__).info(
+            "payment requisite toggled %s", payment_requisites.log_requisite(req)
+        )
+        await _send_admin_req_detail(q.message, m.group(1))
+        return
+    m = re.match(rf"^ar:([ud]):({_RE_REQ_ID})$", data)
+    if m:
+        direction = -1 if m.group(1) == "u" else 1
+        payment_requisites.move_requisite(m.group(2), direction)
+        save_state()
+        await _send_admin_requisites(q.message)
+        return
+    m = re.match(rf"^ar:x:({_RE_REQ_ID})$", data)
+    if m:
+        rid = m.group(1)
+        await q.message.reply_text(
+            "Удалить этот реквизит из оплаты?",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Да, удалить", callback_data=f"ar:xd:{rid}")],
+                    [InlineKeyboardButton("Нет", callback_data=f"ar:v:{rid}")],
+                ]
+            ),
+        )
+        return
+    m = re.match(rf"^ar:xd:({_RE_REQ_ID})$", data)
+    if m:
+        payment_requisites.delete_requisite(m.group(1))
+        save_state()
+        logging.getLogger(__name__).info("payment requisite deleted id=%s", m.group(1))
+        await _send_admin_requisites(q.message)
+        return
+    m = re.match(rf"^ar:k:({_RE_REQ_ID}):([pc])$", data)
+    if m:
+        kind = "phone" if m.group(2) == "p" else "card"
+        _req, err = payment_requisites.update_requisite(m.group(1), kind=kind)
+        if err:
+            await q.message.reply_text(
+                "Не удалось сменить тип: номер не подходит для выбранного типа."
+            )
+            return
+        save_state()
+        await _send_admin_req_detail(q.message, m.group(1))
+        return
+    m = re.match(rf"^ar:e:({_RE_REQ_ID}):([a-z])$", data)
+    if m:
+        field = _REQ_EDIT_FIELDS.get(m.group(2))
+        if not field:
+            return
+        ud["pay_req_edit"] = {"id": m.group(1), "field": field[0]}
+        ud.pop("pay_req_wizard", None)
+        await q.message.reply_text(field[1])
+        return
+
+
+async def _admin_requisite_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """Текст админа при редактировании реквизитов. Номер в лог не пишется."""
+    msg = update.effective_message
+    if not msg or not msg.from_user or not msg.text:
+        return False
+    if not is_admin(msg.from_user.id):
+        return False
+    ud = context.user_data if isinstance(context.user_data, dict) else {}
+    text = msg.text.strip()
+    edit = ud.get("pay_req_edit")
+    wizard = ud.get("pay_req_wizard")
+    if not isinstance(edit, dict) and not isinstance(wizard, dict):
+        return False
+    if isinstance(edit, dict):
+        field = str(edit.get("field") or "")
+        req_id = str(edit.get("id") or "")
+        kwargs: dict = {}
+        if field == "sort":
+            try:
+                kwargs["sort"] = int(text)
+            except ValueError:
+                await msg.reply_text("Нужно целое число, например 25.")
+                return True
+        elif field == "instruction" and text == "-":
+            kwargs["instruction"] = ""
+        elif field:
+            kwargs[field] = text
+        updated, err = payment_requisites.update_requisite(req_id, **kwargs)
+        if err or not updated:
+            await msg.reply_text((err or "Некорректное значение.") + " Отправьте ещё раз.")
+            return True
+        ud.pop("pay_req_edit", None)
+        save_state()
+        logging.getLogger(__name__).info(
+            "payment requisite updated %s", payment_requisites.log_requisite(updated)
+        )
+        await msg.reply_text("Сохранено.")
+        await _send_admin_req_detail(msg, req_id)
+        return True
+    if not isinstance(wizard, dict):
+        return False
+    step = str(wizard.get("step") or "")
+    draft = wizard.setdefault("draft", {})
+    if step == "title":
+        if len(text) < 2:
+            await msg.reply_text("Название слишком короткое.")
+            return True
+        draft["title"] = text[:80]
+        wizard["step"] = "kind"
+        await msg.reply_text(
+            "Тип реквизита:",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Телефон", callback_data="ar:nk:p"),
+                        InlineKeyboardButton("Карта", callback_data="ar:nk:c"),
+                    ]
+                ]
+            ),
+        )
+        return True
+    if step == "kind":
+        await msg.reply_text("Выберите тип кнопкой: телефон или карта.")
+        return True
+    if step == "bank":
+        draft["bank"] = text[:80]
+        wizard["step"] = "country"
+        await msg.reply_text("Страна. «-» — Беларусь.")
+        return True
+    if step == "country":
+        draft["country"] = "Беларусь" if text == "-" else text[:80]
+        wizard["step"] = "value"
+        await msg.reply_text("Номер телефона или карты.")
+        return True
+    if step == "value":
+        draft["value"] = text
+        wizard["step"] = "recipient"
+        await msg.reply_text("Имя получателя. «-» — DANIIL PARFIONAU.")
+        return True
+    if step == "recipient":
+        draft["recipient"] = "DANIIL PARFIONAU" if text == "-" else text[:80]
+        wizard["step"] = "instruction"
+        await msg.reply_text("Дополнительная инструкция. «-» — без неё.")
+        return True
+    if step == "instruction":
+        draft["instruction"] = "" if text == "-" else text[:500]
+        wizard["step"] = "sort"
+        await msg.reply_text("Порядковый номер. «-» — поставить в конец.")
+        return True
+    if step == "sort":
+        if text != "-":
+            try:
+                draft["sort"] = int(text)
+            except ValueError:
+                await msg.reply_text("Нужно целое число или «-».")
+                return True
+        created, err = payment_requisites.add_requisite(draft)
+        ud.pop("pay_req_wizard", None)
+        if err or not created:
+            await msg.reply_text(err or "Не удалось сохранить реквизит. Начните заново.")
+            return True
+        save_state()
+        logging.getLogger(__name__).info(
+            "payment requisite added %s", payment_requisites.log_requisite(created)
+        )
+        await msg.reply_text("Реквизит добавлен.")
+        await _send_admin_requisites(msg)
+        return True
+    ud.pop("pay_req_wizard", None)
+    return False
+
+
 async def on_admin_panel_action(
     update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
@@ -12401,6 +12831,13 @@ async def on_admin_panel_action(
     data = (q.data or "").strip()
     if not is_admin(q.from_user.id):
         await _callback_ack(q, ADMIN_ACCESS_DENIED, show_alert=True)
+        return
+
+    if data == "adm:reqs":
+        await q.answer()
+        context.user_data.pop("pay_req_wizard", None)
+        context.user_data.pop("pay_req_edit", None)
+        await _send_admin_requisites(q.message)
         return
 
     if data == "adm:panel":
@@ -13593,12 +14030,8 @@ async def on_checkout_nav_back(
         pr = _user_state_get(uid, "awaiting_proof")
         if pr is not None and int(pr) == int(oid):
             _user_state_pop(uid, "awaiting_proof")
-        o.pop("payment_pending_method", None)
-        ud.pop("payment_pending_method", None)
         _clear_crypto_auto_watch(o, uid)
-        tot = _order_resolved_grand_total(o)
-        d = o.get("delivery") if isinstance(o.get("delivery"), dict) else {}
-        pay_cur = _order_line_currency_from_delivery(d)
+        tot, pay_cur = _order_payment_display(o)
         try:
             await q.answer()
         except Exception:
@@ -13919,6 +14352,7 @@ async def on_payment_cancel(
             o["status"] = "canceled"
             _void_unpaid_pending_order_and_restore_checkout(uid, ud)
     _clear_awaiting_payment_order_id(uid, ud)
+    _user_state_pop(uid, "pay_support_oid", persist=False)
     save_state()
     try:
         await q.message.edit_reply_markup(reply_markup=None)
@@ -13926,6 +14360,169 @@ async def on_payment_cancel(
         pass
     await q.message.reply_text(MSG_PAY_CANCELLED, reply_markup=REPLY_KB)
     users_touch(uid, "payment_cancel")
+
+
+def _kb_from_payment_actions(order_id: int, rows: List[List[tuple]]) -> InlineKeyboardMarkup:
+    keyboard: List[List[InlineKeyboardButton]] = []
+    for row in rows:
+        buttons: List[InlineKeyboardButton] = []
+        for label, action in row:
+            buttons.append(
+                InlineKeyboardButton(
+                    str(label),
+                    callback_data=payment_requisites.callback_for(str(action), int(order_id)),
+                )
+            )
+        if buttons:
+            keyboard.append(buttons)
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _payment_screen_content(progress: dict, screen: str) -> Tuple[str, InlineKeyboardMarkup]:
+    payment_requisites.ensure_loaded()
+    oid = int(progress.get("order_id") or 0)
+    crypto_on = payment_requisites.crypto_enabled()
+    if screen == "warning":
+        text = payment_requisites.render_warning(crypto_on=crypto_on)
+    elif screen == "bank":
+        req = payment_requisites.find_requisite(str(progress.get("req_id") or ""))
+        text = (
+            payment_requisites.render_bank(progress, req)
+            if req
+            else "Этот способ оплаты сейчас недоступен. Выберите другой."
+        )
+    elif screen == "crypto":
+        text = payment_requisites.render_crypto(progress, PAY_CRYPTO_BODY)
+    elif screen == "support":
+        text = payment_requisites.render_support(progress, crypto_on=crypto_on)
+    else:
+        text = "Не удалось открыть способ оплаты. Нажмите кнопку ещё раз."
+    markup = _kb_from_payment_actions(
+        oid,
+        payment_requisites.keyboard_for(screen, progress, crypto_on=crypto_on),
+    )
+    return text, markup
+
+
+async def _reply_payment_html(msg: Message, text: str, markup: InlineKeyboardMarkup) -> None:
+    try:
+        await msg.reply_text(text, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        plain = re.sub(r"<[^>]+>", "", text)
+        await msg.reply_text(plain, reply_markup=markup)
+
+
+async def _continue_payment_sequence(
+    q: CallbackQuery,
+    context: ContextTypes.DEFAULT_TYPE,
+    uid: int,
+    ud: dict,
+    oid: int,
+    o: dict,
+    action: str,
+) -> None:
+    """Сменить экран реквизитов, не создавая новый заказ и не меняя сумму."""
+    payment_requisites.ensure_loaded()
+    tot, cur = _order_payment_display(o)
+    progress = payment_requisites.progress_from_order(o, int(oid), int(tot), cur)
+    progress, screen = payment_requisites.advance(
+        progress,
+        action,
+        crypto_on=payment_requisites.crypto_enabled(),
+    )
+    payment_requisites.apply_progress(o, progress)
+    _bind_payment_order_session(uid, ud, int(oid))
+    if screen in ("bank", "crypto") and uid:
+        _user_state_bucket(int(uid))["proof_deadline"] = int(time.time()) + 6 * 3600
+    if screen == "crypto":
+        _user_state_bucket(uid)["crypto_check"] = int(oid)
+        o["crypto_auto_active"] = True
+        o["crypto_auto_deadline"] = time.time() + random.uniform(120.0, 300.0)
+    elif screen in ("bank", "warning", "support"):
+        _clear_crypto_auto_watch(o, uid, persist=False)
+    if progress.get("pending_method"):
+        ud["payment_pending_method"] = progress["pending_method"]
+    users_touch(uid, "payment")
+    if screen in ("already_paid", "already_proof"):
+        await q.message.reply_text(
+            MSG_ORDER_ALREADY_PAID_TOAST if screen == "already_paid" else PAY_PROOF_WAIT,
+            reply_markup=REPLY_KB,
+        )
+        save_state()
+        return
+    text, markup = _payment_screen_content(progress, screen)
+    await _reply_payment_html(q.message, text, markup)
+    try:
+        save_state()
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "payment sequence save uid=%s oid=%s", uid, oid
+        )
+
+
+async def on_payment_nav(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Следующие или предыдущие реквизиты, предупреждение и поддержка по заказу."""
+    q = update.callback_query
+    if not q or not q.from_user or not q.message or not q.data:
+        return
+    m = _RE_PAY_NAV_CB.match((q.data or "").strip())
+    if not m:
+        return
+    uid = int(q.from_user.id)
+    ud = context.user_data if isinstance(context.user_data, dict) else {}
+    await _callback_ack(q)
+    action = {"w": "warn_go", "n": "next", "p": "prev", "s": "support"}[m.group("kind")]
+    msg_txt = (q.message.text or q.message.caption or "") if q.message else ""
+    try:
+        oid = _resolve_payment_order_id(
+            uid, ud, callback_data=q.data, message_text=msg_txt
+        )
+        if oid is None:
+            raw = m.group("oid")
+            oid = int(raw) if raw else None
+        if oid is None:
+            await q.message.reply_text(
+                "Сессия оплаты устарела. Откройте заказ ещё раз.",
+                reply_markup=REPLY_KB,
+            )
+            return
+        o = _ensure_order_in_orders(int(oid), uid)
+        if not isinstance(o, dict) or int(o.get("user_id") or 0) != uid:
+            await q.message.reply_text(
+                "Заказ не найден. Оформите его ещё раз или напишите в «Связь».",
+                reply_markup=REPLY_KB,
+            )
+            return
+        if o.get("paid"):
+            await q.message.reply_text(MSG_ORDER_ALREADY_PAID_TOAST, reply_markup=REPLY_KB)
+            return
+        if o.get("payment_proof_submitted") and not o.get("paid"):
+            await q.message.reply_text(PAY_PROOF_WAIT, reply_markup=REPLY_KB)
+            return
+        if action == "support":
+            _user_state_set(uid, "pay_support_oid", int(oid))
+            _bind_payment_order_session(uid, ud, int(oid))
+            await _activate_user_support_chat(q.message, context, uid, reply_markup=REPLY_KB)
+            await q.message.reply_text(
+                f"Напишите сообщение по заказу #{int(oid)}. "
+                "Оно уйдёт администратору вместе с номером заказа. "
+                "Сумма и состав заказа сохранены."
+            )
+            return
+        await _continue_payment_sequence(q, context, uid, ud, int(oid), o, action)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "payment_nav failed uid=%s data=%r", uid, q.data
+        )
+        try:
+            await q.message.reply_text(
+                "Не удалось открыть следующие реквизиты. Нажмите кнопку ещё раз.",
+                reply_markup=REPLY_KB,
+            )
+        except Exception:
+            pass
 
 
 async def on_payment_method(
@@ -13967,20 +14564,21 @@ async def on_payment_method(
                 reply_markup=REPLY_KB,
             )
             return
-        _refresh_unpaid_order_payment(
-            o,
-            uid,
-            ud,
-            preview_text=_get_site_pending_preview(uid) or msg_txt,
-            lines=_checkout_lines_from_sources(
+        if not o.get("payment_total_locked") and not o.get("payment_warning_shown"):
+            _refresh_unpaid_order_payment(
+                o,
                 uid,
                 ud,
-                _get_site_pending_meta(uid, ud),
-                o,
-                _cart_get_lines_uid(uid, ud),
-            ),
-            meta=_get_site_pending_meta(uid, ud),
-        )
+                preview_text=_get_site_pending_preview(uid) or msg_txt,
+                lines=_checkout_lines_from_sources(
+                    uid,
+                    ud,
+                    _get_site_pending_meta(uid, ud),
+                    o,
+                    _cart_get_lines_uid(uid, ud),
+                ),
+                meta=_get_site_pending_meta(uid, ud),
+            )
         if o.get("paid"):
             await q.message.reply_text(MSG_ORDER_ALREADY_PAID_TOAST, reply_markup=REPLY_KB)
             return
@@ -13991,35 +14589,13 @@ async def on_payment_method(
         if pr_same is not None and int(pr_same) == int(oid):
             _user_state_pop(uid, "awaiting_proof")
         method = m.group(1)
-        ud["payment_pending_method"] = method
-        _clear_shipping_session_keys(uid, ud)
-        if isinstance(o, dict):
-            o.pop("delivery_details_parts", None)
-            o.pop("delivery_details", None)
-        _bind_payment_order_session(uid, ud, int(oid))
-        if uid:
-            _user_state_bucket(int(uid))["proof_deadline"] = int(time.time()) + 6 * 3600
-        if method == "crypto":
-            _user_state_bucket(uid)["crypto_check"] = int(oid)
-            o["crypto_auto_active"] = True
-            o["crypto_auto_deadline"] = time.time() + random.uniform(120.0, 300.0)
-        else:
-            _clear_crypto_auto_watch(o, uid)
-        body_map = {
-            "card": PAY_CARD_BODY,
-            "transfer": PAY_TRANSFER_BODY,
-            "crypto": PAY_CRYPTO_BODY,
-        }
-        users_touch(uid, "payment")
-        total_label = _payment_total_label(o)
-        await q.message.reply_text(
-            body_map[method],
-            reply_markup=_kb_paid_confirm_with_back(total_label, int(oid)),
+        action = {"card": "open_card", "transfer": "open_phone", "crypto": "open_crypto"}.get(
+            method, "open_phone"
         )
-        try:
-            save_state()
-        except Exception:
-            log.exception("payment_method save_state uid=%s oid=%s", uid, oid)
+        _clear_shipping_session_keys(uid, ud)
+        await _continue_payment_sequence(
+            q, context, uid, ud, int(oid), o, action
+        )
     except Exception:
         log.exception("payment_method failed uid=%s data=%r", uid, q.data)
         try:
@@ -14431,6 +15007,13 @@ async def on_customer_proof_media(
         bool(file_id),
         bool(msg.reply_to_message),
     )
+
+    if file_id:
+        cc_photo = await custom_card_flow.try_handle_custom_card_photo(
+            update, context, uid, file_id
+        )
+        if cc_photo:
+            raise ApplicationHandlerStop
 
     if not file_id:
         if _user_wants_proof_upload(uid, ud, msg):
@@ -15325,6 +15908,8 @@ async def _handle_main_reply_menu(
     user_data = context.user_data if isinstance(context.user_data, dict) else {}
     log = logging.getLogger(__name__)
     log.info("reply_menu uid=%s btn=%r", uid, text)
+    user_data.pop("pay_req_wizard", None)
+    user_data.pop("pay_req_edit", None)
     _clear_shipping_session_keys(uid, user_data)
     _user_state_pop(uid, "awaiting_proof", persist=False)
     cc_raw = _user_state_get(uid, "crypto_check")
@@ -15533,6 +16118,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if menu is not None:
         await _handle_main_reply_menu(update, context, menu)
+        return
+
+    if uid and is_admin(uid) and await _admin_requisite_text(update, context):
         return
 
     if await _try_handle_postpaid_shipping_text(update, context, log_prefix="on_text"):
@@ -15857,7 +16445,9 @@ def main() -> None:
     app.add_handler(
         CallbackQueryHandler(
             on_checkout_payment_callback,
-            pattern=re.compile(r"^(pay_(card|transfer|crypto)|pay_cancel|paid)(:\d+)?$"),
+            pattern=re.compile(
+                r"^(pay_(card|transfer|crypto)|pay_cancel|paid)(:\d+)?$|^p[wnps]:\d+$"
+            ),
         ),
         group=-1,
     )
@@ -15912,6 +16502,7 @@ def main() -> None:
         ),
         group=-1,
     )
+    custom_card_flow.register_custom_card_handlers(app)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid_cmd))
     app.add_handler(CommandHandler("catalog", catalog_cmd))
@@ -15936,9 +16527,12 @@ def main() -> None:
         CallbackQueryHandler(
             on_admin_panel_action,
             pattern=re.compile(
-                r"^adm:(panel|orders_new|orders_all|orders_shipped|stats|clear_sec_new|clear_sec_all|clear_sec_shipped)$"
+                r"^adm:(panel|orders_new|orders_all|orders_shipped|stats|reqs|clear_sec_new|clear_sec_all|clear_sec_shipped)$"
             ),
         )
+    )
+    app.add_handler(
+        CallbackQueryHandler(on_admin_requisites, pattern=re.compile(r"^ar:"))
     )
     app.add_handler(
         CallbackQueryHandler(
