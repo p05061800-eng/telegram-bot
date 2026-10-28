@@ -1,9 +1,14 @@
-"""Оформление индивидуальной карточки: /start custom_card и согласование макета."""
+"""Индивидуальная карточка по фото: /start custom_card_order и согласование макета.
+
+Параметр start не пересекается с оплатой заказа с сайта (order_…),
+входом (web_login, login) и поддержкой (support). Старый custom_card тоже принимается.
+"""
 
 from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -18,7 +23,11 @@ from telegram.ext import (
 
 log = logging.getLogger(__name__)
 
-START_PAYLOAD = "custom_card"
+# Отдельный deep link для кнопки «Заказать» в акции.
+PRIMARY_START_PAYLOAD = "custom_card_order"
+# Заготовка на сайте (telegramCustomCardOrderUrl) уже использует custom_card.
+LEGACY_START_PAYLOAD = "custom_card"
+START_PAYLOADS = frozenset({PRIMARY_START_PAYLOAD, LEGACY_START_PAYLOAD})
 DRAFT_KEY = "cc_draft"
 SEND_KEY = "cc_send_oid"
 SUPPORT_KEY = "cc_support_oid"
@@ -156,6 +165,9 @@ def _kb_universes(names: List[str], page: int = 0) -> InlineKeyboardMarkup:
         nav.append(InlineKeyboardButton("➡️", callback_data=f"cc:UP:{page + 1}"))
     if nav:
         rows.append(nav)
+    rows.append(
+        [InlineKeyboardButton("✍️ Написать вручную", callback_data="cc:UT")]
+    )
     rows.append([InlineKeyboardButton("✖️ Отмена", callback_data="cc:X")])
     return InlineKeyboardMarkup(rows)
 
@@ -183,12 +195,64 @@ def _kb_characters(names: List[str], page: int = 0) -> InlineKeyboardMarkup:
     if nav:
         rows.append(nav)
     rows.append(
+        [InlineKeyboardButton("✍️ Написать вручную", callback_data="cc:CT")]
+    )
+    rows.append(
         [
             InlineKeyboardButton("↩️ Вселенная", callback_data="cc:UB"),
             InlineKeyboardButton("✖️ Отмена", callback_data="cc:X"),
         ]
     )
     return InlineKeyboardMarkup(rows)
+
+
+def _kb_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✖️ Отмена", callback_data="cc:X")]]
+    )
+
+
+def _universe_prompt(person_no: int, *, saved_photo: bool = False) -> str:
+    n = max(1, int(person_no))
+    if saved_photo and n == 1:
+        return (
+            "Фото сохранено.\n\n"
+            "Напишите вселенную.\n"
+            "Следующим сообщением напишите персонажей."
+        )
+    if n <= 1:
+        return (
+            "Напишите вселенную.\n"
+            "Следующим сообщением напишите персонажей."
+        )
+    return (
+        f"Напишите вселенную для {n}-го человека.\n"
+        "Следующим сообщением напишите персонажей."
+    )
+
+
+def _character_prompt(universe: str) -> str:
+    uni = (universe or "").strip() or "—"
+    return (
+        f"Вселенная: {uni}\n\n"
+        "Напишите персонажей.\n"
+        "Одного — одним сообщением. Нескольких — через запятую или с новой строки."
+    )
+
+
+def _split_character_names(text: str) -> List[str]:
+    names: List[str] = []
+    seen = set()
+    for chunk in re.split(r"[\n,;]+", text or ""):
+        name = " ".join(chunk.split()).strip()
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name[:80])
+    return names
 
 
 def _kb_after_person() -> InlineKeyboardMarkup:
@@ -258,7 +322,7 @@ def _kb_admin_order(oid: int) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    "Отправить макет клиенту",
+                    "Отправить изображение клиенту",
                     callback_data=f"cc:SND:{int(oid)}",
                 )
             ]
@@ -274,11 +338,11 @@ def _summary_text(d: dict) -> str:
     label = B.DELIVERY_OPTIONS.get(code, (code or "—", 0, ""))[0]
     addr = str(d.get("address") or "—").strip() or "—"
     return (
-        "📋 Заявка на индивидуальную карточку\n\n"
+        "📋 Проверьте заявку и подтвердите её.\n\n"
         f"Персонажи:\n{_fmt_people(people)}\n\n"
         f"Количество карточек: {qty}\n"
         f"Доставка: {label}\n"
-        f"Получатель:\n{addr[:1200]}"
+        f"Получатель:\n{addr[:700]}"
     )
 
 
@@ -318,6 +382,9 @@ async def begin_custom_card_flow(
 ) -> None:
     B = _b()
     B.user_support_state.pop(int(uid), None)
+    bucket = B.user_states.get(int(uid))
+    if isinstance(bucket, dict):
+        bucket.pop(SUPPORT_KEY, None)
     _set_draft(
         uid,
         {
@@ -341,11 +408,81 @@ async def begin_custom_card_flow(
 
 
 def is_custom_card_start(first: str, joined: str) -> bool:
+    """True для ?start=custom_card_order и совместимого ?start=custom_card.
+
+    Не совпадает с order_<id>, web_login, login и support.
+    """
     fl = (first or "").strip().lower()
     jl = (joined or "").strip().lower()
-    return fl == START_PAYLOAD or jl == START_PAYLOAD or fl.startswith(
-        START_PAYLOAD + "_"
+    if fl in START_PAYLOADS or jl in START_PAYLOADS:
+        return True
+    return fl.startswith(PRIMARY_START_PAYLOAD + "_") or fl.startswith(
+        LEGACY_START_PAYLOAD + "_"
     )
+
+
+def _still_image_message(msg: Optional[Message]) -> bool:
+    if not msg:
+        return False
+    if msg.photo:
+        return True
+    doc = msg.document
+    if not doc:
+        return False
+    mime = str(doc.mime_type or "").lower()
+    name = str(doc.file_name or "").lower()
+    if mime.startswith("image/"):
+        return True
+    return any(
+        name.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".heic", ".gif")
+    )
+
+
+def _other_flow_needs_this_media(uid: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Не забирать скрин оплаты, адрес после оплаты и сообщения из «Связи»."""
+    B = _b()
+    if B.user_support_state.get(int(uid)):
+        return True
+    ud = context.user_data if isinstance(getattr(context, "user_data", None), dict) else {}
+    pp = B._user_state_get(int(uid), "postpaid_thread_oid")
+    if pp is None:
+        pp = ud.get("postpaid_thread_oid")
+    if pp is not None:
+        try:
+            if B._postpaid_shipping_collect_active(int(uid), int(pp)):
+                return True
+        except Exception:
+            return True
+    raw = None
+    for key in ("awaiting_proof", "awaiting_payment_order_id"):
+        raw = B._user_state_get(int(uid), key)
+        if raw is None:
+            raw = ud.get(key)
+        if raw is not None:
+            break
+    if raw is None:
+        return False
+    try:
+        oid = int(raw)
+    except (TypeError, ValueError):
+        return False
+    order = B.ORDERS.get(oid)
+    if not isinstance(order, dict):
+        return False
+    if order.get("paid") or order.get("payment_proof_submitted"):
+        return False
+    if int(order.get("user_id") or 0) not in (0, int(uid)):
+        return False
+    pending = str(
+        order.get("payment_pending_method") or ud.get("payment_pending_method") or ""
+    ).strip()
+    if pending:
+        return True
+    dl = B._user_state_get(int(uid), "proof_deadline")
+    try:
+        return dl is not None and int(dl) > int(time.time())
+    except (TypeError, ValueError):
+        return False
 
 
 async def try_handle_custom_card_photo(
@@ -355,20 +492,30 @@ async def try_handle_custom_card_photo(
     if B.is_admin(uid):
         send_oid = B.user_states.get(int(uid), {}).get(SEND_KEY)
         if send_oid is not None:
+            msg = update.effective_message
+            if msg and not _still_image_message(msg):
+                await msg.reply_text(
+                    "Нужно изображение макета: отправьте его как фото, не как видео или файл другого типа."
+                )
+                return True
             ok = await _admin_send_proof(context, uid, int(send_oid), file_id)
-            if not ok and update.effective_message:
-                await update.effective_message.reply_text(
-                    "Не удалось отправить макет. Пришлите изображение ещё раз."
+            if not ok and msg:
+                await msg.reply_text(
+                    "Не удалось отправить изображение. Пришлите его ещё раз как фото."
                 )
             return True
+
+    if _other_flow_needs_this_media(uid, context):
+        return False
 
     d = _peek_draft(uid)
     if not d:
         return False
     step = str(d.get("step") or "")
+    msg = update.effective_message
     if step and step != "photo":
-        if update.effective_message:
-            await update.effective_message.reply_text(
+        if msg:
+            await msg.reply_text(
                 "Сейчас нужен ответ текстом или кнопками, а не новое фото. "
                 "Если хотите заменить фото — нажмите «Исправить данные» в сводке "
                 "или откройте ссылку с сайта заново."
@@ -376,39 +523,70 @@ async def try_handle_custom_card_photo(
         return True
     if step != "photo":
         return False
+    if msg and not _still_image_message(msg):
+        await msg.reply_text(
+            "Нужна фотография. Отправьте её как фото, не как видео или документ другого типа.",
+            reply_markup=B.REPLY_KB,
+        )
+        return True
     d["photo_file_id"] = file_id
     d["step"] = "universe"
     d["people"] = []
-    _set_draft(uid, d)
-    names = await _catalog_universes(context)
-    d["universes"] = names
+    d["universe"] = ""
     _set_draft(uid, d)
     await update.effective_message.reply_text(
-        "Фото сохранено.\n\nШаг 2. Выберите вселенную для 1-го человека на фото."
-        + (
-            ""
-            if names
-            else "\n\nКаталог сейчас недоступен — напишите вселенную текстом."
-        ),
-        reply_markup=_kb_universes(names) if names else None,
+        _universe_prompt(1, saved_photo=True),
+        reply_markup=_kb_cancel(),
     )
     return True
 
 
-async def _ask_characters(q, context, d: dict, uid: int) -> None:
-    uni = str(d.get("universe") or "")
-    names = await _catalog_characters(context, uni)
-    d["characters"] = names
-    d["char_page"] = 0
+def _cb_index(data: str) -> Optional[int]:
+    raw = data.split(":", 1)[1] if ":" in data else ""
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
+def _message_has_media(msg: Optional[Message]) -> bool:
+    if not msg:
+        return False
+    return bool(msg.photo or msg.document or msg.video or msg.animation)
+
+
+async def _present(q, text: str, reply_markup=None) -> None:
+    """Текст с кнопками: правка текстового сообщения или новое сообщение под фото."""
+    msg = q.message if q else None
+    if _message_has_media(msg):
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        if msg:
+            await msg.reply_text(text, reply_markup=reply_markup)
+        return
+    try:
+        await q.edit_message_text(text, reply_markup=reply_markup)
+    except Exception:
+        log.exception("custom_card edit prompt")
+        if msg:
+            await msg.reply_text(text, reply_markup=reply_markup)
+
+
+async def _ask_characters(q, d: dict, uid: int) -> None:
     d["step"] = "character"
     _set_draft(uid, d)
-    text = (
-        f"Вселенная: {uni}\n\nВыберите персонажа."
-        if names
-        else f"Вселенная: {uni}\n\nНапишите имя персонажа текстом."
-    )
-    await q.edit_message_text(
-        text, reply_markup=_kb_characters(names) if names else None
+    await _present(q, _character_prompt(str(d.get("universe") or "")), _kb_cancel())
+
+
+async def _ask_characters_text(target, uid: int, d: dict) -> None:
+    d["step"] = "character"
+    _set_draft(uid, d)
+    await target.reply_text(
+        _character_prompt(str(d.get("universe") or "")),
+        reply_markup=_kb_cancel(),
     )
 
 
@@ -417,14 +595,34 @@ async def _ask_qty(q_or_msg, uid: int, d: dict) -> None:
     _set_draft(uid, d)
     text = "Шаг 3. Сколько карточек нужно?"
     markup = _kb_qty()
-    if hasattr(q_or_msg, "edit_message_text"):
-        await q_or_msg.edit_message_text(text, reply_markup=markup)
+    if hasattr(q_or_msg, "edit_message_text") and not _message_has_media(
+        getattr(q_or_msg, "message", None)
+    ):
+        await _present(q_or_msg, text, markup)
     else:
         await q_or_msg.reply_text(text, reply_markup=markup)
 
 
 async def on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _on_custom_card_callback(update, context)
+    try:
+        await _on_custom_card_callback(update, context)
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        log.exception("custom_card callback")
+        q = update.callback_query
+        if q:
+            try:
+                await q.answer()
+            except Exception:
+                pass
+        if q and q.message:
+            try:
+                await q.message.reply_text(
+                    "Не удалось обработать кнопку. Откройте ссылку заказа с сайта ещё раз."
+                )
+            except Exception:
+                pass
     raise ApplicationHandlerStop
 
 
@@ -453,7 +651,7 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
         bucket[SEND_KEY] = oid
         B.save_state()
         await q.message.reply_text(
-            f"Пришлите изображение макета для заявки IC-{oid} следующим сообщением."
+            f"Пришлите готовое изображение для заказа IC-{oid} следующим сообщением."
         )
         return
 
@@ -477,11 +675,25 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
         await q.answer("Сессия оформления истекла. Откройте ссылку с сайта снова.")
         return
 
+    if data == "OK":
+        if (
+            not d.get("photo_file_id")
+            or not d.get("people")
+            or not d.get("qty")
+            or not str(d.get("delivery") or "").strip()
+            or not str(d.get("address") or "").strip()
+        ):
+            await q.answer("Заполните все шаги.", show_alert=True)
+            return
+        await q.answer()
+        await _confirm_order(q, context, uid, d)
+        return
+
     await q.answer()
 
     if data == "X":
         _clear_draft(uid)
-        await q.edit_message_text("Оформление индивидуальной карточки отменено.")
+        await _present(q, "Оформление индивидуальной карточки отменено.")
         return
     if data == "ED":
         d["step"] = "universe"
@@ -490,27 +702,34 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
         d["delivery"] = ""
         d["address"] = ""
         _set_draft(uid, d)
-        names = d.get("universes") or await _catalog_universes(context)
-        d["universes"] = names
         _set_draft(uid, d)
-        await q.edit_message_text(
-            "Выберите вселенную заново.",
-            reply_markup=_kb_universes(names) if names else None,
-        )
+        await _present(q, _universe_prompt(1), _kb_cancel())
+        return
+    if data == "UT":
+        d["step"] = "universe_text"
+        _set_draft(uid, d)
+        await _present(q, "Напишите вселенную текстом.")
+        return
+    if data == "CT":
+        d["step"] = "character_text"
+        _set_draft(uid, d)
+        await _present(q, "Напишите персонажа текстом.")
         return
     if data.startswith("UP:"):
-        page = int(data.split(":", 1)[1])
+        page = _cb_index(data)
+        if page is None:
+            return
         names = d.get("universes") or await _catalog_universes(context)
         await q.edit_message_reply_markup(reply_markup=_kb_universes(names, page))
         return
     if data.startswith("U:"):
-        idx = int(data.split(":", 1)[1])
+        idx = _cb_index(data)
         names = d.get("universes") or await _catalog_universes(context)
-        if idx < 0 or idx >= len(names):
+        if idx is None or idx >= len(names):
             return
         d["universe"] = names[idx]
         _set_draft(uid, d)
-        await _ask_characters(q, context, d, uid)
+        await _ask_characters(q, d, uid)
         return
     if data == "UB":
         if str(d.get("step") or "") == "people_more" and d.get("people"):
@@ -519,27 +738,27 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
         if str(d.get("step") or "") == "qty" and d.get("people"):
             d["step"] = "people_more"
             _set_draft(uid, d)
-            await q.edit_message_text(
+            await _present(
+                q,
                 f"Добавлено:\n{_fmt_people(d.get('people') or [])}\n\nЕщё человек на фото?",
-                reply_markup=_kb_after_person(),
+                _kb_after_person(),
             )
             return
         d["step"] = "universe"
-        names = d.get("universes") or await _catalog_universes(context)
-        await q.edit_message_text(
-            "Выберите вселенную.",
-            reply_markup=_kb_universes(names) if names else None,
-        )
+        n = len(d.get("people") or []) + 1
+        await _present(q, _universe_prompt(n), _kb_cancel())
         return
     if data.startswith("CP:"):
-        page = int(data.split(":", 1)[1])
+        page = _cb_index(data)
+        if page is None:
+            return
         names = d.get("characters") or []
         await q.edit_message_reply_markup(reply_markup=_kb_characters(names, page))
         return
     if data.startswith("C:"):
-        idx = int(data.split(":", 1)[1])
+        idx = _cb_index(data)
         names = d.get("characters") or []
-        if idx < 0 or idx >= len(names):
+        if idx is None or idx >= len(names):
             return
         people = list(d.get("people") or [])
         people.append(
@@ -551,37 +770,40 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
         d["people"] = people
         d["step"] = "people_more"
         _set_draft(uid, d)
-        await q.edit_message_text(
+        await _present(
+            q,
             f"Добавлено:\n{_fmt_people(people)}\n\nЕщё человек на фото?",
-            reply_markup=_kb_after_person(),
+            _kb_after_person(),
         )
         return
     if data == "NP":
         d["step"] = "universe"
         d["universe"] = ""
-        names = d.get("universes") or await _catalog_universes(context)
         n = len(d.get("people") or []) + 1
-        await q.edit_message_text(
-            f"Выберите вселенную для {n}-го человека.",
-            reply_markup=_kb_universes(names) if names else None,
-        )
+        await _present(q, _universe_prompt(n), _kb_cancel())
         return
     if data == "QT":
+        if not d.get("people"):
+            await _present(q, "Сначала укажите хотя бы одного персонажа.")
+            return
         await _ask_qty(q, uid, d)
         return
     if data == "QO":
         d["step"] = "qty_text"
         _set_draft(uid, d)
-        await q.edit_message_text("Напишите нужное количество карточек числом.")
+        await _present(q, "Напишите нужное количество карточек числом.")
         return
     if data.startswith("Q:"):
-        qty = int(data.split(":", 1)[1])
+        qty = _cb_index(data)
+        if qty is None or qty < 1 or qty > 99:
+            return
         d["qty"] = qty
         d["step"] = "delivery"
         _set_draft(uid, d)
-        await q.edit_message_text(
+        await _present(
+            q,
             "Шаг 4. Выберите способ доставки.",
-            reply_markup=_kb_delivery(),
+            _kb_delivery(),
         )
         return
     if data.startswith("D:"):
@@ -591,27 +813,32 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
         d["delivery"] = code
         d["step"] = "address"
         _set_draft(uid, d)
-        await q.edit_message_text(_delivery_prompt(code))
-        return
-    if data == "OK":
-        await _confirm_order(q, context, uid, d)
+        await _present(q, _delivery_prompt(code))
         return
 
 
 async def _confirm_order(q, context, uid: int, d: dict) -> None:
     B = _b()
-    if not d.get("photo_file_id") or not d.get("people") or not d.get("qty"):
-        await q.answer("Заполните все шаги.", show_alert=True)
-        return
     oid = _next_cc_id()
     uname = ""
-    if q.from_user and q.from_user.username:
-        uname = str(q.from_user.username)
+    full_name = ""
+    if q.from_user:
+        if q.from_user.username:
+            uname = str(q.from_user.username)
+        full_name = " ".join(
+            part
+            for part in (
+                str(q.from_user.first_name or "").strip(),
+                str(q.from_user.last_name or "").strip(),
+            )
+            if part
+        )
     order = {
         "id": oid,
         "kind": "custom_card",
         "user_id": int(uid),
         "username": uname,
+        "full_name": full_name,
         "photo_file_id": d.get("photo_file_id"),
         "people": list(d.get("people") or []),
         "qty": d.get("qty"),
@@ -627,15 +854,20 @@ async def _confirm_order(q, context, uid: int, d: dict) -> None:
     B.save_state()
     code = str(order.get("delivery") or "")
     label = B.DELIVERY_OPTIONS.get(code, (code, 0, ""))[0]
+    who = f"id {uid}"
+    if full_name:
+        who += f" {full_name}"
+    if uname:
+        who += f" @{uname}"
     cap = (
-        f"🆕 Индивидуальная карточка IC-{oid}\n"
+        f"🆕 Индивидуальная карточка\n"
+        f"Номер заказа: IC-{oid}\n"
         f"📅 {order['created_at']}\n"
-        f"👤 id {uid}"
-        + (f" @{uname}" if uname else "")
-        + f"\n\nПерсонажи:\n{_fmt_people(order['people'])}\n"
+        f"👤 {who}\n\n"
+        f"Персонажи:\n{_fmt_people(order['people'])}\n"
         f"Количество: {order['qty']}\n"
         f"Доставка: {label}\n"
-        f"{str(order.get('address') or '')[:800]}"
+        f"Получатель:\n{str(order.get('address') or '')[:800]}"
     )
     await B._broadcast_admin_message(
         context,
@@ -644,9 +876,11 @@ async def _confirm_order(q, context, uid: int, d: dict) -> None:
         reply_markup=_kb_admin_order(oid),
         log_tag="custom_card_order",
     )
-    await q.edit_message_text(
-        f"✅ Заявка IC-{oid} отправлена.\n\n"
-        "Когда макет будет готов, мы пришлём его сюда на согласование."
+    await _present(
+        q,
+        f"✅ Заявка принята.\nНомер заказа: IC-{oid}\n\n"
+        "Когда изображение будет готово, пришлём его сюда. "
+        "Можно будет одобрить макет или написать администратору по этому номеру.",
     )
 
 
@@ -662,20 +896,35 @@ async def _admin_send_proof(
     client_id = int(order.get("user_id") or 0)
     if not client_id:
         return False
+    caption = (
+        f"Готовое изображение по заказу IC-{oid}.\n\n"
+        "Если всё верно — нажмите «Одобрить». "
+        "Если нужны правки — «Связаться с администратором»."
+    )
+    markup = _kb_client_proof(oid)
+    sent = False
     try:
         await context.bot.send_photo(
             client_id,
             file_id,
-            caption=(
-                f"Макет индивидуальной карточки IC-{oid}.\n\n"
-                "Если всё верно — нажмите «Одобрить». "
-                "Если нужны правки — «Связаться с администратором»."
-            ),
-            reply_markup=_kb_client_proof(oid),
+            caption=caption,
+            reply_markup=markup,
         )
+        sent = True
     except Exception:
-        log.exception("custom_card send proof oid=%s client=%s", oid, client_id)
-        return False
+        log.exception("custom_card send photo oid=%s client=%s", oid, client_id)
+    if not sent:
+        try:
+            await context.bot.send_document(
+                client_id,
+                file_id,
+                caption=caption,
+                reply_markup=markup,
+            )
+            sent = True
+        except Exception:
+            log.exception("custom_card send document oid=%s client=%s", oid, client_id)
+            return False
     bucket = B.user_states.get(int(admin_uid))
     if isinstance(bucket, dict):
         bucket.pop(SEND_KEY, None)
@@ -686,7 +935,7 @@ async def _admin_send_proof(
     try:
         await context.bot.send_message(
             admin_uid,
-            f"Макет IC-{oid} отправлен клиенту id {client_id}.",
+            f"Изображение заказа IC-{oid} отправлено клиенту id {client_id}.",
         )
     except Exception:
         log.exception("custom_card admin ack oid=%s", oid)
@@ -711,18 +960,18 @@ async def _client_approve(q, context, uid: int, oid: int) -> None:
     await B._broadcast_admin_message(
         context,
         text=(
-            f"✅ Клиент одобрил макет IC-{oid}\n"
+            f"✅ Клиент одобрил изображение заказа IC-{oid}\n"
             f"👤 id {uid}" + (f" @{uname}" if uname else "")
         ),
         log_tag="custom_card_approved",
     )
     try:
         await q.edit_message_caption(
-            caption=f"Макет IC-{oid} одобрен. Спасибо!",
+            caption=f"Заказ IC-{oid} одобрен. Спасибо!",
             reply_markup=None,
         )
     except Exception:
-        await q.message.reply_text(f"Макет IC-{oid} одобрен. Спасибо!")
+        await q.message.reply_text(f"Заказ IC-{oid} одобрен. Спасибо!")
 
 
 async def _client_support(q, context, uid: int, oid: int) -> None:
@@ -740,7 +989,61 @@ async def _client_support(q, context, uid: int, oid: int) -> None:
     msg = q.message
     await B._activate_user_support_chat(msg, context, uid, reply_markup=B.REPLY_KB)
     await msg.reply_text(
-        f"Напишите сообщение по заявке IC-{oid}. Оно уйдёт администратору с номером заказа."
+        f"Напишите сообщение по заказу IC-{oid}. "
+        "Администратор получит его вместе с этим номером."
+    )
+
+
+_TEXT_STEPS = frozenset(
+    {
+        "photo",
+        "universe",
+        "universe_text",
+        "character",
+        "character_text",
+        "people_more",
+        "qty",
+        "qty_text",
+        "delivery",
+        "address",
+        "confirm",
+    }
+)
+
+
+def _is_exact_menu_text(text: str) -> bool:
+    B = _b()
+    return str(text or "").strip() in B.REPLY_MENU_TEXTS
+
+
+async def _save_person_and_ask_more(
+    msg: Message, uid: int, d: dict, characters: List[str]
+) -> None:
+    people = list(d.get("people") or [])
+    universe = str(d.get("universe") or "")
+    for character in characters:
+        name = str(character or "").strip()[:80]
+        if not name:
+            continue
+        people.append({"universe": universe, "character": name})
+    d["people"] = people
+    d["step"] = "people_more"
+    _set_draft(uid, d)
+    await msg.reply_text(
+        f"Добавлено:\n{_fmt_people(people)}\n\n"
+        "Если есть люди из другой вселенной — добавьте их. "
+        "Иначе переходите к количеству карточек.",
+        reply_markup=_kb_after_person(),
+    )
+
+
+async def _save_qty_and_ask_delivery(msg: Message, uid: int, d: dict, qty: int) -> None:
+    d["qty"] = qty
+    d["step"] = "delivery"
+    _set_draft(uid, d)
+    await msg.reply_text(
+        "Шаг 4. Выберите способ доставки.",
+        reply_markup=_kb_delivery(),
     )
 
 
@@ -759,24 +1062,31 @@ async def try_handle_custom_card_text(
         return False
     step = str(d.get("step") or "")
     text = msg.text.strip()
-    if step == "qty_text":
+    if not text or step not in _TEXT_STEPS:
+        return False
+    if _is_exact_menu_text(text):
+        return False
+    if step in ("qty", "qty_text"):
         try:
             n = int(text.replace(" ", ""))
         except ValueError:
-            await msg.reply_text("Нужно целое число, например 2.")
+            await msg.reply_text(
+                "Нужно целое число, например 2. Или выберите количество кнопкой."
+                if step == "qty"
+                else "Нужно целое число, например 2."
+            )
             return True
         if n < 1 or n > 99:
             await msg.reply_text("Укажите количество от 1 до 99.")
             return True
-        d["qty"] = n
-        d["step"] = "delivery"
-        _set_draft(uid, d)
-        await msg.reply_text(
-            "Шаг 4. Выберите способ доставки.",
-            reply_markup=_kb_delivery(),
-        )
+        await _save_qty_and_ask_delivery(msg, uid, d, n)
         return True
     if step == "address":
+        if len(text) < 5:
+            await msg.reply_text(
+                "Напишите адрес, ФИО и телефон одним сообщением."
+            )
+            return True
         d["address"] = text[:1500]
         d["step"] = "confirm"
         _set_draft(uid, d)
@@ -789,31 +1099,33 @@ async def try_handle_custom_card_text(
         else:
             await msg.reply_text(cap, reply_markup=_kb_confirm())
         return True
-    if step == "universe" and text and not (d.get("universes") or []):
+    if step in ("universe", "universe_text"):
         d["universe"] = text[:80]
-        d["step"] = "character"
         _set_draft(uid, d)
-        await msg.reply_text("Напишите персонажа для этой вселенной.")
+        await _ask_characters_text(msg, uid, d)
         return True
-    if step == "character" and text and not (d.get("characters") or []):
-        people = list(d.get("people") or [])
-        people.append(
-            {"universe": str(d.get("universe") or ""), "character": text[:80]}
-        )
-        d["people"] = people
-        d["step"] = "people_more"
-        _set_draft(uid, d)
+    if step in ("character", "character_text"):
+        names = _split_character_names(text)
+        if not names:
+            await msg.reply_text("Напишите имя персонажа текстом.")
+            return True
+        await _save_person_and_ask_more(msg, uid, d, names)
+        return True
+    if step == "photo":
         await msg.reply_text(
-            f"Добавлено:\n{_fmt_people(people)}\n\nЕщё человек на фото?",
-            reply_markup=_kb_after_person(),
+            "Пришлите фотографию как обычное фото, не текстом.",
+            reply_markup=B.REPLY_KB,
         )
         return True
-    return False
+    await msg.reply_text("Используйте кнопки под предыдущим сообщением.")
+    return True
 
 
 class _CustomCardTextFilter(filters.MessageFilter):
     def filter(self, message) -> bool:
         if not message or not getattr(message, "text", None) or not message.from_user:
+            return False
+        if _is_exact_menu_text(message.text):
             return False
         uid = int(message.from_user.id)
         B = _b()
@@ -822,12 +1134,7 @@ class _CustomCardTextFilter(filters.MessageFilter):
         d = (B.user_states.get(uid) or {}).get(DRAFT_KEY)
         if not isinstance(d, dict):
             return False
-        return str(d.get("step") or "") in (
-            "qty_text",
-            "address",
-            "universe",
-            "character",
-        )
+        return str(d.get("step") or "") in _TEXT_STEPS
 
 
 CUSTOM_CARD_TEXT_FILTER = _CustomCardTextFilter()
@@ -838,7 +1145,7 @@ def support_order_suffix(uid: int) -> str:
     oid = (B.user_states.get(int(uid)) or {}).get(SUPPORT_KEY)
     if oid is None:
         return ""
-    return f"\n📦 Индивидуальная карточка IC-{int(oid)}"
+    return f"\n📦 Номер заказа: IC-{int(oid)}"
 
 
 def register_custom_card_handlers(app) -> None:
