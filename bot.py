@@ -7371,8 +7371,6 @@ async def _finalize_order_submission_to_admin(
         o["admin_chat_id"] = int(proof_cid)
         o["admin_message_id"] = int(proof_mid)
     o["checkout_submitted_to_admin"] = True
-    if o.get("clear_cart_on_paid"):
-        _clear_user_cart_after_payment_proof(int(uid), int(oid), o)
     _clear_postpaid_thread_if_matches(int(uid), int(oid))
     save_state()
     return True, "ok"
@@ -7734,17 +7732,7 @@ def _format_login_site_cart_pending_text(
     use_site = fin["from_site"]
     meta = _merge_site_bonus_into_meta(uid, _get_site_pending_meta(uid))
     grand_show, pay_cur, _ = _resolve_site_confirm_pricing(uid, {}, lines, meta)
-    out: List[str] = []
-    for x in lines:
-        name_raw = str(x.get("name") or "—")
-        name = name_raw[:200]
-        if len(name_raw) > 200:
-            name = name.rstrip() + "…"
-        p = int(x.get("price") or 0)
-        q = int(x.get("qty") or 1)
-        lc = str(x.get("line_currency") or "").strip().upper()
-        xcur = lc if lc in ("BYN", "RUB") else g_cur
-        out.append(f"• {name} — {q} шт. × {p} {xcur} = {p * q} {xcur}")
+    out: List[str] = _format_customer_order_line_rows(lines, products, g_cur)
     out.append("")
     site_gt_raw = _cart_get_site_grand_total(uid, g_cur)
     if inc and not site_gt_raw:
@@ -8698,6 +8686,43 @@ def _order_line_display_name(
     if cat and no is not None:
         return f"{cat} №{no} — {name}"
     return name
+
+
+def _order_line_qty_price_tail(x: dict, g_cur: str) -> str:
+    p = int(x.get("price") or 0)
+    q = int(x.get("qty") or 1)
+    copies = _cart_line_copy_qty(x)
+    lc = str(x.get("line_currency") or "").strip().upper()
+    xcur = lc if lc in ("BYN", "RUB") else g_cur
+    if copies > 0 or _cart_line_is_custom_order(x):
+        cp = _cart_line_copy_unit_price(p)
+        total = p * q + cp * copies
+        return (
+            f"{q} полноценн. × {p} {xcur}"
+            + (f" + {copies} копий × {cp} {xcur}" if copies else "")
+            + f" = {total} {xcur}"
+        )
+    return f"{q} шт. × {p} {xcur} = {p * q} {xcur}"
+
+
+def _format_customer_order_line_rows(
+    lines: List[dict], products: Optional[List[dict]], g_cur: str
+) -> List[str]:
+    """Позиции заказа с сквозной нумерацией 1, 2, 3; карточки на заказ — Карточка 1, 2, 3."""
+    out: List[str] = []
+    custom_i = 0
+    n = 0
+    for x in lines:
+        if not isinstance(x, dict):
+            continue
+        n += 1
+        if _cart_line_copy_qty(x) > 0 or _cart_line_is_custom_order(x):
+            custom_i += 1
+            name = f"Карточка {custom_i}"
+        else:
+            name = _order_line_display_name(x, products)
+        out.append(f"{n}. {name} — {_order_line_qty_price_tail(x, g_cur)}")
+    return out
 
 
 def _product_category_label(products: List[dict], target: dict) -> str:
@@ -10286,25 +10311,7 @@ def _format_site_checkout_order_body(
     inc = fin["inc"]
     out: List[str] = ["📦 Ваш заказ", ""]
     g_cur = fin["g_cur"]
-    for x in lines:
-        if not isinstance(x, dict):
-            continue
-        name = _order_line_display_name(x, products)
-        p = int(x.get("price") or 0)
-        q = int(x.get("qty") or 1)
-        copies = _cart_line_copy_qty(x)
-        lc = str(x.get("line_currency") or "").strip().upper()
-        xcur = lc if lc in ("BYN", "RUB") else g_cur
-        if copies > 0 or _cart_line_is_custom_order(x):
-            cp = _cart_line_copy_unit_price(p)
-            total = p * q + cp * copies
-            out.append(
-                f"• {name} — {q} полноценн. × {p} {xcur}"
-                + (f" + {copies} копий × {cp} {xcur}" if copies else "")
-                + f" = {total} {xcur}"
-            )
-        else:
-            out.append(f"• {name} — {q} шт. × {p} {xcur} = {p * q} {xcur}")
+    out.extend(_format_customer_order_line_rows(lines, products, g_cur))
     out.append("")
     if inc:
         out.append(f"🚚 Доставка: {d_label} (уже в сумме на сайте)")
@@ -10437,7 +10444,7 @@ async def _begin_site_checkout_order(
         return None
     if ext_id:
         ORDERS[int(oid)]["external_id"] = ext_id
-    ORDERS[int(oid)]["clear_cart_on_paid"] = True
+    ORDERS[int(oid)]["clear_cart_on_paid"] = False
     ORDERS[int(oid)]["total_goods"] = int(goods_total)
     ORDERS[int(oid)]["payment_currency"] = str(pay_cur)
     ORDERS[int(oid)]["checkout_grand_total"] = int(total)
@@ -15577,6 +15584,7 @@ async def on_admin_confirm_payment(
         raise ApplicationHandlerStop
     o["paid"] = True
     o["paid_at"] = time.time()
+    o["clear_cart_on_paid"] = True
     cust = int(o.get("user_id") or 0)
     await _ensure_site_order_for_bot_order(oid, o)
     _user_state_clear_payment_states(cust)
@@ -15592,13 +15600,14 @@ async def on_admin_confirm_payment(
         )
     if cust:
         await _send_payment_receipt(context.bot, cust, oid, o)
+        _clear_user_cart_after_payment_proof(cust, oid, o)
     try:
         await _sync_site_order_status(o, site_status="paid")
     except Exception:
         logging.getLogger(__name__).exception(
             "confirm_payment site paid sync order_id=%s", oid
         )
-    if cust and o.get("clear_cart_on_paid"):
+    if cust:
         try:
             await _notify_site_cart_cleared_after_proof(cust, oid, o)
         except Exception:
