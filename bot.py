@@ -7262,7 +7262,7 @@ async def _collect_postpaid_client_message(
 
 
 async def _sync_site_order_checkout_complete(order_id: int, order: dict) -> None:
-    """После адреса: paid + delivery_details + file_id на сайте (ЛК и корзина)."""
+    """После адреса и скрина: confirmed + delivery_details. Корзина чистится только после paid."""
     ext = str(order.get("external_id") or "").strip()
     if not ext:
         try:
@@ -7284,7 +7284,7 @@ async def _sync_site_order_checkout_complete(order_id: int, order: dict) -> None
         headers["Authorization"] = f"Bearer {ORDER_STATUS_UPDATE_SECRET}"
     payload: Dict[str, object] = {
         "order_id": ext,
-        "status": "paid",
+        "status": "confirmed",
         "delivery_details": details,
     }
     fid = str(order.get("proof_file_id") or "").strip()
@@ -7373,10 +7373,6 @@ async def _finalize_order_submission_to_admin(
     o["checkout_submitted_to_admin"] = True
     if o.get("clear_cart_on_paid"):
         _clear_user_cart_after_payment_proof(int(uid), int(oid), o)
-        try:
-            await _notify_site_cart_cleared_after_proof(int(uid), int(oid), o)
-        except Exception:
-            log.exception("finalize site cart clear uid=%s oid=%s", uid, oid)
     _clear_postpaid_thread_if_matches(int(uid), int(oid))
     save_state()
     return True, "ok"
@@ -10331,6 +10327,27 @@ def _site_checkout_payment_message(uid: int, username: Optional[str] = None) -> 
     )
 
 
+async def offer_site_checkout_payment(
+    bot, uid: int, oid: int, username: Optional[str] = None
+) -> None:
+    """Оплата всего заказа с сайта — после данных по карточкам на заказ, если они были."""
+    try:
+        oid_i = int(oid)
+        uid_i = int(uid)
+    except (TypeError, ValueError):
+        return
+    o = ORDERS.get(oid_i)
+    if not isinstance(o, dict) or o.get("paid"):
+        return
+    _set_awaiting_payment_order_id(uid_i, {}, oid_i)
+    await bot.send_message(
+        chat_id=uid_i,
+        text=_site_checkout_payment_message(uid_i, username),
+        reply_markup=_kb_payment_methods(oid_i),
+        disable_web_page_preview=True,
+    )
+
+
 async def _begin_site_checkout_order(
     context,
     uid: int,
@@ -10521,14 +10538,13 @@ async def _present_site_order_checkout_flow(
             )
         await _send(START_SITE_TRANSITION_TEXT, reply_markup=REPLY_KB)
         await _send(body, disable_web_page_preview=True)
-        await _send(
-            _site_checkout_payment_message(int(uid), username),
-            reply_markup=_kb_payment_methods(bot_oid),
-            disable_web_page_preview=True,
-        )
+        queued = False
         try:
             queued = await custom_card_flow.begin_site_custom_cards_queue(
-                bot, int(uid), list(norm.get("items") or [])
+                bot,
+                int(uid),
+                list(norm.get("items") or []),
+                pay_oid=int(bot_oid),
             )
             if queued:
                 log.info(
@@ -10539,6 +10555,12 @@ async def _present_site_order_checkout_flow(
         except Exception:
             log.exception(
                 "site custom-card queue failed uid=%s order=%s", uid, ext_id
+            )
+        if not queued:
+            await _send(
+                _site_checkout_payment_message(int(uid), username),
+                reply_markup=_kb_payment_methods(bot_oid),
+                disable_web_page_preview=True,
             )
         if ext_id:
             _mark_site_checkout_pushed(int(uid), ext_id, fingerprint=checkout_fp)
@@ -10672,9 +10694,11 @@ async def _notify_site_cart_cleared_after_proof(uid: int, oid: int, o: dict) -> 
         log.exception("cart clear webhook failed uid=%s oid=%s", uid, oid)
 
 
-async def _sync_site_order_status(order: dict) -> None:
+async def _sync_site_order_status(
+    order: dict, *, site_status: Optional[str] = None
+) -> None:
     external_id = str(order.get("external_id") or "").strip()
-    status = _site_status_from_bot_status(str(order.get("status") or ""))
+    status = site_status or _site_status_from_bot_status(str(order.get("status") or ""))
     url = ORDER_STATUS_UPDATE_API_URL
     if not external_id or not status or not url:
         return
@@ -15568,6 +15592,19 @@ async def on_admin_confirm_payment(
         )
     if cust:
         await _send_payment_receipt(context.bot, cust, oid, o)
+    try:
+        await _sync_site_order_status(o, site_status="paid")
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "confirm_payment site paid sync order_id=%s", oid
+        )
+    if cust and o.get("clear_cart_on_paid"):
+        try:
+            await _notify_site_cart_cleared_after_proof(cust, oid, o)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "confirm_payment site cart clear order_id=%s", oid
+            )
     save_state()
     raise ApplicationHandlerStop
 

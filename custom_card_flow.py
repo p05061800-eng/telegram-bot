@@ -569,11 +569,21 @@ async def begin_custom_card_flow(
     )
 
 
-async def begin_site_custom_cards_queue(bot, uid: int, items: list) -> bool:
-    """После заказа с сайта: опрос по каждой карточке на заказ отдельно."""
+async def begin_site_custom_cards_queue(
+    bot, uid: int, items: list, *, pay_oid: Optional[int] = None
+) -> bool:
+    """После заказа с сайта: опрос по каждой карточке на заказ отдельно.
+
+    Обычные карточки в том же заказе не спрашиваем. Оплату всего заказа
+    открываем после последней карточки на заказ.
+    """
     queue = []
+    regular_n = 0
     for it in items or []:
-        if not isinstance(it, dict) or not _item_is_custom_order(it):
+        if not isinstance(it, dict):
+            continue
+        if not _item_is_custom_order(it):
+            regular_n += 1
             continue
         try:
             qty = int(it.get("qty") if it.get("qty") is not None else it.get("quantity") or 1)
@@ -624,18 +634,40 @@ async def begin_site_custom_cards_queue(bot, uid: int, items: list) -> bool:
         "universe": "",
         "char_page": 0,
         "uni_page": 0,
+        "has_regular": regular_n > 0,
     }
+    if pay_oid is not None:
+        try:
+            draft["pay_oid"] = int(pay_oid)
+        except (TypeError, ValueError):
+            pass
     _set_draft(uid, draft)
-    if len(queue) > 1:
+    mixed = regular_n > 0
+    if mixed:
+        intro = (
+            "В заказе обычные карточки и карточки на заказ.\n"
+            "Обычные уже в заказе — про них не спрашиваем.\n"
+            "Сначала уточним каждую карточку на заказ (фото и персонажи).\n"
+            "Потом оплатите весь заказ одним платежом.\n"
+            "Доставку повторно не спрашиваем — она уже в заказе с сайта.\n\n"
+        )
+        if len(queue) > 1:
+            intro += (
+                "Карточек на заказ несколько — спросим про каждую отдельно. "
+                "Копия относится к своей карточке.\n\n"
+            )
+    elif len(queue) > 1:
         intro = (
             "В заказе несколько карточек на заказ. Спросим про каждую отдельно.\n"
             "Копия относится к своей карточке.\n"
-            "Доставку и оплату повторно не спрашиваем — они уже в заказе с сайта.\n\n"
+            "Доставку повторно не спрашиваем — она уже в заказе с сайта.\n"
+            "Оплату откроем после данных по всем карточкам.\n\n"
         )
     else:
         intro = (
             "Нужно уточнить данные по карточке на заказ.\n"
-            "Доставку и оплату повторно не спрашиваем — они уже в заказе с сайта.\n\n"
+            "Доставку повторно не спрашиваем — она уже в заказе с сайта.\n"
+            "Оплату откроем после фото и персонажей.\n\n"
         )
     await bot.send_message(
         chat_id=int(uid),
@@ -1183,13 +1215,40 @@ async def _commit_site_card_and_next(q, context, uid: int, d: dict) -> None:
             await q.reply_text(text)
 
     if i >= len(queue):
+        pay_oid = d.get("pay_oid")
+        mixed = bool(d.get("has_regular"))
         _clear_draft(uid)
-        await _out(
-            f"{saved}\n\n"
-            "Данные по всем карточкам на заказ собраны.\n"
-            "Можно оплачивать заказ с сайта.\n"
-            "Когда макеты будут готовы — пришлём сюда на согласование.",
-        )
+        if mixed:
+            done = (
+                f"{saved}\n\n"
+                "Данные по карточкам на заказ собраны.\n"
+                "Обычные карточки уже в этом же заказе.\n"
+                "Дальше оплата всего заказа одним платежом.\n"
+                "Когда макеты будут готовы — пришлём сюда на согласование."
+            )
+        else:
+            done = (
+                f"{saved}\n\n"
+                "Данные по всем карточкам на заказ собраны.\n"
+                "Дальше оплата заказа.\n"
+                "Когда макеты будут готовы — пришлём сюда на согласование."
+            )
+        await _out(done)
+        try:
+            oid = int(pay_oid) if pay_oid is not None else 0
+        except (TypeError, ValueError):
+            oid = 0
+        if oid > 0:
+            bot = getattr(context, "bot", None)
+            if bot is not None:
+                try:
+                    await B.offer_site_checkout_payment(bot, int(uid), oid)
+                except Exception:
+                    log.exception(
+                        "site checkout payment after custom cards uid=%s oid=%s",
+                        uid,
+                        oid,
+                    )
         return
     nxt = queue[i] if isinstance(queue[i], dict) else {}
     d["queue_i"] = i
