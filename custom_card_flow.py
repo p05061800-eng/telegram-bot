@@ -114,6 +114,61 @@ def _order(oid: int) -> Optional[dict]:
     return raw if isinstance(raw, dict) else None
 
 
+PRICE_FULL_RUB = 2000
+PRICE_FULL_BYN = 70
+PRICE_COPY_RUB = 1000
+PRICE_COPY_BYN = 35
+
+
+def _price_blurb() -> str:
+    return (
+        f"Полноценная: {PRICE_FULL_RUB} ₽ / {PRICE_FULL_BYN} BYN\n"
+        f"Копия этого макета: −50% ({PRICE_COPY_RUB} ₽ / {PRICE_COPY_BYN} BYN)"
+    )
+
+
+def _queue_len(d: dict) -> int:
+    queue = d.get("queue") if isinstance(d.get("queue"), list) else []
+    return max(1, len(queue)) if queue else 1
+
+
+def _queue_index(d: dict) -> int:
+    try:
+        return max(0, int(d.get("queue_i") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _card_title(d: dict) -> str:
+    it = _current_queue_item(d) if _is_site_attach(d) else None
+    if it:
+        name = str(it.get("name") or "").strip()
+        if name:
+            return name[:200]
+    return "Карточка на заказ"
+
+
+def _copies_from_draft(d: dict) -> int:
+    it = _current_queue_item(d) if _is_site_attach(d) else None
+    raw = d.get("copies")
+    if raw is None and it:
+        raw = it.get("copies")
+    try:
+        n = int(raw or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return max(0, min(n, 99))
+
+
+def _card_header(d: dict) -> str:
+    if not _is_site_attach(d):
+        return "Карточка на заказ"
+    n = _queue_len(d)
+    i = _queue_index(d) + 1
+    name = _card_title(d)
+    return f"Карточка на заказ {i} из {n}\nМакет: «{name}»"
+
+
 def _fmt_people(people: list) -> str:
     if not people:
         return "—"
@@ -214,20 +269,12 @@ def _kb_cancel() -> InlineKeyboardMarkup:
 
 def _universe_prompt(person_no: int, *, saved_photo: bool = False) -> str:
     n = max(1, int(person_no))
-    if saved_photo and n == 1:
-        return (
-            "Фото сохранено.\n\n"
-            "Напишите вселенную.\n"
-            "Следующим сообщением напишите персонажей."
-        )
-    if n <= 1:
-        return (
-            "Напишите вселенную.\n"
-            "Следующим сообщением напишите персонажей."
-        )
+    head = "Фото сохранено.\n\n" if saved_photo and n == 1 else ""
+    who = "Напишите вселенную." if n <= 1 else f"Напишите вселенную для {n}-го человека на фото."
     return (
-        f"Напишите вселенную для {n}-го человека.\n"
-        "Следующим сообщением напишите персонажей."
+        f"{head}{who}\n"
+        "Marvel, DC, аниме и т.д. — кнопкой или текстом.\n"
+        "Следующим сообщением напишите персонажа."
     )
 
 
@@ -235,7 +282,7 @@ def _character_prompt(universe: str) -> str:
     uni = (universe or "").strip() or "—"
     return (
         f"Вселенная: {uni}\n\n"
-        "Напишите персонажей.\n"
+        "Напишите персонажа.\n"
         "Одного — одним сообщением. Нескольких — через запятую или с новой строки."
     )
 
@@ -255,7 +302,103 @@ def _split_character_names(text: str) -> List[str]:
     return names
 
 
-def _kb_after_person() -> InlineKeyboardMarkup:
+def _is_site_attach(d: Optional[dict]) -> bool:
+    return bool(d) and str(d.get("mode") or "") == "site_order_attach"
+
+
+def _item_is_custom_order(it: dict) -> bool:
+    cat = str(it.get("category") or "").strip().lower()
+    if "на заказ" in cat:
+        return True
+    try:
+        copies = int(
+            it.get("copyQuantity")
+            if it.get("copyQuantity") is not None
+            else it.get("copy_quantity") or 0
+        )
+    except (TypeError, ValueError):
+        copies = 0
+    return copies > 0
+
+
+def _current_queue_item(d: dict) -> Optional[dict]:
+    queue = d.get("queue") if isinstance(d.get("queue"), list) else []
+    try:
+        i = int(d.get("queue_i") or 0)
+    except (TypeError, ValueError):
+        i = 0
+    if i < 0 or i >= len(queue):
+        return None
+    it = queue[i]
+    return it if isinstance(it, dict) else None
+
+
+def _photo_prompt(d: Optional[dict] = None) -> str:
+    d = d if isinstance(d, dict) else {}
+    copies = _copies_from_draft(d)
+    copies_line = (
+        f"Копии этого макета со скидкой 50%: {copies}."
+        if copies
+        else "Копии этого макета можно добавить со скидкой 50%."
+    )
+    if _is_site_attach(d):
+        return (
+            f"{_card_header(d)}\n\n"
+            f"{_price_blurb()}\n\n"
+            "Сейчас уточним только эту карточку.\n"
+            f"{copies_line}\n\n"
+            "Пришлите фото, по которому собрать эту карточку.\n"
+            "Обычным фото, не файлом-документом.\n"
+            "Если на фото несколько человек — напишем персонажа для каждого."
+        )
+    return (
+        "Карточка на заказ\n\n"
+        f"{_price_blurb()}\n\n"
+        "Пришлите фото, по которому собрать карточку.\n"
+        "Обычным фото, не файлом-документом.\n"
+        "Если на фото несколько человек — напишем персонажа для каждого."
+    )
+
+
+def _copies_prompt(d: dict) -> str:
+    n = _copies_from_draft(d)
+    extra = ""
+    if _is_site_attach(d):
+        extra = f"\nС сайта: копий — {n}." if n else "\nС сайта копий нет."
+    return (
+        f"{_card_header(d)}\n\n"
+        "Эта карточка идёт как полноценная.\n\n"
+        "Сколько копий этого же макета добавить со скидкой 50%?\n"
+        "0 — без копий."
+        f"{extra}"
+    )
+
+
+def _people_more_text(d: dict) -> str:
+    people = d.get("people") if isinstance(d.get("people"), list) else []
+    if _is_site_attach(d):
+        return (
+            f"{_card_header(d)}\n\n"
+            f"Люди на фото:\n{_fmt_people(people)}\n\n"
+            "Если есть ещё человек на фото — добавьте.\n"
+            "Иначе переходите к копиям этой карточки."
+        )
+    return (
+        f"Люди на фото:\n{_fmt_people(people)}\n\n"
+        "Если есть ещё человек на фото — добавьте.\n"
+        "Иначе переходите к количеству карточек."
+    )
+
+
+def _kb_after_person(d: Optional[dict] = None) -> InlineKeyboardMarkup:
+    if _is_site_attach(d):
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("➕ Ещё человек на фото", callback_data="cc:NP")],
+                [InlineKeyboardButton("➡️ К копиям этой карточки", callback_data="cc:QT")],
+                [InlineKeyboardButton("↩️ Исправить выбор", callback_data="cc:UB")],
+            ]
+        )
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("➕ Ещё человек на фото", callback_data="cc:NP")],
@@ -263,6 +406,24 @@ def _kb_after_person() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("↩️ Исправить выбор", callback_data="cc:UB")],
         ]
     )
+
+
+def _kb_copies(d: Optional[dict] = None) -> InlineKeyboardMarkup:
+    n = _copies_from_draft(d or {})
+    row1 = [
+        InlineKeyboardButton(str(i), callback_data=f"cc:Y:{i}") for i in (0, 1, 2, 3)
+    ]
+    rows: List[List[InlineKeyboardButton]] = [row1]
+    extra: List[InlineKeyboardButton] = [
+        InlineKeyboardButton("Другое число", callback_data="cc:YO"),
+    ]
+    if n > 3:
+        extra.insert(
+            0, InlineKeyboardButton(f"Оставить {n}", callback_data=f"cc:Y:{n}")
+        )
+    rows.append(extra)
+    rows.append([InlineKeyboardButton("↩️ Назад", callback_data="cc:UB")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _kb_qty() -> InlineKeyboardMarkup:
@@ -337,10 +498,13 @@ def _summary_text(d: dict) -> str:
     code = str(d.get("delivery") or "")
     label = B.DELIVERY_OPTIONS.get(code, (code or "—", 0, ""))[0]
     addr = str(d.get("address") or "—").strip() or "—"
+    copies = _copies_from_draft(d)
     return (
         "📋 Проверьте заявку и подтвердите её.\n\n"
-        f"Персонажи:\n{_fmt_people(people)}\n\n"
-        f"Количество карточек: {qty}\n"
+        f"{_price_blurb()}\n\n"
+        f"Люди на фото:\n{_fmt_people(people)}\n\n"
+        f"Полноценных карточек: {qty}\n"
+        f"Копий этого макета (−50%): {copies}\n"
         f"Доставка: {label}\n"
         f"Получатель:\n{addr[:700]}"
     )
@@ -400,11 +564,85 @@ async def begin_custom_card_flow(
         },
     )
     await msg.reply_text(
-        "✨ Оформление индивидуальной карточки\n\n"
-        "Шаг 1. Пришлите фотографию, по которой нужно создать карточку "
-        "(как обычное фото, не файл-документ).",
+        _photo_prompt({}),
         reply_markup=B.REPLY_KB,
     )
+
+
+async def begin_site_custom_cards_queue(bot, uid: int, items: list) -> bool:
+    """После заказа с сайта: опрос по каждой карточке на заказ отдельно."""
+    queue = []
+    for it in items or []:
+        if not isinstance(it, dict) or not _item_is_custom_order(it):
+            continue
+        try:
+            qty = int(it.get("qty") if it.get("qty") is not None else it.get("quantity") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        try:
+            copies = int(
+                it.get("copyQuantity")
+                if it.get("copyQuantity") is not None
+                else it.get("copy_quantity") or 0
+            )
+        except (TypeError, ValueError):
+            copies = 0
+        qty = max(1, qty)
+        copies = max(0, copies)
+        name = str(it.get("name") or it.get("title") or "Карточка на заказ")[:200]
+        ref = str(it.get("ref") or it.get("id") or "")[:120]
+        slots = [0] * qty
+        for i in range(copies):
+            slots[i % qty] += 1
+        for copies_on in slots:
+            queue.append(
+                {
+                    "ref": ref,
+                    "name": name,
+                    "qty": 1,
+                    "copies": copies_on,
+                }
+            )
+    if not queue:
+        return False
+    B = _b()
+    B.user_support_state.pop(int(uid), None)
+    bucket = B.user_states.get(int(uid))
+    if isinstance(bucket, dict):
+        bucket.pop(SUPPORT_KEY, None)
+    draft = {
+        "mode": "site_order_attach",
+        "queue": queue,
+        "queue_i": 0,
+        "step": "photo",
+        "people": [],
+        "photo_file_id": "",
+        "qty": queue[0].get("qty"),
+        "copies": queue[0].get("copies"),
+        "delivery": "",
+        "address": "",
+        "universe": "",
+        "char_page": 0,
+        "uni_page": 0,
+    }
+    _set_draft(uid, draft)
+    if len(queue) > 1:
+        intro = (
+            "В заказе несколько карточек на заказ. Спросим про каждую отдельно.\n"
+            "Копия относится к своей карточке.\n"
+            "Доставку и оплату повторно не спрашиваем — они уже в заказе с сайта.\n\n"
+        )
+    else:
+        intro = (
+            "Нужно уточнить данные по карточке на заказ.\n"
+            "Доставку и оплату повторно не спрашиваем — они уже в заказе с сайта.\n\n"
+        )
+    await bot.send_message(
+        chat_id=int(uid),
+        text=intro + _photo_prompt(draft),
+        reply_markup=B.REPLY_KB,
+    )
+    return True
 
 
 def is_custom_card_start(first: str, joined: str) -> bool:
@@ -517,7 +755,7 @@ async def try_handle_custom_card_photo(
         if msg:
             await msg.reply_text(
                 "Сейчас нужен ответ текстом или кнопками, а не новое фото. "
-                "Если хотите заменить фото — нажмите «Исправить данные» в сводке "
+                "Если хотите заменить фото — нажмите «Исправить данные» "
                 "или откройте ссылку с сайта заново."
             )
         return True
@@ -525,7 +763,7 @@ async def try_handle_custom_card_photo(
         return False
     if msg and not _still_image_message(msg):
         await msg.reply_text(
-            "Нужна фотография. Отправьте её как фото, не как видео или документ другого типа.",
+            "Нужна фотография. Пришлите её как обычное фото, не файлом-документом.",
             reply_markup=B.REPLY_KB,
         )
         return True
@@ -593,8 +831,25 @@ async def _ask_characters_text(target, uid: int, d: dict) -> None:
 async def _ask_qty(q_or_msg, uid: int, d: dict) -> None:
     d["step"] = "qty"
     _set_draft(uid, d)
-    text = "Шаг 3. Сколько карточек нужно?"
+    text = (
+        "Сколько полноценных карточек этого макета?\n"
+        "Каждая будет отдельной карточкой в заказе (Карточка 1, 2, 3…).\n\n"
+        f"{_price_blurb()}"
+    )
     markup = _kb_qty()
+    if hasattr(q_or_msg, "edit_message_text") and not _message_has_media(
+        getattr(q_or_msg, "message", None)
+    ):
+        await _present(q_or_msg, text, markup)
+    else:
+        await q_or_msg.reply_text(text, reply_markup=markup)
+
+
+async def _ask_copies(q_or_msg, uid: int, d: dict) -> None:
+    d["step"] = "copies"
+    _set_draft(uid, d)
+    text = _copies_prompt(d)
+    markup = _kb_copies(d)
     if hasattr(q_or_msg, "edit_message_text") and not _message_has_media(
         getattr(q_or_msg, "message", None)
     ):
@@ -693,7 +948,7 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
 
     if data == "X":
         _clear_draft(uid)
-        await _present(q, "Оформление индивидуальной карточки отменено.")
+        await _present(q, "Оформление карточки на заказ отменено.")
         return
     if data == "ED":
         d["step"] = "universe"
@@ -708,7 +963,10 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
     if data == "UT":
         d["step"] = "universe_text"
         _set_draft(uid, d)
-        await _present(q, "Напишите вселенную текстом.")
+        await _present(
+            q,
+            "Напишите вселенную текстом (Marvel, DC, аниме и т.д.).",
+        )
         return
     if data == "CT":
         d["step"] = "character_text"
@@ -735,14 +993,10 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
         if str(d.get("step") or "") == "people_more" and d.get("people"):
             d["people"] = list(d.get("people") or [])[:-1]
             _set_draft(uid, d)
-        if str(d.get("step") or "") == "qty" and d.get("people"):
+        if str(d.get("step") or "") in ("qty", "copies", "copies_text") and d.get("people"):
             d["step"] = "people_more"
             _set_draft(uid, d)
-            await _present(
-                q,
-                f"Добавлено:\n{_fmt_people(d.get('people') or [])}\n\nЕщё человек на фото?",
-                _kb_after_person(),
-            )
+            await _present(q, _people_more_text(d), _kb_after_person(d))
             return
         d["step"] = "universe"
         n = len(d.get("people") or []) + 1
@@ -770,11 +1024,7 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
         d["people"] = people
         d["step"] = "people_more"
         _set_draft(uid, d)
-        await _present(
-            q,
-            f"Добавлено:\n{_fmt_people(people)}\n\nЕщё человек на фото?",
-            _kb_after_person(),
-        )
+        await _present(q, _people_more_text(d), _kb_after_person(d))
         return
     if data == "NP":
         d["step"] = "universe"
@@ -786,25 +1036,53 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
         if not d.get("people"):
             await _present(q, "Сначала укажите хотя бы одного персонажа.")
             return
+        if _is_site_attach(d):
+            await _ask_copies(q, uid, d)
+            return
         await _ask_qty(q, uid, d)
         return
     if data == "QO":
         d["step"] = "qty_text"
         _set_draft(uid, d)
-        await _present(q, "Напишите нужное количество карточек числом.")
+        await _present(
+            q,
+            "Напишите числом, сколько полноценных карточек нужно (от 1 до 99).",
+        )
+        return
+    if data == "YO":
+        d["step"] = "copies_text"
+        _set_draft(uid, d)
+        await _present(
+            q,
+            "Напишите числом, сколько копий этого макета добавить (0–99).",
+        )
+        return
+    if data.startswith("Y:"):
+        copies = _cb_index(data)
+        if copies is None or copies < 0 or copies > 99:
+            return
+        d["copies"] = copies
+        it = _current_queue_item(d)
+        if isinstance(it, dict):
+            it["copies"] = copies
+        _set_draft(uid, d)
+        if _is_site_attach(d):
+            await _commit_site_card_and_next(q, context, uid, d)
+            return
+        d["step"] = "delivery"
+        _set_draft(uid, d)
+        await _present(
+            q,
+            "Выберите способ доставки.",
+            _kb_delivery(),
+        )
         return
     if data.startswith("Q:"):
         qty = _cb_index(data)
         if qty is None or qty < 1 or qty > 99:
             return
         d["qty"] = qty
-        d["step"] = "delivery"
-        _set_draft(uid, d)
-        await _present(
-            q,
-            "Шаг 4. Выберите способ доставки.",
-            _kb_delivery(),
-        )
+        await _ask_copies(q, uid, d)
         return
     if data.startswith("D:"):
         code = data.split(":", 1)[1]
@@ -815,6 +1093,119 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
         _set_draft(uid, d)
         await _present(q, _delivery_prompt(code))
         return
+
+
+async def _commit_site_card_and_next(q, context, uid: int, d: dict) -> None:
+    B = _b()
+    item = _current_queue_item(d) or {}
+    oid = _next_cc_id()
+    uname = ""
+    full_name = ""
+    from_user = getattr(q, "from_user", None)
+    if from_user:
+        if from_user.username:
+            uname = str(from_user.username)
+        full_name = " ".join(
+            part
+            for part in (
+                str(from_user.first_name or "").strip(),
+                str(from_user.last_name or "").strip(),
+            )
+            if part
+        )
+    try:
+        qty = int(item.get("qty") or d.get("qty") or 1)
+    except (TypeError, ValueError):
+        qty = 1
+    try:
+        copies = int(item.get("copies") or d.get("copies") or 0)
+    except (TypeError, ValueError):
+        copies = 0
+    catalog_name = str(item.get("name") or "")[:200]
+    order = {
+        "id": oid,
+        "kind": "custom_card",
+        "user_id": int(uid),
+        "username": uname,
+        "full_name": full_name,
+        "photo_file_id": d.get("photo_file_id"),
+        "people": list(d.get("people") or []),
+        "qty": qty,
+        "copies": copies,
+        "catalog_ref": str(item.get("ref") or "")[:120],
+        "catalog_name": catalog_name,
+        "attached_to_site": True,
+        "delivery": d.get("delivery") or "",
+        "address": d.get("address") or "",
+        "status": "new",
+        "created_at": _now_iso(),
+        "history": [{"at": _now_iso(), "event": "created_site_attach"}],
+        "approved_at": None,
+    }
+    B.CUSTOM_CARD_ORDERS[int(oid)] = order
+    B.save_state()
+    who = f"id {uid}"
+    if full_name:
+        who += f" {full_name}"
+    if uname:
+        who += f" @{uname}"
+    cap = (
+        f"🆕 Карточка на заказ (с сайта)\n"
+        f"Номер заявки: IC-{oid}\n"
+        f"Макет: {catalog_name or '—'}\n"
+        f"📅 {order['created_at']}\n"
+        f"👤 {who}\n\n"
+        f"Люди на фото:\n{_fmt_people(order['people'])}\n"
+        f"Полноценных: {qty}, копий (−50%): {copies}"
+    )
+    await B._broadcast_admin_message(
+        context,
+        photo_file_id=str(order.get("photo_file_id") or "") or None,
+        caption=cap,
+        reply_markup=_kb_admin_order(oid),
+        log_tag="custom_card_site_attach",
+    )
+    queue = d.get("queue") if isinstance(d.get("queue"), list) else []
+    try:
+        i = int(d.get("queue_i") or 0) + 1
+    except (TypeError, ValueError):
+        i = 1
+    saved = (
+        f"✅ Карточка {_queue_index(d) + 1} сохранена (IC-{oid}).\n"
+        f"Макет: {catalog_name or '—'}\n"
+        f"Люди на фото:\n{_fmt_people(order['people'])}\n"
+        f"Копии: {copies}"
+    )
+    async def _out(text: str) -> None:
+        if hasattr(q, "edit_message_text"):
+            await _present(q, text)
+        else:
+            await q.reply_text(text)
+
+    if i >= len(queue):
+        _clear_draft(uid)
+        await _out(
+            f"{saved}\n\n"
+            "Данные по всем карточкам на заказ собраны.\n"
+            "Можно оплачивать заказ с сайта.\n"
+            "Когда макеты будут готовы — пришлём сюда на согласование.",
+        )
+        return
+    nxt = queue[i] if isinstance(queue[i], dict) else {}
+    d["queue_i"] = i
+    d["step"] = "photo"
+    d["people"] = []
+    d["photo_file_id"] = ""
+    d["universe"] = ""
+    d["qty"] = nxt.get("qty")
+    d["copies"] = nxt.get("copies")
+    d["char_page"] = 0
+    d["uni_page"] = 0
+    _set_draft(uid, d)
+    await _out(
+        f"{saved}\n\nДальше карточка {i + 1} из {len(queue)}.\n\n"
+        + _photo_prompt(d),
+    )
 
 
 async def _confirm_order(q, context, uid: int, d: dict) -> None:
@@ -842,6 +1233,7 @@ async def _confirm_order(q, context, uid: int, d: dict) -> None:
         "photo_file_id": d.get("photo_file_id"),
         "people": list(d.get("people") or []),
         "qty": d.get("qty"),
+        "copies": _copies_from_draft(d),
         "delivery": d.get("delivery"),
         "address": d.get("address"),
         "status": "new",
@@ -864,8 +1256,8 @@ async def _confirm_order(q, context, uid: int, d: dict) -> None:
         f"Номер заказа: IC-{oid}\n"
         f"📅 {order['created_at']}\n"
         f"👤 {who}\n\n"
-        f"Персонажи:\n{_fmt_people(order['people'])}\n"
-        f"Количество: {order['qty']}\n"
+        f"Люди на фото:\n{_fmt_people(order['people'])}\n"
+        f"Полноценных: {order['qty']}, копий (−50%): {order.get('copies') or 0}\n"
         f"Доставка: {label}\n"
         f"Получатель:\n{str(order.get('address') or '')[:800]}"
     )
@@ -879,8 +1271,8 @@ async def _confirm_order(q, context, uid: int, d: dict) -> None:
     await _present(
         q,
         f"✅ Заявка принята.\nНомер заказа: IC-{oid}\n\n"
-        "Когда изображение будет готово, пришлём его сюда. "
-        "Можно будет одобрить макет или написать администратору по этому номеру.",
+        "Когда макеты будут готовы — пришлём сюда на согласование. "
+        "Можно будет одобрить или написать администратору по этому номеру.",
     )
 
 
@@ -897,7 +1289,7 @@ async def _admin_send_proof(
     if not client_id:
         return False
     caption = (
-        f"Готовое изображение по заказу IC-{oid}.\n\n"
+        f"Макет по заказу IC-{oid} готов.\n\n"
         "Если всё верно — нажмите «Одобрить». "
         "Если нужны правки — «Связаться с администратором»."
     )
@@ -1004,6 +1396,8 @@ _TEXT_STEPS = frozenset(
         "people_more",
         "qty",
         "qty_text",
+        "copies",
+        "copies_text",
         "delivery",
         "address",
         "confirm",
@@ -1030,10 +1424,8 @@ async def _save_person_and_ask_more(
     d["step"] = "people_more"
     _set_draft(uid, d)
     await msg.reply_text(
-        f"Добавлено:\n{_fmt_people(people)}\n\n"
-        "Если есть люди из другой вселенной — добавьте их. "
-        "Иначе переходите к количеству карточек.",
-        reply_markup=_kb_after_person(),
+        _people_more_text(d),
+        reply_markup=_kb_after_person(d),
     )
 
 
@@ -1042,7 +1434,7 @@ async def _save_qty_and_ask_delivery(msg: Message, uid: int, d: dict, qty: int) 
     d["step"] = "delivery"
     _set_draft(uid, d)
     await msg.reply_text(
-        "Шаг 4. Выберите способ доставки.",
+        "Выберите способ доставки.",
         reply_markup=_kb_delivery(),
     )
 
@@ -1077,9 +1469,29 @@ async def try_handle_custom_card_text(
             )
             return True
         if n < 1 or n > 99:
-            await msg.reply_text("Укажите количество от 1 до 99.")
+            await msg.reply_text("Укажите количество полноценных карточек от 1 до 99.")
             return True
-        await _save_qty_and_ask_delivery(msg, uid, d, n)
+        d["qty"] = n
+        await _ask_copies(msg, uid, d)
+        return True
+    if step in ("copies", "copies_text"):
+        try:
+            n = int(text.replace(" ", ""))
+        except ValueError:
+            await msg.reply_text("Нужно целое число, например 0 или 1.")
+            return True
+        if n < 0 or n > 99:
+            await msg.reply_text("Укажите число копий от 0 до 99.")
+            return True
+        d["copies"] = n
+        it = _current_queue_item(d)
+        if isinstance(it, dict):
+            it["copies"] = n
+        _set_draft(uid, d)
+        if _is_site_attach(d):
+            await _commit_site_card_and_next(msg, context, uid, d)
+            return True
+        await _save_qty_and_ask_delivery(msg, uid, d, int(d.get("qty") or 1))
         return True
     if step == "address":
         if len(text) < 5:
@@ -1113,7 +1525,7 @@ async def try_handle_custom_card_text(
         return True
     if step == "photo":
         await msg.reply_text(
-            "Пришлите фотографию как обычное фото, не текстом.",
+            "Пришлите фото как обычное фото, не текстом.",
             reply_markup=B.REPLY_KB,
         )
         return True

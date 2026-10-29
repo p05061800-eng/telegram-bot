@@ -2225,6 +2225,9 @@ def _normalize_sync_cart_items(
             line_entry["category"] = cat
         if category_order is not None:
             line_entry["category_order"] = category_order
+        copies = _cart_line_copy_qty(x)
+        if copies > 0:
+            line_entry["copyQuantity"] = copies
         out.append(line_entry)
     return out
 
@@ -5265,7 +5268,7 @@ def _payment_intro_text(
     *,
     loyalty_earn_estimate: Optional[int] = None,
 ) -> str:
-    """Сумма и подпись к кнопкам способа оплаты. Само предупреждение — выше."""
+    """После оформления: сумма и выбор способа оплаты."""
     cur = str(currency or "BYN").strip().upper() or "BYN"
     payment_requisites.ensure_loaded()
     methods = "📱 Перевод по номеру телефона\n💳 Оплата картой"
@@ -5281,81 +5284,16 @@ def _payment_intro_text(
     return body
 
 
-def _with_payment_warning(body: str) -> str:
-    """Текст предупреждения всегда выше выбора способа оплаты."""
-    payment_requisites.ensure_loaded()
-    warning = payment_requisites.render_warning(
-        crypto_on=payment_requisites.crypto_enabled()
-    )
-    rest = str(body or "").strip()
-    if rest:
-        return f"{warning}\n\n{rest}"
-    return warning
-
-
-def _payment_choice_text(
-    total: int,
-    currency: str = "BYN",
-    *,
-    loyalty_earn_estimate: Optional[int] = None,
-    prefix: str = "",
-) -> str:
-    """Предупреждение о переводе стоит до кнопок выбора способа."""
-    intro = _payment_intro_text(
-        int(total), currency, loyalty_earn_estimate=loyalty_earn_estimate
-    )
-    head = str(prefix or "").strip()
-    if head:
-        intro = f"{head}\n\n{intro}"
-    return _with_payment_warning(intro)
-
-
 def _payment_step_message_text(
     total: int,
     currency: str = "BYN",
     *,
     loyalty_earn_estimate: Optional[int] = None,
 ) -> str:
-    return _payment_choice_text(
-        int(total),
-        currency,
-        loyalty_earn_estimate=loyalty_earn_estimate,
-        prefix=ORDER_AUTO_ACK,
+    return (
+        f"{ORDER_AUTO_ACK}\n\n"
+        f"{_payment_intro_text(int(total), currency, loyalty_earn_estimate=loyalty_earn_estimate)}"
     )
-
-
-def _mark_payment_warning_shown(order_id: Optional[int]) -> None:
-    """Предупреждение уже в сообщении с кнопками — не показывать его повторно."""
-    if order_id is None:
-        return
-    try:
-        oid = int(order_id)
-    except (TypeError, ValueError):
-        return
-    o = ORDERS.get(oid)
-    if not isinstance(o, dict) or o.get("payment_warning_shown"):
-        return
-    o["payment_warning_shown"] = True
-    try:
-        save_state()
-    except Exception:
-        logging.getLogger(__name__).exception(
-            "payment warning flag save oid=%s", oid
-        )
-
-
-async def _reply_payment_choice(
-    msg: Message,
-    text: str,
-    order_id: Optional[int] = None,
-) -> None:
-    _mark_payment_warning_shown(order_id)
-    markup = _kb_payment_methods(order_id)
-    try:
-        await msg.reply_text(text, reply_markup=markup, parse_mode="HTML")
-    except Exception:
-        plain = re.sub(r"<[^>]+>", "", text)
-        await msg.reply_text(plain, reply_markup=markup)
 
 
 async def _reply_payment_step(
@@ -5366,12 +5304,11 @@ async def _reply_payment_step(
     loyalty_earn_estimate: Optional[int] = None,
     order_id: Optional[int] = None,
 ) -> None:
-    await _reply_payment_choice(
-        msg,
+    await msg.reply_text(
         _payment_step_message_text(
             int(total), currency, loyalty_earn_estimate=loyalty_earn_estimate
         ),
-        order_id,
+        reply_markup=_kb_payment_methods(order_id),
     )
 
 
@@ -5771,13 +5708,11 @@ async def _resend_active_payment_step(
     )
     tot, pay_cur = _order_payment_display(o)
     lo_est = o.get("loyalty_earn_estimate")
-    body = _payment_choice_text(
-        int(tot),
-        pay_cur,
-        loyalty_earn_estimate=lo_est,
-        prefix=f"💳 Оплата по заказу #{int(oid)}",
+    body = (
+        f"💳 Оплата по заказу #{int(oid)}\n\n"
+        f"{_payment_intro_text(int(tot), pay_cur, loyalty_earn_estimate=lo_est)}"
     )
-    await _reply_payment_choice(q.message, body, int(oid))
+    await q.message.reply_text(body, reply_markup=_kb_payment_methods(int(oid)))
     _set_awaiting_payment_order_id(uid, ud, int(oid))
 
 
@@ -7646,16 +7581,52 @@ async def _admin_delete_order_chat_message(
         pass
 
 
+def _cart_line_copy_qty(x: Optional[dict]) -> int:
+    if not isinstance(x, dict):
+        return 0
+    raw = x.get("copyQuantity")
+    if raw is None:
+        raw = x.get("copy_quantity")
+    if raw is None:
+        raw = x.get("copies")
+    try:
+        n = int(raw or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return max(0, min(n, 999))
+
+
+def _cart_line_is_custom_order(x: Optional[dict]) -> bool:
+    if not isinstance(x, dict):
+        return False
+    cat = str(x.get("category") or "").strip().lower()
+    if "на заказ" in cat:
+        return True
+    return _cart_line_copy_qty(x) > 0
+
+
+def _cart_line_copy_unit_price(price: int) -> int:
+    return int(round(max(0, int(price)) * 0.5))
+
+
+def _cart_line_goods_amount(x: dict) -> Tuple[int, int]:
+    q = _cart_line_qty_coerce(x.get("qty"))
+    p = _coerce_card_price_int(x.get("price"))
+    copies = _cart_line_copy_qty(x)
+    total = p * q + _cart_line_copy_unit_price(p) * copies
+    pieces = q + copies
+    return int(total), int(pieces)
+
+
 def _cart_totals(lines: List[dict]) -> Tuple[int, int]:
     t = 0
     n = 0
     for x in lines:
         if not isinstance(x, dict):
             continue
-        q = _cart_line_qty_coerce(x.get("qty"))
-        p = _coerce_card_price_int(x.get("price"))
-        t += p * q
-        n += q
+        amt, pcs = _cart_line_goods_amount(x)
+        t += amt
+        n += pcs
     return t, n
 
 
@@ -9619,16 +9590,21 @@ def _normalize_deep_link_order(
             or name
         )[:120]
         lc = _goods_currency_for_delivery_country(region_bot)
-        items_out.append(
-            {
-                "name": name,
-                "price": price,
-                "qty": qty,
-                "ref": ref,
-                "from_site": True,
-                "line_currency": lc,
-            }
-        )
+        cat = str(it.get("category") or "").strip()
+        copies = _cart_line_copy_qty(it)
+        row = {
+            "name": name,
+            "price": price,
+            "qty": qty,
+            "ref": ref,
+            "from_site": True,
+            "line_currency": lc,
+        }
+        if cat:
+            row["category"] = cat
+        if copies > 0:
+            row["copyQuantity"] = copies
+        items_out.append(row)
     if not items_out:
         return None
     if products:
@@ -10320,9 +10296,19 @@ def _format_site_checkout_order_body(
         name = _order_line_display_name(x, products)
         p = int(x.get("price") or 0)
         q = int(x.get("qty") or 1)
+        copies = _cart_line_copy_qty(x)
         lc = str(x.get("line_currency") or "").strip().upper()
         xcur = lc if lc in ("BYN", "RUB") else g_cur
-        out.append(f"• {name} — {q} шт. × {p} {xcur} = {p * q} {xcur}")
+        if copies > 0 or _cart_line_is_custom_order(x):
+            cp = _cart_line_copy_unit_price(p)
+            total = p * q + cp * copies
+            out.append(
+                f"• {name} — {q} полноценн. × {p} {xcur}"
+                + (f" + {copies} копий × {cp} {xcur}" if copies else "")
+                + f" = {total} {xcur}"
+            )
+        else:
+            out.append(f"• {name} — {q} шт. × {p} {xcur} = {p * q} {xcur}")
     out.append("")
     if inc:
         out.append(f"🚚 Доставка: {d_label} (уже в сумме на сайте)")
@@ -10337,13 +10323,12 @@ def _format_site_checkout_order_body(
 
 def _site_checkout_payment_message(uid: int, username: Optional[str] = None) -> str:
     un = _site_checkout_username_label(int(uid), username)
-    choice = (
+    return (
         "Выберите способ оплаты:\n\n"
         "💳 Карта -> 💵 Перевод -> ₿ Крипта\n"
         "💳 Оплата -> 📸 Скрин -> 🔎 Проверка -> ✅ Готово\n\n"
         f"Заказ {un}"
     )
-    return _with_payment_warning(choice)
 
 
 async def _begin_site_checkout_order(
@@ -10536,20 +10521,24 @@ async def _present_site_order_checkout_flow(
             )
         await _send(START_SITE_TRANSITION_TEXT, reply_markup=REPLY_KB)
         await _send(body, disable_web_page_preview=True)
-        pay_text = _site_checkout_payment_message(int(uid), username)
-        _mark_payment_warning_shown(bot_oid)
+        await _send(
+            _site_checkout_payment_message(int(uid), username),
+            reply_markup=_kb_payment_methods(bot_oid),
+            disable_web_page_preview=True,
+        )
         try:
-            await _send(
-                pay_text,
-                reply_markup=_kb_payment_methods(bot_oid),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
+            queued = await custom_card_flow.begin_site_custom_cards_queue(
+                bot, int(uid), list(norm.get("items") or [])
             )
+            if queued:
+                log.info(
+                    "site custom-card queue started uid=%s order=%s",
+                    uid,
+                    ext_id,
+                )
         except Exception:
-            await _send(
-                re.sub(r"<[^>]+>", "", pay_text),
-                reply_markup=_kb_payment_methods(bot_oid),
-                disable_web_page_preview=True,
+            log.exception(
+                "site custom-card queue failed uid=%s order=%s", uid, ext_id
             )
         if ext_id:
             _mark_site_checkout_pushed(int(uid), ext_id, fingerprint=checkout_fp)
@@ -14116,12 +14105,9 @@ async def on_checkout_nav_back(
         except Exception:
             pass
         lo_est_pm = (ORDERS.get(int(oid)) or {}).get("loyalty_earn_estimate")
-        await _reply_payment_choice(
-            q.message,
-            _payment_choice_text(
-                tot, pay_cur, loyalty_earn_estimate=lo_est_pm
-            ),
-            int(oid),
+        await q.message.reply_text(
+            _payment_intro_text(tot, pay_cur, loyalty_earn_estimate=lo_est_pm),
+            reply_markup=_kb_payment_methods(int(oid)),
         )
         return
 
