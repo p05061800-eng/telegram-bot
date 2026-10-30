@@ -10502,15 +10502,9 @@ async def _present_site_order_checkout_flow(
     order_updated = bool(
         checkout_fp and old_fp and checkout_fp != old_fp
     )
-    if _site_checkout_recently_pushed(int(uid), ext_id or None, norm=norm):
+    # Автоповтор с сайта не дублируем. Если человек сам открыл заказ — присылаем его снова.
+    if msg is None and _site_checkout_recently_pushed(int(uid), ext_id or None, norm=norm):
         log.info("skip duplicate site checkout uid=%s order=%s", uid, ext_id)
-        if msg is not None:
-            try:
-                await msg.reply_text(
-                    MSG_SITE_CHECKOUT_ALREADY_SHOWN, reply_markup=REPLY_KB
-                )
-            except Exception:
-                pass
         return True
     products: List[dict] = []
     try:
@@ -11053,14 +11047,6 @@ async def _try_present_pending_site_order(
     order = await _fetch_order_for_deep_link(oid, int(uid))
     if not order:
         return False
-    if _site_checkout_recently_pushed(int(uid), oid, norm=order):
-        try:
-            await msg.reply_text(
-                MSG_SITE_CHECKOUT_ALREADY_SHOWN, reply_markup=REPLY_KB
-            )
-        except Exception:
-            pass
-        return True
     un = username or _site_checkout_username_label(int(uid), username)
     ok = await _present_site_order_checkout_flow(
         msg=msg,
@@ -11149,14 +11135,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 await _send_start_intro_with_site_button(msg, uid, context.user_data)
                 return
-            if _site_checkout_recently_pushed(
-                uid, resolved_oid or str(oid).strip(), norm=order
-            ):
-                await msg.reply_text(
-                    MSG_SITE_CHECKOUT_ALREADY_SHOWN, reply_markup=REPLY_KB
-                )
-                return
-
             await _maybe_thank_first_telegram_auth(msg, uid)
             un = (msg.from_user.username or "").strip().lstrip("@") or None
             ok = await _present_site_order_checkout_flow(
