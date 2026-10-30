@@ -10359,13 +10359,22 @@ def _format_site_checkout_order_body(
     return s
 
 
-def _site_checkout_payment_message(uid: int, username: Optional[str] = None) -> str:
+def _site_checkout_payment_message(
+    uid: int, username: Optional[str] = None, order: Optional[dict] = None
+) -> str:
     un = _site_checkout_username_label(int(uid), username)
+    total_line = ""
+    if isinstance(order, dict):
+        tot, cur = _order_payment_display(order)
+        if int(tot) > 0:
+            total_line = f"💰 Итого: {int(tot)} {cur}\n\n"
     return (
+        f"{total_line}"
         "Выберите способ оплаты:\n\n"
         "💳 Карта -> 💵 Перевод -> ₿ Крипта\n"
         "💳 Оплата -> 📸 Скрин -> 🔎 Проверка -> ✅ Готово\n\n"
-        f"Заказ {un}"
+        f"Заказ {un}\n\n"
+        "После выбора способа пришлю реквизиты: номер, банк и сумму."
     )
 
 
@@ -10384,7 +10393,7 @@ async def offer_site_checkout_payment(
     _set_awaiting_payment_order_id(uid_i, {}, oid_i)
     await bot.send_message(
         chat_id=uid_i,
-        text=_site_checkout_payment_message(uid_i, username),
+        text=_site_checkout_payment_message(uid_i, username, o),
         reply_markup=_kb_payment_methods(oid_i),
         disable_web_page_preview=True,
     )
@@ -10594,7 +10603,9 @@ async def _present_site_order_checkout_flow(
             )
         if not queued:
             await _send(
-                _site_checkout_payment_message(int(uid), username),
+                _site_checkout_payment_message(
+                    int(uid), username, ORDERS.get(int(bot_oid))
+                ),
                 reply_markup=_kb_payment_methods(bot_oid),
                 disable_web_page_preview=True,
             )
@@ -14715,9 +14726,6 @@ async def on_payment_method(
             )
         if o.get("paid"):
             await q.message.reply_text(MSG_ORDER_ALREADY_PAID_TOAST, reply_markup=REPLY_KB)
-            return
-        if o.get("payment_proof_submitted") and not o.get("paid"):
-            await q.message.reply_text(PAY_PROOF_WAIT, reply_markup=REPLY_KB)
             return
         pr_same = _user_state_get(uid, "awaiting_proof")
         if pr_same is not None and int(pr_same) == int(oid):

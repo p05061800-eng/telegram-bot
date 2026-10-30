@@ -362,7 +362,8 @@ def advance(
     act = str(action or "").strip()
     if prog.get("paid"):
         return prog, "already_paid"
-    if prog.get("proof") and act != "to_menu":
+    # Реквизиты можно открыть снова. «Проверяем оплату» — только повторное «Я оплатил».
+    if prog.get("proof") and act == "paid":
         return prog, "already_proof"
     if act in ("open_phone", "open_card", "open_crypto") and not prog.get("warning_shown"):
         prog["warning_shown"] = True
