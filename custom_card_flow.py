@@ -243,6 +243,23 @@ def _copies_from_draft(d: dict) -> int:
     return max(0, min(n, 99))
 
 
+def _client_card_label(order: dict) -> str:
+    """Как карточка называется для клиента, без внутреннего номера IC-."""
+    name = str(order.get("catalog_name") or "").strip()
+    generic = not name or name.casefold() in {"карточка на заказ", "—", "-"}
+    try:
+        n = int(order.get("card_no") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n > 0 and not generic:
+        return f"Карточка номер {n} — {name}"
+    if n > 0:
+        return f"Карточка номер {n}"
+    if not generic:
+        return name
+    return "Карточка на заказ"
+
+
 def _card_header(d: dict) -> str:
     if not _is_site_attach(d):
         return "Карточка на заказ"
@@ -1246,6 +1263,7 @@ async def _commit_site_card_and_next(q, context, uid: int, d: dict) -> None:
         "copies": copies,
         "catalog_ref": str(item.get("ref") or "")[:120],
         "catalog_name": catalog_name,
+        "card_no": _queue_index(d) + 1,
         "attached_to_site": True,
         "delivery": d.get("delivery") or "",
         "address": d.get("address") or "",
@@ -1403,8 +1421,9 @@ async def _admin_send_proof(
     client_id = int(order.get("user_id") or 0)
     if not client_id:
         return False
+    label = _client_card_label(order)
     caption = (
-        f"Макет по заказу IC-{oid} готов.\n\n"
+        f"Макет готов: {label}.\n\n"
         "Если всё верно — нажмите «Одобрить». "
         "Если нужны правки — «Связаться с администратором»."
     )
@@ -1474,11 +1493,13 @@ async def _client_approve(q, context, uid: int, oid: int) -> None:
     )
     try:
         await q.edit_message_caption(
-            caption=f"Заказ IC-{oid} одобрен. Спасибо!",
+            caption=f"Макет одобрен: {_client_card_label(order)}. Спасибо!",
             reply_markup=None,
         )
     except Exception:
-        await q.message.reply_text(f"Заказ IC-{oid} одобрен. Спасибо!")
+        await q.message.reply_text(
+            f"Макет одобрен: {_client_card_label(order)}. Спасибо!"
+        )
 
 
 async def _client_support(q, context, uid: int, oid: int) -> None:
@@ -1496,7 +1517,7 @@ async def _client_support(q, context, uid: int, oid: int) -> None:
     msg = q.message
     await B._activate_user_support_chat(msg, context, uid, reply_markup=B.REPLY_KB)
     await msg.reply_text(
-        f"Напишите сообщение по заказу IC-{oid}. "
+        f"Напишите сообщение по карточке «{_client_card_label(order)}». "
         "Администратор получит его вместе с этим номером."
     )
 
