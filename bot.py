@@ -3372,7 +3372,8 @@ async def _http_site_notify(request: web.Request) -> web.Response:
             oid = 0
         status = str(data.get("status") or "new").strip()
         sk = _norm_bot_order_status(status)
-        raw_text = _format_customer_order_status_notice(max(0, oid), sk)
+        site_order = ORDERS.get(int(oid)) if oid > 0 else None
+        raw_text = _format_customer_order_status_notice(max(0, oid), sk, site_order)
         if oid <= 0:
             raw_text = raw_text.replace("(#0)", "").strip()
     if not raw_text:
@@ -5214,6 +5215,11 @@ ORDER_STATUS_RU: dict = {
 }
 
 # Уведомление клиенту о смене статуса (коротко)
+CUSTOM_CARD_PRODUCTION_NOTICE = (
+    "Приступаем к изготовлению карточек на заказ.\n"
+    "Когда макет будет готов — пришлём сюда на согласование."
+)
+
 CUSTOMER_STATUS_BODY: dict = {
     "accepted": "🚚 Подготавливаем к отправке",
     "shipped": "🚚 Отправлен",
@@ -5250,10 +5256,26 @@ def _norm_bot_order_status(status: str) -> str:
     return s
 
 
-def _format_customer_order_status_notice(order_id: int, status_key: str) -> str:
+def _order_has_custom_cards(o: Optional[dict]) -> bool:
+    if not isinstance(o, dict):
+        return False
+    ids = o.get("custom_card_ids")
+    if isinstance(ids, list) and any(str(x).strip() for x in ids):
+        return True
+    for line in o.get("items") or []:
+        if isinstance(line, dict) and _cart_line_is_custom_order(line):
+            return True
+    return False
+
+
+def _format_customer_order_status_notice(
+    order_id: int, status_key: str, order: Optional[dict] = None
+) -> str:
     sk = str(status_key or "new").strip()
     if sk == "cancelled":
         sk = "canceled"
+    if sk == "accepted" and _order_has_custom_cards(order):
+        return CUSTOM_CARD_PRODUCTION_NOTICE
     if sk == "done":
         return "Ваш заказ успешно получен. Спасибо, что выбрали нас!"
     body = CUSTOMER_STATUS_BODY.get(sk, "")
@@ -13283,8 +13305,21 @@ async def on_order_status_buttons(
         if not str(o.get("external_id") or "").strip() and o.get("paid"):
             await _ensure_site_order_for_bot_order(oid, o)
         await _sync_site_order_status(o)
-        notice = _format_customer_order_status_notice(oid, str(o.get("status") or ""))
-        await _notify_order_customer(context, o, notice)
+        if want == "accepted" and _order_has_custom_cards(o):
+            if not o.get("custom_cards_production_notified"):
+                o["custom_cards_production_notified"] = True
+                await _notify_order_customer(context, o, CUSTOM_CARD_PRODUCTION_NOTICE)
+                try:
+                    await custom_card_flow.send_attached_custom_cards_to_admin(
+                        context, int(oid), o
+                    )
+                except Exception:
+                    log.exception("custom cards on accept oid=%s", oid)
+        else:
+            notice = _format_customer_order_status_notice(
+                oid, str(o.get("status") or ""), o
+            )
+            await _notify_order_customer(context, o, notice)
         await _refresh_admin_order_message(context, oid, q=q)
         try:
             await asyncio.to_thread(save_state)
@@ -15600,6 +15635,19 @@ async def on_admin_confirm_payment(
         )
     if cust:
         await _send_payment_receipt(context.bot, cust, oid, o)
+        if _order_has_custom_cards(o) and not o.get("custom_cards_production_notified"):
+            o["custom_cards_production_notified"] = True
+            await _send_customer_plain(
+                context.bot, cust, CUSTOM_CARD_PRODUCTION_NOTICE
+            )
+            try:
+                await custom_card_flow.send_attached_custom_cards_to_admin(
+                    context, int(oid), o
+                )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "custom cards after payment oid=%s", oid
+                )
         _clear_user_cart_after_payment_proof(cust, oid, o)
     try:
         await _sync_site_order_status(o, site_status="paid")
