@@ -1065,7 +1065,7 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
             await _present(q, "Сначала укажите хотя бы одного персонажа.")
             return
         if _is_site_attach(d):
-            await _ask_copies(q, uid, d)
+            await _commit_site_card_and_next(q, context, uid, d)
             return
         await _ask_qty(q, uid, d)
         return
@@ -1089,14 +1089,14 @@ async def _on_custom_card_callback(update: Update, context: ContextTypes.DEFAULT
         copies = _cb_index(data)
         if copies is None or copies < 0 or copies > 99:
             return
+        if _is_site_attach(d):
+            await _commit_site_card_and_next(q, context, uid, d)
+            return
         d["copies"] = copies
         it = _current_queue_item(d)
         if isinstance(it, dict):
             it["copies"] = copies
         _set_draft(uid, d)
-        if _is_site_attach(d):
-            await _commit_site_card_and_next(q, context, uid, d)
-            return
         d["step"] = "delivery"
         _set_draft(uid, d)
         await _present(
@@ -1199,12 +1199,7 @@ async def _commit_site_card_and_next(q, context, uid: int, d: dict) -> None:
         i = int(d.get("queue_i") or 0) + 1
     except (TypeError, ValueError):
         i = 1
-    saved = (
-        f"✅ Карточка {_queue_index(d) + 1} сохранена (IC-{oid}).\n"
-        f"Макет: {catalog_name or '—'}\n"
-        f"{_brief_block(order)}\n"
-        f"Копии: {copies}"
-    )
+    saved = f"✅ Карточка {_queue_index(d) + 1} сохранена."
     async def _out(text: str) -> None:
         if hasattr(q, "edit_message_text"):
             await _present(q, text)
@@ -1532,6 +1527,9 @@ async def try_handle_custom_card_text(
         await _ask_copies(msg, uid, d)
         return True
     if step in ("copies", "copies_text"):
+        if _is_site_attach(d):
+            await _commit_site_card_and_next(msg, context, uid, d)
+            return True
         try:
             n = int(text.replace(" ", ""))
         except ValueError:
@@ -1545,9 +1543,6 @@ async def try_handle_custom_card_text(
         if isinstance(it, dict):
             it["copies"] = n
         _set_draft(uid, d)
-        if _is_site_attach(d):
-            await _commit_site_card_and_next(msg, context, uid, d)
-            return True
         await _save_qty_and_ask_delivery(msg, uid, d, int(d.get("qty") or 1))
         return True
     if step == "address":
@@ -1577,7 +1572,7 @@ async def try_handle_custom_card_text(
             d["people"] = [{"universe": "Идея", "character": idea[:300]}]
             _set_draft(uid, d)
             if _is_site_attach(d):
-                await _ask_copies(msg, uid, d)
+                await _commit_site_card_and_next(msg, context, uid, d)
             else:
                 await _ask_qty(msg, uid, d)
             return True
