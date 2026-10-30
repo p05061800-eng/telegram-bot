@@ -5787,9 +5787,16 @@ def _format_admin_order_detail_text(
         "",
         "📦 Состав:",
         items_block,
-        "",
-        f"🚚 Доставка: {d_country}",
     ]
+    custom_cards = custom_card_flow.admin_attached_cards_text(o)
+    if custom_cards:
+        parts.extend(["", custom_cards])
+    parts.extend(
+        [
+            "",
+            f"🚚 Доставка: {d_country}",
+        ]
+    )
     if dline:
         parts.extend(["", dline])
     parts.extend(
@@ -7365,6 +7372,12 @@ async def _finalize_order_submission_to_admin(
         log.exception("finalize admin proof uid=%s oid=%s", uid, oid)
     if not ok:
         return False, "admin_fail"
+    try:
+        await custom_card_flow.send_attached_custom_cards_to_admin(
+            context, int(oid), o
+        )
+    except Exception:
+        log.exception("finalize custom cards uid=%s oid=%s", uid, oid)
     proof_cid = o.get("payment_proof_admin_chat_id")
     proof_mid = o.get("payment_proof_admin_message_id")
     if proof_cid is not None and proof_mid is not None:

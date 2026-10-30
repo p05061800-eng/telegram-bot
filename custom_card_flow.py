@@ -108,6 +108,89 @@ def _next_cc_id() -> int:
     return n
 
 
+def _link_custom_card_to_site_order(pay_oid, cc_id: int) -> None:
+    """Карточка на заказ едет вместе с заказом сайта, отдельно админу не уходит."""
+    B = _b()
+    try:
+        site_id = int(pay_oid)
+        card_id = int(cc_id)
+    except (TypeError, ValueError):
+        return
+    if site_id <= 0 or card_id <= 0:
+        return
+    site = getattr(B, "ORDERS", {}).get(site_id)
+    if not isinstance(site, dict):
+        return
+    raw = site.get("custom_card_ids")
+    ids = [int(x) for x in raw if str(x).isdigit()] if isinstance(raw, list) else []
+    if card_id not in ids:
+        ids.append(card_id)
+    site["custom_card_ids"] = ids
+    card = _order(card_id)
+    if isinstance(card, dict):
+        card["site_order_id"] = site_id
+
+
+def admin_attached_cards_text(site_order: dict) -> str:
+    raw = site_order.get("custom_card_ids") if isinstance(site_order, dict) else None
+    if not isinstance(raw, list) or not raw:
+        return ""
+    lines: List[str] = []
+    n = 0
+    for item in raw:
+        try:
+            oid = int(item)
+        except (TypeError, ValueError):
+            continue
+        order = _order(oid)
+        if not isinstance(order, dict):
+            continue
+        n += 1
+        name = str(order.get("catalog_name") or "Карточка на заказ")
+        lines.append(f"{n}. {name} (IC-{oid})")
+        brief = _brief_block(order)
+        if brief:
+            lines.append(brief[:500])
+    if not lines:
+        return ""
+    return "Карточки на заказ:\n" + "\n".join(lines)
+
+
+async def send_attached_custom_cards_to_admin(context, site_oid: int, site_order: dict) -> None:
+    """Фото и идея каждой карточки на заказ — вместе с конечным заказом."""
+    raw = site_order.get("custom_card_ids") if isinstance(site_order, dict) else None
+    if not isinstance(raw, list) or not raw:
+        return
+    B = _b()
+    changed = False
+    for item in raw:
+        try:
+            oid = int(item)
+        except (TypeError, ValueError):
+            continue
+        order = _order(oid)
+        if not isinstance(order, dict) or order.get("admin_notified"):
+            continue
+        cap = (
+            f"Карточка на заказ · заказ #{int(site_oid)}\n"
+            f"Номер заявки: IC-{oid}\n"
+            f"Макет: {str(order.get('catalog_name') or '—')}\n\n"
+            f"{_brief_block(order)}\n"
+            f"Полноценных: {order.get('qty') or 1}, копий (−50%): {order.get('copies') or 0}"
+        )
+        await B._broadcast_admin_message(
+            context,
+            photo_file_id=str(order.get("photo_file_id") or "") or None,
+            caption=cap,
+            reply_markup=_kb_admin_order(oid),
+            log_tag="custom_card_with_site_order",
+        )
+        order["admin_notified"] = True
+        changed = True
+    if changed:
+        B.save_state()
+
+
 def _order(oid: int) -> Optional[dict]:
     B = _b()
     raw = getattr(B, "CUSTOM_CARD_ORDERS", {}).get(int(oid))
@@ -1172,28 +1255,8 @@ async def _commit_site_card_and_next(q, context, uid: int, d: dict) -> None:
         "approved_at": None,
     }
     B.CUSTOM_CARD_ORDERS[int(oid)] = order
+    _link_custom_card_to_site_order(d.get("pay_oid"), int(oid))
     B.save_state()
-    who = f"id {uid}"
-    if full_name:
-        who += f" {full_name}"
-    if uname:
-        who += f" @{uname}"
-    cap = (
-        f"🆕 Карточка на заказ (с сайта)\n"
-        f"Номер заявки: IC-{oid}\n"
-        f"Макет: {catalog_name or '—'}\n"
-        f"📅 {order['created_at']}\n"
-        f"👤 {who}\n\n"
-        f"{_brief_block(order)}\n"
-        f"Полноценных: {qty}, копий (−50%): {copies}"
-    )
-    await B._broadcast_admin_message(
-        context,
-        photo_file_id=str(order.get("photo_file_id") or "") or None,
-        caption=cap,
-        reply_markup=_kb_admin_order(oid),
-        log_tag="custom_card_site_attach",
-    )
     queue = d.get("queue") if isinstance(d.get("queue"), list) else []
     try:
         i = int(d.get("queue_i") or 0) + 1
