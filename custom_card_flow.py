@@ -167,6 +167,14 @@ def _card_header(d: dict) -> str:
     return f"Карточка номер {i}:"
 
 
+def _brief_block(source: dict) -> str:
+    idea = str(source.get("idea") or "").strip()
+    if idea:
+        return f"Идея:\n{idea[:900]}"
+    people = source.get("people") if isinstance(source.get("people"), list) else []
+    return f"Люди на фото:\n{_fmt_people(people)}"
+
+
 def _fmt_people(people: list) -> str:
     if not people:
         return "—"
@@ -265,14 +273,22 @@ def _kb_cancel() -> InlineKeyboardMarkup:
     )
 
 
+def _idea_prompt() -> str:
+    return (
+        "Фото сохранено.\n\n"
+        "Напишите, по какой вселенной карточка и какие персонажи.\n"
+        "Или опишите идею целиком — что должно быть на карточке."
+    )
+
+
 def _universe_prompt(person_no: int, *, saved_photo: bool = False) -> str:
+    if saved_photo:
+        return _idea_prompt()
     n = max(1, int(person_no))
-    head = "Фото сохранено.\n\n" if saved_photo and n == 1 else ""
     who = "Напишите вселенную." if n <= 1 else f"Напишите вселенную для {n}-го человека на фото."
     return (
-        f"{head}{who}\n"
-        "Marvel, DC, аниме и т.д. — кнопкой или текстом.\n"
-        "Следующим сообщением напишите персонажа."
+        f"{who}\n"
+        "Следующим сообщением напишите персонажей."
     )
 
 
@@ -337,8 +353,7 @@ def _photo_prompt(d: Optional[dict] = None) -> str:
         return (
             f"{_card_header(d)}\n"
             "Пришлите фото, по которому собрать эту карточку.\n"
-            "Обычным фото, не файлом-документом.\n"
-            "Если на фото несколько человек — напишем персонажа для каждого."
+            "Обычным фото, не файлом-документом."
         )
     return (
         "Карточка на заказ\n\n"
@@ -482,7 +497,6 @@ def _kb_admin_order(oid: int) -> InlineKeyboardMarkup:
 
 def _summary_text(d: dict) -> str:
     B = _b()
-    people = d.get("people") if isinstance(d.get("people"), list) else []
     qty = d.get("qty") or "—"
     code = str(d.get("delivery") or "")
     label = B.DELIVERY_OPTIONS.get(code, (code or "—", 0, ""))[0]
@@ -491,7 +505,7 @@ def _summary_text(d: dict) -> str:
     return (
         "📋 Проверьте заявку и подтвердите её.\n\n"
         f"{_price_blurb()}\n\n"
-        f"Люди на фото:\n{_fmt_people(people)}\n\n"
+        f"{_brief_block(d)}\n\n"
         f"Полноценных карточек: {qty}\n"
         f"Копий этого макета (−50%): {copies}\n"
         f"Доставка: {label}\n"
@@ -636,11 +650,9 @@ async def begin_site_custom_cards_queue(
         intro = (
             "В заказе обычные карточки и карточки на заказ.\n"
             "Сначала уточним каждую карточку на заказ (фото и персонажи).\n"
-            "Потом оплатите весь заказ одним платежом.\n"
-            "Данные доставки уже в заказе с сайта — повторно не спрашиваем.\n\n"
         )
         if len(queue) > 1:
-            intro += "Карточек на заказ несколько — спросим про каждую отдельно.\n\n"
+            intro += "Карточек на заказ несколько — спросим про каждую отдельно.\n"
     elif len(queue) > 1:
         intro = (
             "В заказе несколько карточек на заказ. Спросим про каждую отдельно.\n"
@@ -1146,6 +1158,7 @@ async def _commit_site_card_and_next(q, context, uid: int, d: dict) -> None:
         "full_name": full_name,
         "photo_file_id": d.get("photo_file_id"),
         "people": list(d.get("people") or []),
+        "idea": str(d.get("idea") or "")[:1500],
         "qty": qty,
         "copies": copies,
         "catalog_ref": str(item.get("ref") or "")[:120],
@@ -1171,7 +1184,7 @@ async def _commit_site_card_and_next(q, context, uid: int, d: dict) -> None:
         f"Макет: {catalog_name or '—'}\n"
         f"📅 {order['created_at']}\n"
         f"👤 {who}\n\n"
-        f"Люди на фото:\n{_fmt_people(order['people'])}\n"
+        f"{_brief_block(order)}\n"
         f"Полноценных: {qty}, копий (−50%): {copies}"
     )
     await B._broadcast_admin_message(
@@ -1189,7 +1202,7 @@ async def _commit_site_card_and_next(q, context, uid: int, d: dict) -> None:
     saved = (
         f"✅ Карточка {_queue_index(d) + 1} сохранена (IC-{oid}).\n"
         f"Макет: {catalog_name or '—'}\n"
-        f"Люди на фото:\n{_fmt_people(order['people'])}\n"
+        f"{_brief_block(order)}\n"
         f"Копии: {copies}"
     )
     async def _out(text: str) -> None:
@@ -1238,6 +1251,7 @@ async def _commit_site_card_and_next(q, context, uid: int, d: dict) -> None:
     d["queue_i"] = i
     d["step"] = "photo"
     d["people"] = []
+    d["idea"] = ""
     d["photo_file_id"] = ""
     d["universe"] = ""
     d["qty"] = nxt.get("qty")
@@ -1274,6 +1288,7 @@ async def _confirm_order(q, context, uid: int, d: dict) -> None:
         "full_name": full_name,
         "photo_file_id": d.get("photo_file_id"),
         "people": list(d.get("people") or []),
+        "idea": str(d.get("idea") or "")[:1500],
         "qty": d.get("qty"),
         "copies": _copies_from_draft(d),
         "delivery": d.get("delivery"),
@@ -1298,7 +1313,7 @@ async def _confirm_order(q, context, uid: int, d: dict) -> None:
         f"Номер заказа: IC-{oid}\n"
         f"📅 {order['created_at']}\n"
         f"👤 {who}\n\n"
-        f"Люди на фото:\n{_fmt_people(order['people'])}\n"
+        f"{_brief_block(order)}\n"
         f"Полноценных: {order['qty']}, копий (−50%): {order.get('copies') or 0}\n"
         f"Доставка: {label}\n"
         f"Получатель:\n{str(order.get('address') or '')[:800]}"
@@ -1554,6 +1569,18 @@ async def try_handle_custom_card_text(
             await msg.reply_text(cap, reply_markup=_kb_confirm())
         return True
     if step in ("universe", "universe_text"):
+        # Первый ответ после фото — вселенная и персонажи или идея целиком.
+        if not str(d.get("universe") or "").strip() and not d.get("people"):
+            idea = text[:1500]
+            d["idea"] = idea
+            d["universe"] = idea[:80]
+            d["people"] = [{"universe": "Идея", "character": idea[:300]}]
+            _set_draft(uid, d)
+            if _is_site_attach(d):
+                await _ask_copies(msg, uid, d)
+            else:
+                await _ask_qty(msg, uid, d)
+            return True
         d["universe"] = text[:80]
         _set_draft(uid, d)
         await _ask_characters_text(msg, uid, d)
