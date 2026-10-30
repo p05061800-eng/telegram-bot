@@ -323,10 +323,12 @@ def _brief_block(source: dict) -> str:
     title = str(source.get("card_title") or "").strip()
     description = str(source.get("description") or "").strip()
     idea = str(source.get("idea") or "").strip()
-    if number > 0:
-        parts.append(f"Номер карточки: {number}")
-    if title:
-        parts.append(f"Название: {title}")
+    if number > 0 and title:
+        parts.append(f"Карточка номер {number} — {title}")
+    elif number > 0:
+        parts.append(f"Карточка номер {number}")
+    elif title:
+        parts.append(title)
     if description:
         parts.append(f"Описание:\n{description[:700]}")
     if idea:
@@ -435,12 +437,19 @@ def _kb_cancel() -> InlineKeyboardMarkup:
     )
 
 
-def _idea_prompt() -> str:
+def _card_title_prompt(d: dict) -> str:
+    n = _queue_index(d) + 1 if _is_site_attach(d) else 1
     return (
         "Фото сохранено.\n\n"
+        f"Карточка номер {n}.\n"
+        "Напишите название карточки одним сообщением."
+    )
+
+
+def _idea_prompt() -> str:
+    return (
+        "Название сохранено.\n\n"
         "Напишите одним сообщением:\n"
-        "Номер карточки: \n"
-        "Название: \n"
         "Описание: \n"
         "Вселенная и персонажи: \n\n"
         "Вселенную и персонажей можно заменить идеей целиком — что должно быть на карточке."
@@ -1020,12 +1029,13 @@ async def try_handle_custom_card_photo(
         )
         return True
     d["photo_file_id"] = file_id
-    d["step"] = "universe"
+    d["step"] = "card_title"
     d["people"] = []
     d["universe"] = ""
+    d["card_title"] = ""
     _set_draft(uid, d)
     await update.effective_message.reply_text(
-        _universe_prompt(1, saved_photo=True),
+        _card_title_prompt(d),
         reply_markup=_kb_cancel(),
     )
     return True
@@ -1658,6 +1668,7 @@ async def _client_support(q, context, uid: int, oid: int) -> None:
 _TEXT_STEPS = frozenset(
     {
         "photo",
+        "card_title",
         "universe",
         "universe_text",
         "character",
@@ -1780,20 +1791,27 @@ async def try_handle_custom_card_text(
         else:
             await msg.reply_text(cap, reply_markup=_kb_confirm())
         return True
+    if step == "card_title":
+        title = text.strip()[:200]
+        if not title:
+            await msg.reply_text("Напишите название карточки одним сообщением.")
+            return True
+        d["card_title"] = title
+        d["step"] = "universe"
+        d["universe"] = ""
+        d["people"] = []
+        _set_draft(uid, d)
+        await msg.reply_text(_idea_prompt(), reply_markup=_kb_cancel())
+        return True
     if step in ("universe", "universe_text"):
         # Первый ответ после фото — вселенная и персонажи или идея целиком.
         if not str(d.get("universe") or "").strip() and not d.get("people"):
             parsed = _parse_card_brief(text)
             idea = str(parsed.get("idea") or text).strip()[:1500]
             d["idea"] = idea
-            title = str(parsed.get("card_title") or "").strip()
-            if title:
-                d["card_title"] = title[:200]
             description = str(parsed.get("description") or "").strip()
             if description:
                 d["description"] = description[:1500]
-            if parsed.get("card_no"):
-                d["card_no"] = int(parsed["card_no"])
             d["universe"] = idea[:80]
             d["people"] = [{"universe": "Идея", "character": idea[:300]}]
             _set_draft(uid, d)
