@@ -243,14 +243,61 @@ def _copies_from_draft(d: dict) -> int:
     return max(0, min(n, 99))
 
 
-def _client_card_label(order: dict) -> str:
-    """Как карточка называется для клиента, без внутреннего номера IC-."""
-    name = str(order.get("catalog_name") or "").strip()
-    generic = not name or name.casefold() in {"карточка на заказ", "—", "-"}
+def _client_card_number(order: dict) -> int:
+    """Номер карточки в заказе: 1, 2, 3…"""
     try:
         n = int(order.get("card_no") or 0)
     except (TypeError, ValueError):
         n = 0
+    if n > 0:
+        return n
+    B = _b()
+    try:
+        card_id = int(order.get("id") or 0)
+    except (TypeError, ValueError):
+        card_id = 0
+    try:
+        site_id = int(order.get("site_order_id") or 0)
+    except (TypeError, ValueError):
+        site_id = 0
+    site = getattr(B, "ORDERS", {}).get(site_id) if site_id else None
+    raw = site.get("custom_card_ids") if isinstance(site, dict) else None
+    ids: List[int] = []
+    if isinstance(raw, list):
+        for item in raw:
+            try:
+                ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
+    if card_id and card_id in ids:
+        return ids.index(card_id) + 1
+    uid = 0
+    try:
+        uid = int(order.get("user_id") or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    if uid and card_id:
+        mine: List[int] = []
+        for key, raw_order in getattr(B, "CUSTOM_CARD_ORDERS", {}).items():
+            if not isinstance(raw_order, dict):
+                continue
+            try:
+                if int(raw_order.get("user_id") or 0) != uid:
+                    continue
+                mine.append(int(key))
+            except (TypeError, ValueError):
+                continue
+        mine.sort()
+        if card_id in mine:
+            return mine.index(card_id) + 1
+    return 0
+
+
+def _client_card_label(order: dict) -> str:
+    """Как карточка называется для клиента, без внутреннего номера IC-."""
+    name = str(order.get("catalog_name") or "").strip()
+    generic = not name or name.casefold() in {"карточка на заказ", "—", "-"}
+    n = _client_card_number(order)
     if n > 0 and not generic:
         return f"Карточка номер {n} — {name}"
     if n > 0:
@@ -1486,9 +1533,10 @@ async def _client_approve(q, context, uid: int, oid: int) -> None:
     await B._broadcast_admin_message(
         context,
         text=(
-            f"✅ Клиент одобрил изображение заказа IC-{oid}\n"
+            f"✅ Клиент одобрил макет: {_client_card_label(order)}\n"
             f"👤 id {uid}" + (f" @{uname}" if uname else "")
         ),
+        reply_markup=_kb_admin_order(oid),
         log_tag="custom_card_approved",
     )
     try:
