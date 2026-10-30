@@ -295,7 +295,7 @@ def _client_card_number(order: dict) -> int:
 
 def _client_card_label(order: dict) -> str:
     """Как карточка называется для клиента, без внутреннего номера IC-."""
-    name = str(order.get("catalog_name") or "").strip()
+    name = str(order.get("card_title") or order.get("catalog_name") or "").strip()
     generic = not name or name.casefold() in {"карточка на заказ", "—", "-"}
     n = _client_card_number(order)
     if n > 0 and not generic:
@@ -315,9 +315,24 @@ def _card_header(d: dict) -> str:
 
 
 def _brief_block(source: dict) -> str:
+    parts: List[str] = []
+    try:
+        number = int(source.get("card_no") or 0)
+    except (TypeError, ValueError):
+        number = 0
+    title = str(source.get("card_title") or "").strip()
+    description = str(source.get("description") or "").strip()
     idea = str(source.get("idea") or "").strip()
+    if number > 0:
+        parts.append(f"Номер карточки: {number}")
+    if title:
+        parts.append(f"Название: {title}")
+    if description:
+        parts.append(f"Описание:\n{description[:700]}")
     if idea:
-        return f"Идея:\n{idea[:900]}"
+        parts.append(f"Вселенная и персонажи:\n{idea[:900]}")
+    if parts:
+        return "\n".join(parts)
     people = source.get("people") if isinstance(source.get("people"), list) else []
     return f"Люди на фото:\n{_fmt_people(people)}"
 
@@ -423,9 +438,71 @@ def _kb_cancel() -> InlineKeyboardMarkup:
 def _idea_prompt() -> str:
     return (
         "Фото сохранено.\n\n"
-        "Напишите, по какой вселенной карточка и какие персонажи.\n"
-        "Или опишите идею целиком — что должно быть на карточке."
+        "Напишите одним сообщением:\n"
+        "Номер карточки: \n"
+        "Название: \n"
+        "Описание: \n"
+        "Вселенная и персонажи: \n\n"
+        "Вселенную и персонажей можно заменить идеей целиком — что должно быть на карточке."
     )
+
+
+def _parse_card_brief(text: str) -> dict:
+    """Номер, название, описание и вселенная из одного сообщения."""
+    keys = (
+        ("card_no", ("номер карточки", "номер")),
+        ("card_title", ("название",)),
+        ("description", ("описание",)),
+        ("idea", ("вселенная и персонажи", "вселенная", "персонажи", "идея")),
+    )
+    found: dict = {}
+    current = ""
+    buf: List[str] = []
+
+    def flush() -> None:
+        if not current:
+            return
+        value = "\n".join(part for part in buf if part.strip()).strip()
+        if value:
+            found[current] = value
+
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            if current:
+                buf.append("")
+            continue
+        low = line.casefold()
+        matched = ""
+        rest = ""
+        for field, aliases in keys:
+            for alias in aliases:
+                if low.startswith(alias):
+                    matched = field
+                    rest = line[len(alias) :].lstrip(" :.—-")
+                    break
+            if matched:
+                break
+        if matched:
+            flush()
+            current = matched
+            buf = [rest] if rest else []
+            continue
+        if current:
+            buf.append(line)
+    flush()
+    raw_no = str(found.get("card_no") or "")
+    number = re.search(r"\d+", raw_no)
+    if number:
+        try:
+            found["card_no"] = int(number.group())
+        except (TypeError, ValueError):
+            found.pop("card_no", None)
+    else:
+        found.pop("card_no", None)
+    if not any(found.get(key) for key in ("card_no", "card_title", "description", "idea")):
+        found["idea"] = str(text or "").strip()
+    return found
 
 
 def _universe_prompt(person_no: int, *, saved_photo: bool = False) -> str:
@@ -1306,11 +1383,13 @@ async def _commit_site_card_and_next(q, context, uid: int, d: dict) -> None:
         "photo_file_id": d.get("photo_file_id"),
         "people": list(d.get("people") or []),
         "idea": str(d.get("idea") or "")[:1500],
+        "card_title": str(d.get("card_title") or "")[:200],
+        "description": str(d.get("description") or "")[:1500],
         "qty": qty,
         "copies": copies,
         "catalog_ref": str(item.get("ref") or "")[:120],
-        "catalog_name": catalog_name,
-        "card_no": _queue_index(d) + 1,
+        "catalog_name": str(d.get("card_title") or catalog_name)[:200],
+        "card_no": int(d.get("card_no") or (_queue_index(d) + 1)),
         "attached_to_site": True,
         "delivery": d.get("delivery") or "",
         "address": d.get("address") or "",
@@ -1375,6 +1454,9 @@ async def _commit_site_card_and_next(q, context, uid: int, d: dict) -> None:
     d["step"] = "photo"
     d["people"] = []
     d["idea"] = ""
+    d["card_title"] = ""
+    d["description"] = ""
+    d.pop("card_no", None)
     d["photo_file_id"] = ""
     d["universe"] = ""
     d["qty"] = nxt.get("qty")
@@ -1412,6 +1494,9 @@ async def _confirm_order(q, context, uid: int, d: dict) -> None:
         "photo_file_id": d.get("photo_file_id"),
         "people": list(d.get("people") or []),
         "idea": str(d.get("idea") or "")[:1500],
+        "card_title": str(d.get("card_title") or "")[:200],
+        "description": str(d.get("description") or "")[:1500],
+        "card_no": int(d.get("card_no") or 0) or None,
         "qty": d.get("qty"),
         "copies": _copies_from_draft(d),
         "delivery": d.get("delivery"),
@@ -1698,8 +1783,17 @@ async def try_handle_custom_card_text(
     if step in ("universe", "universe_text"):
         # Первый ответ после фото — вселенная и персонажи или идея целиком.
         if not str(d.get("universe") or "").strip() and not d.get("people"):
-            idea = text[:1500]
+            parsed = _parse_card_brief(text)
+            idea = str(parsed.get("idea") or text).strip()[:1500]
             d["idea"] = idea
+            title = str(parsed.get("card_title") or "").strip()
+            if title:
+                d["card_title"] = title[:200]
+            description = str(parsed.get("description") or "").strip()
+            if description:
+                d["description"] = description[:1500]
+            if parsed.get("card_no"):
+                d["card_no"] = int(parsed["card_no"])
             d["universe"] = idea[:80]
             d["people"] = [{"universe": "Идея", "character": idea[:300]}]
             _set_draft(uid, d)
