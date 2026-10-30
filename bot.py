@@ -11266,6 +11266,8 @@ def _infer_site_order_action_from_keyboard_layout(message: Optional[Message], da
     if idx is None:
         return None
     btn_text = str(getattr(flat[idx], "text", None) or "").lower()
+    if want.startswith("cc:") or "изображен" in btn_text:
+        return None
     if _is_bot_checkout_payment_callback(want) or "оплат" in btn_text:
         return None
     if len(flat) == 2:
@@ -11409,6 +11411,8 @@ def _resolve_site_order_action(q: CallbackQuery) -> Optional[Tuple[str, Optional
     data = (q.data or "").strip()
     if not data:
         return None
+    if data.startswith("cc:"):
+        return None
     if _is_bot_checkout_payment_callback(data):
         return None
     parsed = _parse_site_order_callback_data(data)
@@ -11500,10 +11504,15 @@ async def _try_handle_site_order_callback(
     if not q or not q.data or not q.message:
         return
     data = (q.data or "").strip()
-    if _is_bot_checkout_payment_callback(data):
+    if data.startswith("cc:") or _is_bot_checkout_payment_callback(data):
         return
     msg_text = (q.message.text or q.message.caption or "") if q.message else ""
-    if _message_looks_like_admin_order_card(msg_text):
+    if (
+        _message_looks_like_admin_order_card(msg_text)
+        or "Карточка на заказ" in msg_text
+        or "Номер заявки: IC-" in msg_text
+        or "Индивидуальная карточка" in msg_text
+    ):
         return
     if _RE_SITE_ORDER_CB_PATTERN.match(data):
         return

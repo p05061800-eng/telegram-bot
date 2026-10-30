@@ -1690,7 +1690,7 @@ def support_order_suffix(uid: int) -> str:
 def register_custom_card_handlers(app) -> None:
     app.add_handler(
         CallbackQueryHandler(on_custom_card_callback, pattern=_RE_CB),
-        group=-1,
+        group=-2,
     )
     app.add_handler(
         MessageHandler(
